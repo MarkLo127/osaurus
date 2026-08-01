@@ -367,7 +367,7 @@ struct DiscordSettingsView: View {
             }
 
             if let discovery {
-                Picker(L("Server"), selection: $selectedGuildId) {
+                Picker(L("discord.guild.picker"), selection: $selectedGuildId) {
                     ForEach(discovery.guilds, id: \.id) { guild in
                         Text(guild.name).tag(guild.id)
                     }
@@ -395,7 +395,7 @@ struct DiscordSettingsView: View {
             VStack(alignment: .leading, spacing: 12) {
                 SettingsToggle(
                     title: L("Allow Sending on Discord"),
-                    description: L("Let agents post to write-allowlisted Discord destinations. Channel writes must also be on globally."),
+                    description: L("Let agents post to write-allowlisted Discord destinations. The global Sending switch in Channels must also be on."),
                     isOn: $writeEnabled.animation(.easeOut(duration: 0.2))
                 )
 
@@ -415,11 +415,11 @@ struct DiscordSettingsView: View {
 
     private var stepDispatchSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            AgentChannelSectionHeading(L("Send incoming messages to an agent"))
+            AgentChannelSectionHeading(L("Reply to incoming messages"))
 
             SettingsToggle(
-                title: L("Dispatch Discord Messages to an Agent"),
-                description: L("Run verified messages from allowed channels and senders through a selected agent."),
+                title: L("Reply with an Agent"),
+                description: L("Choose which agent answers verified messages from allowed channels and senders."),
                 isOn: $inboundDispatchEnabled.animation(.easeOut(duration: 0.2))
             )
             if inboundDispatchEnabled {
@@ -526,7 +526,7 @@ struct DiscordSettingsView: View {
                     title: L("Authorized Sender IDs"),
                     text: $senderAllowlistText,
                     placeholder: L("123456789012345678 — one per line"),
-                    help: L("Required for inbound dispatch. Use Discord user IDs.")
+                    help: L("Required before an agent can reply. Use Discord user IDs.")
                 )
                 StyledSettingsTextField(
                     label: L("Default Read Limit"),
@@ -557,13 +557,21 @@ struct DiscordSettingsView: View {
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Channels", bundle: .module)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(theme.primaryText)
                 Spacer()
-                Text("\(channels.count) channels", bundle: .module)
+                Text("\(channels.count) found", bundle: .module)
                     .font(.system(size: 10))
                     .foregroundColor(theme.tertiaryText)
             }
+
+            Text(
+                "Read lets agents see a channel, Write lets them post there.",
+                bundle: .module
+            )
+            .font(.system(size: 10))
+            .foregroundColor(theme.tertiaryText)
+            .fixedSize(horizontal: false, vertical: true)
 
             AgentChannelSelectorSearchField(
                 placeholder: L("Search channels by name or ID"),
@@ -621,7 +629,7 @@ struct DiscordSettingsView: View {
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Authorized Senders", bundle: .module)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(theme.primaryText)
                 Spacer()
                 Text("\(allowedCount) allowed · \(members.count) people", bundle: .module)
@@ -704,7 +712,7 @@ struct DiscordSettingsView: View {
         inboundRequireMention = configuration.inboundDispatch.requireMention
         inboundContinueThreads = configuration.inboundDispatch.continueThreads
         inboundAutoReplyEnabled = configuration.inboundDispatch.autoReplyEnabled
-        tokenSaved = DiscordConnectionService.shared.hasBotToken()
+        Task { tokenSaved = await DiscordConnectionService.shared.hasBotTokenOffMain() }
         // Arm autosave only after the stored configuration has hydrated the
         // draft, so hydration itself is never mistaken for an edit.
         lastSavedDraft = currentDraft
@@ -715,10 +723,12 @@ struct DiscordSettingsView: View {
     }
 
     /// Persist a pasted bot token to Keychain before the configuration save.
-    private func persistPendingSecrets() -> Bool {
+    /// Awaited off the main thread so a slow securityd never beachballs the
+    /// Save/Test buttons.
+    private func persistPendingSecrets() async -> Bool {
         guard hasPendingToken else { return true }
         do {
-            try DiscordConnectionService.shared.saveBotToken(botToken)
+            try await DiscordConnectionService.shared.saveBotTokenOffMain(botToken)
             botToken = ""
             tokenSaved = true
             return true
@@ -729,9 +739,9 @@ struct DiscordSettingsView: View {
     }
 
     private func removeToken() {
-        _ = DiscordConnectionService.shared.deleteBotToken()
         botToken = ""
         tokenSaved = false
+        Task { await DiscordConnectionService.shared.deleteBotTokenOffMain() }
         showStatus(L("Discord bot token removed"), isError: false)
     }
 
@@ -741,13 +751,13 @@ struct DiscordSettingsView: View {
     private func validationFailure() -> (message: String, section: AgentChannelProviderSetupSection)? {
         if inboundDispatchEnabled && inboundAgentId == nil && inboundRoutes.isEmpty {
             return (
-                L("Select a default agent or add a routing rule for inbound Discord messages."),
+                L("Choose an agent to reply, or add a rule for incoming Discord messages."),
                 .behavior
             )
         }
         if inboundDispatchEnabled && parseIds(senderAllowlistText).isEmpty {
             return (
-                L("Add at least one authorized Discord sender for inbound dispatch."),
+                L("Add at least one authorized Discord sender before an agent can reply."),
                 .access
             )
         }
@@ -802,9 +812,12 @@ struct DiscordSettingsView: View {
     /// than dismissing on a superficially successful save.
     private func saveAndDismiss() {
         autosaveTask?.cancel()
-        guard persistPendingSecrets(), saveConfiguration() else { return }
         isSaving = true
         Task {
+            guard await persistPendingSecrets(), saveConfiguration() else {
+                isSaving = false
+                return
+            }
             await AgentChannelTransportSupervisor.shared.refreshDiscordRuntime()
             guard inboundDispatchEnabled else {
                 await MainActor.run {
@@ -838,9 +851,12 @@ struct DiscordSettingsView: View {
     /// user sees in the form, not a stale save.
     private func testConnection() {
         autosaveTask?.cancel()
-        guard persistPendingSecrets(), saveConfiguration() else { return }
         isTesting = true
         Task {
+            guard await persistPendingSecrets(), saveConfiguration() else {
+                isTesting = false
+                return
+            }
             await AgentChannelTransportSupervisor.shared.refreshDiscordRuntime()
             let diagnostics = await DiscordConnectionService.shared.diagnostics()
             await MainActor.run {
@@ -859,9 +875,12 @@ struct DiscordSettingsView: View {
     }
 
     private func refreshDiscovery(showStatus announce: Bool) {
-        guard persistPendingSecrets() else { return }
         isDiscovering = true
         Task {
+            guard await persistPendingSecrets() else {
+                isDiscovering = false
+                return
+            }
             do {
                 let loaded = try await DiscordConnectionService.shared.discoverConfigurationOptions()
                 await MainActor.run {

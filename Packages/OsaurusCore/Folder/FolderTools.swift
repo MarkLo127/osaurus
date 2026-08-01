@@ -493,6 +493,16 @@ enum FolderToolHelpers {
 
 // MARK: - Core Tools
 
+enum WorkspaceToolContract {
+    /// Keeps one generated tool call small enough to parse and execute
+    /// promptly on local models. Large files are assembled with append calls.
+    static let maxWriteContentCharacters = 30_000
+    /// Leaves room for JSON escaping and argument framing below the streaming
+    /// envelope while accepting the 20–25K single-file apps local models
+    /// commonly produce.
+    static let recommendedWriteChunkCharacters = 28_000
+}
+
 // MARK: File Tree Tool
 
 struct FileTreeTool: OsaurusTool {
@@ -742,7 +752,8 @@ struct FileReadTool: OsaurusTool {
     let name = "file_read"
     let description =
         "Read a file's contents, or list a directory's contents — the path decides. Files return text "
-        + "with `N|` line-number prefixes (text-extractable documents — PDF, Word, PowerPoint, RTF, HTML — "
+        + "with `N|` line-number prefixes (UTF-8 source files, including HTML/RTF/SVG, are returned raw; "
+        + "binary text-extractable documents — PDF, Word, PowerPoint — "
         + "and a bounded XLSX preview are supported; binaries are not); bound large reads with "
         + "start_line/end_line, tail_lines, or max_chars. Directories return a listing; bound with "
         + "max_depth. Example: {\"path\": \"src/app.py\", \"start_line\": 1, \"end_line\": 120}"
@@ -798,6 +809,43 @@ struct FileReadTool: OsaurusTool {
     init(rootPath: URL? = nil, documentRegistry: DocumentFormatRegistry = .shared) {
         self.fixedRootPath = rootPath
         self.documentRegistry = documentRegistry
+    }
+
+    var canExposeToSpawnedOperation: Bool { true }
+
+    func spawnedOperationCancellationSupport(
+        argumentsJSON: String
+    ) -> SpawnedOperationCancellationSupport {
+        guard let args = parseArguments(argumentsJSON),
+            let relativePath = args["path"] as? String,
+            combinedFileRoute(path: relativePath) == .host,
+            args["sheet_name"] == nil,
+            let rootPath = FolderToolHelpers.resolveRoot(fixed: fixedRootPath),
+            let fileURL = try? FolderToolHelpers.resolvePath(relativePath, rootPath: rootPath)
+        else {
+            return .unsupported
+        }
+        var isDirectory: ObjCBool = false
+        let ext = fileURL.pathExtension.lowercased()
+        guard FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory),
+            !isDirectory.boolValue
+        else {
+            return .unsupported
+        }
+        // PDF text-layer extraction has a fully async, cancellation-aware
+        // adapter path below. Other parser-backed formats still pass through
+        // DocumentParser's synchronous compatibility shim, so they cannot be
+        // owned by a spawned operation yet.
+        if ext == "pdf" {
+            return .cooperative
+        }
+        guard !WorkspaceFileFormatPolicy.prefersDocumentExtraction(ext) else {
+            return .unsupported
+        }
+        if DocumentParser.isImageFile(url: fileURL), ext != "svg" {
+            return .unsupported
+        }
+        return .cooperative
     }
 
     /// Maximum characters for file_read output to prevent context window exhaustion.
@@ -887,12 +935,16 @@ struct FileReadTool: OsaurusTool {
         guard FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory) else {
             throw FolderToolError.fileNotFound(relativePath)
         }
+        let ext = fileURL.pathExtension.lowercased()
 
         // A directory path lists rather than reads (the path carries the
         // decision — no separate `file_tree` tool to mis-select). Reuse the
         // internal tree lister, honoring `max_depth`, but stamp the
         // envelope as `file_read` since that's the only file tool now.
-        if isDirectory.boolValue {
+        // Document packages such as RTFD are directories on macOS, but remain
+        // files at the workspace contract boundary and must use extraction.
+        if isDirectory.boolValue,
+            !WorkspaceFileFormatPolicy.prefersDocumentExtraction(ext) {
             let maxDepth = coerceInt(args["max_depth"]) ?? 3
             let listing = FileTreeTool(rootPath: rootPath).entries(for: fileURL, maxDepth: maxDepth)
             return ToolEnvelope.listing(
@@ -928,7 +980,6 @@ struct FileReadTool: OsaurusTool {
             return ToolEnvelope.success(tool: name, text: workbookPreview)
         }
 
-        let ext = fileURL.pathExtension.lowercased()
         let content = try await loadFileContent(
             url: fileURL,
             relativePath: relativePath,
@@ -963,6 +1014,7 @@ struct FileReadTool: OsaurusTool {
         // model actually saw by one line.
         var partialLine: Int? = nil
         for i in (validStart - 1) ..< validEnd {
+            try Task.checkCancellation()
             // Gutter format is `N|content` with NO space after the pipe:
             // everything after the first `|` is byte-exact file content.
             // The earlier `N| content` form made a leading gutter space
@@ -1094,27 +1146,39 @@ struct FileReadTool: OsaurusTool {
     }
 
     /// Pull text out of the file at `url`, throwing `binaryContent` when
-    /// the file is not text or text-extractable. Three branches:
-    ///   - images are refused outright (this tool returns text only);
-    ///   - text-extractable documents (PDF, Word, PowerPoint, RTF, HTML,
-    ///     …) go through `DocumentParser`, which routes through
-    ///     `DocumentFormatRegistry` and PDFKit / `NSAttributedString`;
-    ///   - plain text / source / CSV / unknown extensions read raw bytes,
-    ///     NUL-sniff the first 4KB, then UTF-8 decode. The raw path keeps
-    ///     line-numbering and `start_line`/`end_line` semantics, and the
-    ///     byte-first ordering catches binaries whose UTF-8 prefix happens
-    ///     to be valid by coincidence.
+    /// the file is not text or text-extractable:
+    ///   - PDFs use `PDFAdapter` directly so spawned reads remain
+    ///     cancellation-cooperative without crossing the synchronous
+    ///     `DocumentParser` compatibility shim;
+    ///   - other known binary document packages use document extraction;
+    ///   - every other UTF-8 file reads as raw source regardless of extension;
+    ///   - binary images are refused, while parser-supported binary documents
+    ///     fall back to extraction;
+    /// Raw reads NUL-sniff the first 4KB, then UTF-8 decode. This keeps
+    /// line-numbering and `start_line`/`end_line` semantics, and the
+    /// byte-first ordering catches binaries whose UTF-8 prefix happens
+    /// to be valid by coincidence.
     private func loadFileContent(
         url: URL,
         relativePath: String,
         ext: String
     ) async throws -> LoadedFileContent {
-        // Text-only tool: never try to surface image pixels.
-        if DocumentParser.isImageFile(url: url) {
-            throw Self.binaryError(path: relativePath, ext: ext, detail: .image)
+        if ext == "pdf" {
+            return LoadedFileContent(
+                text: try await extractPDFTextLayer(
+                    url: url,
+                    relativePath: relativePath,
+                    ext: ext
+                ),
+                rawRead: nil
+            )
         }
 
-        if Self.shouldExtractViaParser(url: url, ext: ext) {
+        if WorkspaceFileFormatPolicy.prefersDocumentExtraction(ext) {
+            DocumentAdaptersBootstrap.registerBuiltIns()
+            guard DocumentParser.canParse(url: url) else {
+                throw Self.binaryError(path: relativePath, ext: ext, detail: .parseFailed)
+            }
             return LoadedFileContent(
                 text: try await extractRichDocumentText(
                     url: url,
@@ -1125,30 +1189,74 @@ struct FileReadTool: OsaurusTool {
             )
         }
 
-        return try await Task.detached(priority: .userInitiated) {
-            try Self.loadBoundedRawText(
+        do {
+            let worker = Task.detached(priority: .userInitiated) {
+                try Self.loadBoundedRawText(
+                    url: url,
+                    relativePath: relativePath,
+                    ext: ext
+                )
+            }
+            return try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+        } catch let error as FolderToolError {
+            guard case .binaryContent = error else { throw error }
+
+            // Raw UTF-8 always wins. Only after strict decoding fails do we
+            // reinterpret the bytes as an image or rich binary document.
+            if DocumentParser.isImageFile(url: url) {
+                throw Self.binaryError(path: relativePath, ext: ext, detail: .image)
+            }
+            DocumentAdaptersBootstrap.registerBuiltIns()
+            if DocumentParser.canParse(url: url) {
+                return LoadedFileContent(
+                    text: try await extractRichDocumentText(
+                        url: url,
+                        relativePath: relativePath,
+                        ext: ext
+                    ),
+                    rawRead: nil
+                )
+            }
+            throw error
+        }
+    }
+
+    /// Extract a PDF text layer without the synchronous `DocumentParser`
+    /// bridge. `PDFAdapter` checks cancellation between pages, glyphs, table
+    /// phases, and representation construction, so an owning spawned
+    /// operation can cancel and drain this work before it returns.
+    private func extractPDFTextLayer(
+        url: URL,
+        relativePath: String,
+        ext: String
+    ) async throws -> String {
+        do {
+            let document = try await PDFAdapter().parse(
                 url: url,
-                relativePath: relativePath,
-                ext: ext
+                sizeLimit: Int64(DocumentParser.maxFileSize)
             )
-        }.value
+            try Task.checkCancellation()
+            return document.textFallback
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as DocumentAdapterError {
+            switch error {
+            case .emptyContent:
+                throw Self.binaryError(path: relativePath, ext: ext, detail: .imageOnlyPdf)
+            case .cancelled:
+                throw CancellationError()
+            case .unsupportedFormat, .sizeLimitExceeded, .readFailed, .writeFailed:
+                throw Self.binaryError(path: relativePath, ext: ext, detail: .parseFailed)
+            }
+        }
     }
 
-    /// Whether `url` should be routed through `DocumentParser` for text
-    /// extraction rather than read as raw bytes. Plain-text / source /
-    /// CSV extensions stay on the raw path (so line ranges keep working);
-    /// every other format the document infrastructure can parse — PDF,
-    /// Word, PowerPoint, RTF, HTML, etc. — is extracted. Lazily registers
-    /// the built-in adapters (idempotent) so `canParse` sees formats like
-    /// PPTX even on entry points that didn't bootstrap at launch, mirroring
-    /// `workbookAdapter(for:)`.
-    private static func shouldExtractViaParser(url: URL, ext: String) -> Bool {
-        if DocumentParser.isPlainTextExtension(ext) { return false }
-        DocumentAdaptersBootstrap.registerBuiltIns()
-        return DocumentParser.canParse(url: url)
-    }
-
-    /// Run `DocumentParser.parse(url:)` on a detached task so the
+    /// Run the non-PDF `DocumentParser.parse(url:)` compatibility path on a
+    /// detached task so the
     /// parser's internal `runBlocking` semaphore can't starve the
     /// cooperative thread pool. Matches the production pattern in
     /// `FloatingInputCard`.
@@ -1216,18 +1324,19 @@ struct FileReadTool: OsaurusTool {
                 guard let chunk = try handle.read(upToCount: count), !chunk.isEmpty else { break }
                 data.append(chunk)
                 bytesRead += chunk.count
+                if data.prefix(Self.binarySniffBytes).contains(0) {
+                    throw binaryError(path: relativePath, ext: ext, detail: .nulByte)
+                }
                 if chunk.count < count { break }
             }
         } catch let error as CancellationError {
+            throw error
+        } catch let error as FolderToolError {
             throw error
         } catch {
             throw FolderToolError.operationFailed(
                 "Could not read '\(relativePath)': \(error.localizedDescription)"
             )
-        }
-
-        if data.prefix(Self.binarySniffBytes).contains(0) {
-            throw binaryError(path: relativePath, ext: ext, detail: .nulByte)
         }
 
         let truncatedByByteLimit: Bool
@@ -1511,11 +1620,14 @@ struct FileReadTool: OsaurusTool {
 struct FileWriteTool: OsaurusTool, PermissionedTool {
     let name = "file_write"
     let description =
-        "Create or overwrite a UTF-8 text file — always pass `path` (that exact key) as the FIRST argument, before `content`. "
+        "Create, overwrite, or append to a UTF-8 text file — always pass `path` (that exact key) as the FIRST argument, before `content`. "
         + "Parent directories are created automatically. You MUST provide the file contents in the "
-        + "`content` parameter. Pass `dry_run: true` to preview the diff and risk warnings without "
-        + "writing. Not for structured `.xlsx` / `.pdf` / `.pptx` outputs — write text formats such "
-        + "as CSV/TSV/Markdown instead. "
+        + "`content` parameter. Use `mode: \"append\"` for any additive change so existing content remains intact. "
+        + "For a large file, keep calls bounded: write the first chunk normally, "
+        + "then pass `mode: \"append\"` for later chunks. Pass `dry_run: true` to preview the diff and risk warnings without "
+        + "writing. Binary document/package extensions such as `.docx`, `.xlsx`, `.pdf`, and `.pptx` "
+        + "are rejected — write UTF-8 formats such as Markdown/HTML/CSV/TSV instead. "
+        + "For runnable code, a successful write proves only persistence; run an available check before claiming it works. "
         + "Example: {\"path\": \"notes/summary.md\", \"content\": \"# Summary\\n...\"}"
     let parameters: JSONValue? = .object([
         "type": .string("object"),
@@ -1527,8 +1639,16 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
             ]),
             "content": .object([
                 "type": .string("string"),
+                "maxLength": .number(Double(WorkspaceToolContract.maxWriteContentCharacters)),
                 "description": .string(
-                    "Content to write to the file"
+                    "Content to write (maximum \(WorkspaceToolContract.maxWriteContentCharacters) characters per call; use append for more)"
+                ),
+            ]),
+            "mode": .object([
+                "type": .string("string"),
+                "enum": .array([.string("overwrite"), .string("append")]),
+                "description": .string(
+                    "Write mode (default: overwrite). Use append for additive changes or later chunks."
                 ),
             ]),
             "dry_run": .object([
@@ -1576,6 +1696,28 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
         guard case .value(let content) = contentReq else {
             return contentReq.failureEnvelope ?? ""
         }
+        var mode = "overwrite"
+        if args["mode"] != nil {
+            let modeReq = requireString(
+                args,
+                "mode",
+                expected: "`overwrite` or `append`",
+                tool: name
+            )
+            guard case .value(let requestedMode) = modeReq else {
+                return modeReq.failureEnvelope ?? ""
+            }
+            guard requestedMode == "overwrite" || requestedMode == "append" else {
+                return ToolEnvelope.failure(
+                    kind: .invalidArgs,
+                    message: "`mode` must be `overwrite` or `append`.",
+                    field: "mode",
+                    expected: "`overwrite` or `append`",
+                    tool: name
+                )
+            }
+            mode = requestedMode
+        }
         let dryRun = coerceBool(args["dry_run"]) ?? false
 
         // Writable combined mode: an absolute `/workspace/...` path is the
@@ -1595,10 +1737,12 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
                     tool: name
                 )
             }
+            var bridgeArgs = ["path": relativePath, "content": content]
+            if mode == "append" { bridgeArgs["mode"] = mode }
             return try await sandboxBridgeWrite(
                 bridge,
                 tool: name,
-                args: ["path": relativePath, "content": content]
+                args: bridgeArgs
             )
         }
 
@@ -1632,15 +1776,18 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
         case .failureEnvelope(let envelope):
             return envelope
         }
+        let proposedContent =
+            mode == "append" ? (previousContent ?? "") + content : content
 
         let parentDir = fileURL.deletingLastPathComponent()
         let createsParentDirectories = !FileManager.default.fileExists(atPath: parentDir.path)
         var preview = WorkspaceWriteSafety.preview(
             path: relativePath,
             previousContent: previousContent,
-            proposedContent: content,
+            proposedContent: proposedContent,
             operation: name,
             dryRun: dryRun,
+            overwritesExistingFile: mode != "append",
             createsParentDirectories: createsParentDirectories,
             fileURL: fileURL
         )
@@ -1660,7 +1807,7 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
         )
 
         // Write content
-        try content.write(to: fileURL, atomically: true, encoding: .utf8)
+        try proposedContent.write(to: fileURL, atomically: true, encoding: .utf8)
 
         if let sessionId = ChatExecutionContext.currentSessionId {
             let operation = FileOperation(
@@ -1674,6 +1821,12 @@ struct FileWriteTool: OsaurusTool, PermissionedTool {
             await FileOperationLog.shared.log(operation)
             preview.payload["operation_id"] = operation.id.uuidString
         }
+        preview.payload["file_reference"] = [
+            "kind": "workspace_file",
+            "path": relativePath,
+            "exportable": false,
+        ]
+        preview.payload["mode"] = mode
         return ToolEnvelope.success(
             tool: name,
             result: preview.payload,
@@ -1699,6 +1852,8 @@ struct FileEditTool: OsaurusTool, PermissionedTool {
         + "location in the file — include surrounding context lines if needed to ensure uniqueness. "
         + "Copy the RAW file text only: never include the `N|` line-number prefixes shown in "
         + "`file_read` output. Fails if `old_string` is not found or matches multiple locations. "
+        + "Binary document/package extensions are rejected; this tool edits UTF-8 source only. "
+        + "For runnable code, verify the result before claiming it works; a truncated diff is only a shortened review preview, not a partial edit. "
         + "Pass `dry_run: true` to preview the diff without modifying the file. "
         + "Example: {\"path\": \"config.py\", \"old_string\": \"debug = True\", \"new_string\": \"debug = False\"}"
     let parameters: JSONValue? = .object([
@@ -1876,6 +2031,7 @@ struct FileEditTool: OsaurusTool, PermissionedTool {
             proposedContent: content,
             operation: name,
             dryRun: dryRun,
+            overwritesExistingFile: false,
             createsParentDirectories: false,
             fileURL: fileURL
         )
@@ -1901,6 +2057,11 @@ struct FileEditTool: OsaurusTool, PermissionedTool {
             await FileOperationLog.shared.log(operation)
             preview.payload["operation_id"] = operation.id.uuidString
         }
+        preview.payload["file_reference"] = [
+            "kind": "workspace_file",
+            "path": relativePath,
+            "exportable": false,
+        ]
 
         return ToolEnvelope.success(
             tool: name,
@@ -2287,6 +2448,8 @@ struct FileUndoTool: OsaurusTool, PermissionedTool {
 // MARK: File Search Tool
 
 struct FileSearchTool: OsaurusTool {
+    typealias ContentReader = @Sendable (URL) async throws -> String?
+
     let name = "file_search"
     let description =
         "Search files in the working directory. With `target=\"content\"` (default) it finds text by "
@@ -2336,20 +2499,47 @@ struct FileSearchTool: OsaurusTool {
     ])
 
     private let fixedRootPath: URL?
+    /// Async seam for cancellation-owned content reads. Production uses a
+    /// close-on-cancel `FileHandle` owner; tests inject a suspended read so
+    /// cancellation can be asserted deterministically at the mid-read boundary.
+    private let contentReader: ContentReader
     /// Entries pulled from the enumerator before a search stops and reports
     /// truncation. Defaults to the shared budget; injectable so tests can
     /// exercise the bound without creating tens of thousands of files.
     private let maxEntriesVisited: Int
 
-    init(rootPath: URL? = nil, maxEntriesVisited: Int = FolderToolHelpers.maxSearchEntriesVisited) {
+    init(
+        rootPath: URL? = nil,
+        maxEntriesVisited: Int = FolderToolHelpers.maxSearchEntriesVisited,
+        contentReader: ContentReader? = nil
+    ) {
         self.fixedRootPath = rootPath
         self.maxEntriesVisited = maxEntriesVisited
+        self.contentReader =
+            contentReader
+            ?? { url in
+                try await Self.readContentCancellationAware(url)
+            }
     }
 
     /// The executing chat's folder root (TaskLocal scope), or the fixed
     /// root when this instance was built for a known folder. Helpers run
     /// inside `execute`'s task, so they resolve the same root.
     private var rootPath: URL? { FolderToolHelpers.resolveRoot(fixed: fixedRootPath) }
+
+    var canExposeToSpawnedOperation: Bool { true }
+
+    func spawnedOperationCancellationSupport(
+        argumentsJSON: String
+    ) -> SpawnedOperationCancellationSupport {
+        guard let args = parseArguments(argumentsJSON) else {
+            return .unsupported
+        }
+        let searchPath = args["path"] as? String ?? "."
+        return combinedFileRoute(path: searchPath) == .host
+            ? .cooperative
+            : .unsupported
+    }
 
     func execute(argumentsJSON: String) async throws -> String {
         let argsReq = requireArgumentsDictionary(argumentsJSON, tool: name)
@@ -2481,7 +2671,11 @@ struct FileSearchTool: OsaurusTool {
                 }
 
                 // Search file
-                switch searchFile(fileURL, pattern: pattern, maxResults: maxResults - totalMatches) {
+                switch try await searchFile(
+                    fileURL,
+                    pattern: pattern,
+                    maxResults: maxResults - totalMatches
+                ) {
                 case .matches(let matches):
                     results.append(contentsOf: matches)
                     totalMatches += matches.count
@@ -2491,7 +2685,7 @@ struct FileSearchTool: OsaurusTool {
             }
         } else {
             // Search single file
-            switch searchFile(searchURL, pattern: pattern, maxResults: maxResults) {
+            switch try await searchFile(searchURL, pattern: pattern, maxResults: maxResults) {
             case .matches(let matches):
                 results.append(contentsOf: matches)
                 totalMatches = matches.count
@@ -2765,7 +2959,12 @@ struct FileSearchTool: OsaurusTool {
         case skipped
     }
 
-    private func searchFile(_ url: URL, pattern: String, maxResults: Int) -> ContentSearchFileOutcome {
+    private func searchFile(
+        _ url: URL,
+        pattern: String,
+        maxResults: Int
+    ) async throws -> ContentSearchFileOutcome {
+        try Task.checkCancellation()
         // Skip obvious binaries by extension and any file over the size cap
         // before loading it into memory; the UTF-8 decode below is the final
         // backstop for misnamed or unexpectedly-large text.
@@ -2779,7 +2978,15 @@ struct FileSearchTool: OsaurusTool {
         {
             return .skipped
         }
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return .skipped }
+        let content: String
+        do {
+            guard let loaded = try await contentReader(url) else { return .skipped }
+            content = loaded
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .skipped
+        }
 
         guard let rootPath else { return .skipped }
         let relativePath = FolderToolHelpers.displayPath(for: url, under: rootPath)
@@ -2788,6 +2995,7 @@ struct FileSearchTool: OsaurusTool {
         var matches: [String] = []
 
         for (index, line) in lines.enumerated() {
+            try Task.checkCancellation()
             guard matches.count < maxResults else { break }
 
             if line.localizedCaseInsensitiveContains(pattern) {
@@ -2797,6 +3005,101 @@ struct FileSearchTool: OsaurusTool {
         }
 
         return .matches(matches)
+    }
+
+    /// Read at most the content-search byte limit on a detached worker whose
+    /// file descriptor remains owned by this call. Cancellation closes the
+    /// live handle before draining the worker, so a blocked host/network read
+    /// cannot outlive a stopped spawned run. Invalid UTF-8 and files that grow
+    /// past the cap retain the prior `skipped` behavior.
+    private static func readContentCancellationAware(_ url: URL) async throws -> String? {
+        let owner = ContentReadOwner(url: url)
+        let worker = Task.detached(priority: .userInitiated) {
+            try owner.read(
+                maxBytes: FolderToolHelpers.maxContentSearchFileBytes,
+                chunkBytes: 64 * 1024
+            )
+        }
+
+        do {
+            let data = try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                owner.requestAbort()
+                worker.cancel()
+            }
+            try Task.checkCancellation()
+            guard let data else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw error
+        }
+    }
+
+    /// Synchronous `FileHandle.read` itself does not observe Swift task
+    /// cancellation. This owner supplies the missing hard-abort edge by closing
+    /// the handle from the cancellation handler, then the caller awaits the
+    /// worker's termination before returning.
+    private final class ContentReadOwner: @unchecked Sendable {
+        private let url: URL
+        private let lock = NSLock()
+        private var handle: FileHandle?
+        private var abortRequested = false
+
+        init(url: URL) {
+            self.url = url
+        }
+
+        func read(maxBytes: Int, chunkBytes: Int) throws -> Data? {
+            try Task.checkCancellation()
+            let opened = try FileHandle(forReadingFrom: url)
+
+            lock.lock()
+            if abortRequested {
+                lock.unlock()
+                try? opened.close()
+                throw CancellationError()
+            }
+            handle = opened
+            lock.unlock()
+
+            defer { finish(opened) }
+
+            var data = Data()
+            data.reserveCapacity(maxBytes)
+            while data.count <= maxBytes {
+                try Task.checkCancellation()
+                let remaining = (maxBytes + 1) - data.count
+                let count = min(chunkBytes, remaining)
+                guard let chunk = try opened.read(upToCount: count), !chunk.isEmpty else {
+                    break
+                }
+                data.append(chunk)
+            }
+            try Task.checkCancellation()
+            return data.count > maxBytes ? nil : data
+        }
+
+        func requestAbort() {
+            lock.lock()
+            abortRequested = true
+            let opened = handle
+            handle = nil
+            lock.unlock()
+            try? opened?.close()
+        }
+
+        private func finish(_ opened: FileHandle) {
+            lock.lock()
+            if handle === opened {
+                handle = nil
+            }
+            lock.unlock()
+            try? opened.close()
+        }
     }
 }
 
@@ -2830,6 +3133,13 @@ struct ShellRunTool: OsaurusTool, PermissionedTool {
                         + "terminates from the chat card if needed)."
                 ),
             ]),
+            "background": .object([
+                "type": .string("boolean"),
+                "description": .string(
+                    "VM only. Run a long-lived server or watcher as a tracked background job. "
+                        + "Requires Background Processes to be enabled; rejected in Trusted Folder mode."
+                ),
+            ]),
         ]),
         "required": .array([.string("command")]),
     ])
@@ -2852,6 +3162,22 @@ struct ShellRunTool: OsaurusTool, PermissionedTool {
     func execute(argumentsJSON: String) async throws -> String {
         let argsReq = requireArgumentsDictionary(argumentsJSON, tool: name)
         guard case .value(let args) = argsReq else { return argsReq.failureEnvelope ?? "" }
+
+        if FolderToolHelpers.resolveRoot(fixed: fixedRootPath) == nil,
+            let bridge = ChatExecutionContext.sandboxReadBridge
+        {
+            return try await sandboxBridgeExec(bridge, argumentsJSON: argumentsJSON)
+        }
+
+        if coerceBool(args["background"]) == true {
+            return ToolEnvelope.failure(
+                kind: .invalidArgs,
+                message: "`background` is available only in VM Sandbox mode.",
+                field: "background",
+                expected: "omit in Trusted Folder mode",
+                tool: name
+            )
+        }
 
         guard let rootPath = FolderToolHelpers.resolveRoot(fixed: fixedRootPath) else {
             return FolderToolHelpers.noActiveFolderEnvelope(tool: name)
@@ -3028,6 +3354,7 @@ struct ShellRunTool: OsaurusTool, PermissionedTool {
             "stdout": truncateOutput(trimmedStdout),
             "stderr": truncateOutput(trimmedStderr),
             "exit_code": Int(exitCode),
+            "working_directory": rootPath.standardizedFileURL.path,
         ]
         if sink.terminationReason == .user {
             payload["killed_by"] = "user"
@@ -3039,7 +3366,8 @@ struct ShellRunTool: OsaurusTool, PermissionedTool {
             command: command,
             exitCode: exitCode,
             stdout: trimmedStdout,
-            stderr: trimmedStderr
+            stderr: trimmedStderr,
+            workingDirectory: rootPath.standardizedFileURL.path
         )
         if payload["killed_by"] as? String == "idle_timeout", let idleTimeout {
             warnings.append(

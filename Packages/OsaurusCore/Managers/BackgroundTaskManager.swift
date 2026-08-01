@@ -563,6 +563,7 @@ public final class BackgroundTaskManager: ObservableObject {
             type: .cancelled,
             json: PluginHostContext.serializeCancelledEvent(taskTitle: state.taskTitle)
         )
+        releaseResidencyAndRearmChatWarmup(after: state)
         scheduleAutoFinalize(backgroundId)
         persistRetainedTabs()
         recomputeSortedToastTasks()
@@ -639,6 +640,10 @@ public final class BackgroundTaskManager: ObservableObject {
             }
             return true
         }
+        // Headless conversations follow the agent's current default model
+        // on every turn (no-op for window chats); the retained branch above
+        // gets the same treatment via `context.prepare()`.
+        session.applyAgentDefaultModelForDispatch()
         // `send` clears any clarify pause / stale prompt overlay and starts
         // the next run; the streaming observer transitions the task back to
         // `.running`, so no status write is needed here.
@@ -855,12 +860,14 @@ public final class BackgroundTaskManager: ObservableObject {
                 && (request.source == .schedule
                     || request.source == .selfSchedule
                     || request.source == .watcher)
-            await ChatExecutionContext.$isUnattendedDispatch.withValue(unattended) {
-                await ChatExecutionContext.$isExternalSurface.withValue(externalSurface) {
-                    await ChatExecutionContext.$currentRunId.withValue(boundRunId) {
-                        await ChatExecutionContext.$currentRunActor.withValue(boundActor) {
-                            await ChatExecutionContext.$currentBackgroundId.withValue(context.id) {
-                                await context.start(prompt: request.prompt)
+            await ChatExecutionContext.$currentSessionSource.withValue(request.source) {
+                await ChatExecutionContext.$isUnattendedDispatch.withValue(unattended) {
+                    await ChatExecutionContext.$isExternalSurface.withValue(externalSurface) {
+                        await ChatExecutionContext.$currentRunId.withValue(boundRunId) {
+                            await ChatExecutionContext.$currentRunActor.withValue(boundActor) {
+                                await ChatExecutionContext.$currentBackgroundId.withValue(context.id) {
+                                    await context.start(prompt: request.prompt)
+                                }
                             }
                         }
                     }
@@ -1166,7 +1173,7 @@ public final class BackgroundTaskManager: ObservableObject {
     /// is the minimal mapping that's stable for Phase 1.
     private static func triggerKind(for source: SessionSource) -> AgentRunTriggerKind {
         switch source {
-        case .chat, .plugin, .http, .channel: return .user
+        case .chat, .plugin, .http, .channel, .imported: return .user
         case .schedule: return .recurringSchedule
         case .watcher: return .watcher
         case .selfSchedule: return .schedule
@@ -1241,6 +1248,7 @@ public final class BackgroundTaskManager: ObservableObject {
             outputText: outputText
         )
         emitPluginEvent(state, type: eventType, json: json)
+        releaseResidencyAndRearmChatWarmup(after: state)
         // Schedule terminal cleanup. Toast-visible sessions become lightweight
         // durable tabs (observers and live session released); truly headless
         // runs finalize completely. Both paths prevent stale observers from
@@ -1249,6 +1257,53 @@ public final class BackgroundTaskManager: ObservableObject {
         persistRetainedTabs()
         recomputeSortedToastTasks()
         pumpQueue()
+    }
+
+    /// A dispatched run that reached a terminal state no longer needs its
+    /// model, but nothing released it: the run's generations carry a
+    /// non-chat request source, so the chat-close acceleration skips the
+    /// model by design and it sat resident until the full idle policy
+    /// expired — while every speculative chat warm-up refused to displace
+    /// it ("a different model is resident"). Release the finished run's
+    /// residency claim, then re-arm warm-up on the active chat window.
+    ///
+    /// Eviction protections all stay in place: the runtime releases only a
+    /// resident owned by this task's source class, keeps anything an open
+    /// window or still-active task references (this task itself is already
+    /// terminal, so it no longer pins its model), re-checks wants and leases
+    /// at fire time, and the re-armed warm-up still loads with background
+    /// intent — it fills the freed slot and can never evict.
+    private func releaseResidencyAndRearmChatWarmup(after state: BackgroundTaskState) {
+        let taskSource = state.source.inferenceSource
+        let modelName = state.chatSession?.selectedModel
+        Task { @MainActor in
+            // The terminal transition can observably fire before the run's
+            // engine teardown releases its model lease and schedules the
+            // idle decision the acceleration below shortens. Give that
+            // teardown a beat; if it still hasn't settled, the guards
+            // no-op the release and the model simply follows the full idle
+            // policy (the freed-slot rewarm covers the chat either way).
+            try? await Task.sleep(for: .milliseconds(300))
+            if let modelName, !modelName.isEmpty, taskSource != .chatUI {
+                await ModelRuntime.shared.accelerateIdleUnloadAfterBackgroundTaskCompleted(
+                    modelName: modelName,
+                    taskSource: taskSource,
+                    keeping: ChatWindowManager.shared.activeLocalModelNames(),
+                    isModelStillWanted: { name in
+                        await MainActor.run {
+                            ChatWindowManager.shared.activeLocalModelNames().contains(name)
+                        }
+                    }
+                )
+            }
+            // Re-arm regardless of source (a detached chat-owned run blocks
+            // other windows' warm-ups the same way while it streams). The
+            // same-model window coalesces onto the still-resident model; a
+            // different-model window warms once the release lands — the
+            // freed-slot path in ChatWarmupController covers the case where
+            // this re-arm still races the unload.
+            ChatWindowManager.shared.rearmChatWarmupAfterBackgroundWork()
+        }
     }
 
     // MARK: - Private: Run-Trace Persistence

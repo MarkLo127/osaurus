@@ -1009,7 +1009,9 @@ struct DiscordConnectionTests {
             )
             let channelService = AgentChannelConnectionService(discordService: service)
             let tool = AgentChannelSendMessageTool(service: channelService)
-            let emojiMessage = String(repeating: "😀", count: 1001)
+            // 5,001 emoji = 10,002 UTF-16 units, above the chunked-send input
+            // cap (5 chunks x 2,000 units).
+            let emojiMessage = String(repeating: "😀", count: 5_001)
 
             let result = try await tool.execute(
                 argumentsJSON:
@@ -1018,6 +1020,41 @@ struct DiscordConnectionTests {
 
             #expect(EnvelopeAssertions.failureKind(result) == "invalid_args")
             #expect(await fake.sentMessageCount() == 0)
+        }
+    }
+
+    @Test func agentChannelSendToolChunksLongContentWithoutSplittingEmoji() async throws {
+        try await withIsolatedDiscordStores { credentials in
+            let fake = FakeDiscordAPIClient()
+            let service = DiscordConnectionService(client: fake, credentialStore: credentials)
+            try service.saveBotToken("discord-bot-token-super-secret")
+            try service.saveConfiguration(
+                DiscordConnectionConfiguration(
+                    writableChannelIds: ["333333333333333333"],
+                    writeEnabled: true
+                )
+            )
+            let channelService = AgentChannelConnectionService(discordService: service)
+            let tool = AgentChannelSendMessageTool(service: channelService)
+            // 1,001 emoji = 2,002 UTF-16 units: one unit over Discord's limit,
+            // so the send must split into two messages at a grapheme boundary.
+            let emojiMessage = String(repeating: "😀", count: 1_001)
+
+            let result = try await tool.execute(
+                argumentsJSON:
+                    #"{"connection_id":"discord","room_id":"333333333333333333","content":"\#(emojiMessage)","confirm_send":true}"#
+            )
+
+            let payload = try #require(EnvelopeAssertions.successPayload(result))
+            #expect(payload["chunk_count"] as? Int == 2)
+            #expect(await fake.sentMessageCount() == 2)
+            let contents = await fake.sentContents()
+            #expect(contents.joined() == emojiMessage)
+            for chunk in contents {
+                #expect(chunk.utf16.count <= 2_000)
+                // No torn surrogate pairs: every chunk is whole emoji.
+                #expect(chunk.allSatisfy { $0 == "😀" })
+            }
         }
     }
 
@@ -1045,6 +1082,54 @@ struct DiscordConnectionTests {
             #expect(payload["kind"] as? String == "discord_message_sent")
             #expect(await fake.sentMessageCount() == 1)
         }
+    }
+
+    @Test func transportSupervisorRunsGatewayPresenceWheneverBotTokenExists() async {
+        let presence = DiscordPresenceRuntimeSpy()
+        let receive = DiscordReceiveTransportRuntimeSpy()
+        let hasToken = DiscordTokenPresenceBox(true)
+        let supervisor = AgentChannelTransportSupervisor(
+            discordConfiguration: {
+                // Send-only setup: no readable channels or sender allowlist,
+                // so the polling receive runtime must stay off while the
+                // presence session still runs.
+                DiscordConnectionConfiguration(
+                    writableChannelIds: ["333333333333333333"],
+                    writeEnabled: true
+                )
+            },
+            discordHasBotToken: { hasToken.value() },
+            discordRuntime: receive,
+            discordPresenceRuntime: presence
+        )
+
+        await supervisor.refreshDiscordRuntime()
+        #expect(await presence.startCount() == 1)
+        #expect(await receive.startCount() == 0)
+
+        // Refresh is idempotent while the token stays saved.
+        await supervisor.refreshDiscordRuntime()
+        #expect(await presence.startCount() == 1)
+
+        hasToken.set(false)
+        await supervisor.refreshDiscordRuntime()
+        #expect(await presence.stopCount() == 1)
+    }
+
+    @Test func transportSupervisorStopsGatewayPresenceOnShutdown() async {
+        let presence = DiscordPresenceRuntimeSpy()
+        let supervisor = AgentChannelTransportSupervisor(
+            discordConfiguration: { DiscordConnectionConfiguration() },
+            discordHasBotToken: { true },
+            discordRuntime: DiscordReceiveTransportRuntimeSpy(),
+            discordPresenceRuntime: presence
+        )
+
+        await supervisor.refreshDiscordRuntime()
+        await supervisor.stop()
+
+        #expect(await presence.startCount() == 1)
+        #expect(await presence.stopCount() == 1)
     }
 
     @Test func nativeDiscordConnectionIdIsCaseInsensitive() async throws {
@@ -2108,21 +2193,34 @@ struct DiscordConnectionTests {
     }
 
     private func withIsolatedDiscordStores(
-        _ body: (any DiscordCredentialStorage) async throws -> Void
+        _ body: @Sendable (any DiscordCredentialStorage) async throws -> Void
     ) async throws {
-        let previousDirectory = DiscordConnectionConfigurationStore.overrideDirectory
-        let previousChannelDirectory = AgentChannelConfigurationStore.overrideDirectory
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("osaurus-discord-tests-\(UUID().uuidString)", isDirectory: true)
-        let credentials = FakeDiscordCredentialStore()
-        DiscordConnectionConfigurationStore.overrideDirectory = directory
-        AgentChannelConfigurationStore.overrideDirectory = directory
-        defer {
-            DiscordConnectionConfigurationStore.overrideDirectory = previousDirectory
-            AgentChannelConfigurationStore.overrideDirectory = previousChannelDirectory
-            try? FileManager.default.removeItem(at: directory)
+        // BOTH process-wide locks (fixed order: StoragePaths →
+        // AgentChannelConfiguration): this helper mutates
+        // `AgentChannelConfigurationStore.overrideDirectory`, a global also
+        // guarded by these locks in the runner/coexistence/hardening suites;
+        // holding neither raced them and intermittently pointed mid-test
+        // reads at a foreign temp directory.
+        try await StoragePathsTestLock.shared.run {
+            try await AgentChannelConfigurationTestLock.shared.run {
+                let previousDirectory = DiscordConnectionConfigurationStore.overrideDirectory
+                let previousChannelDirectory = AgentChannelConfigurationStore.overrideDirectory
+                let directory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(
+                        "osaurus-discord-tests-\(UUID().uuidString)",
+                        isDirectory: true
+                    )
+                let credentials = FakeDiscordCredentialStore()
+                DiscordConnectionConfigurationStore.overrideDirectory = directory
+                AgentChannelConfigurationStore.overrideDirectory = directory
+                defer {
+                    DiscordConnectionConfigurationStore.overrideDirectory = previousDirectory
+                    AgentChannelConfigurationStore.overrideDirectory = previousChannelDirectory
+                    try? FileManager.default.removeItem(at: directory)
+                }
+                try await body(credentials)
+            }
         }
-        try await body(credentials)
     }
 
     private func policy(named action: String, in policies: [[String: Any]]) -> [String: Any]? {
@@ -2215,6 +2313,10 @@ private actor FakeDiscordAPIClient: DiscordAPIClientProtocol {
 
     func lastSentContent() -> String? {
         sentMessages.last?.content
+    }
+
+    func sentContents() -> [String] {
+        sentMessages.map(\.content)
     }
 
     func currentUser(token: String) async throws -> DiscordBotIdentity {
@@ -2367,6 +2469,60 @@ private struct AgentChannelRegistrySnapshot {
     let pluginNames: Set<String>
     let alwaysLoadedNames: Set<String>
     let phantomNames: Set<String>
+}
+
+/// Mutable token-presence flag usable from the supervisor's @Sendable closures.
+private final class DiscordTokenPresenceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var present: Bool
+
+    init(_ present: Bool) {
+        self.present = present
+    }
+
+    func value() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return present
+    }
+
+    func set(_ newValue: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        present = newValue
+    }
+}
+
+private actor DiscordPresenceRuntimeSpy: DiscordGatewayPresenceMaintaining {
+    private var starts = 0
+    private var stops = 0
+
+    func start() async {
+        starts += 1
+    }
+
+    func stop() async {
+        stops += 1
+    }
+
+    func startCount() -> Int { starts }
+    func stopCount() -> Int { stops }
+}
+
+private actor DiscordReceiveTransportRuntimeSpy: AgentChannelReceiveTransportRuntime {
+    private var starts = 0
+    private var stops = 0
+
+    func start(pollInterval: TimeInterval) async {
+        starts += 1
+    }
+
+    func stop(now: Date) async {
+        stops += 1
+    }
+
+    func startCount() -> Int { starts }
+    func stopCount() -> Int { stops }
 }
 
 private extension DiscordMessage {

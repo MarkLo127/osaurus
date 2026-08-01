@@ -364,10 +364,33 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
             MasterKey.warmExistsCacheInBackground()
         }
 
+        // Seed channel credential availability (Keychain bot-token probes +
+        // the iMessage helper digest check) off-main so the first prompt
+        // preview / Settings recompute reads a cached answer instead of
+        // paying a synchronous SecItemCopyMatching on the main thread.
+        AgentChannelCredentialAvailability.shared.seedAllInBackground()
+
         Task { @MainActor in
+            // Await the identity-existence seed before the first
+            // `RemoteProviderManager.shared` touch below: its cold init
+            // runs the managed-router gate, and racing the fire-and-forget
+            // warm above means that gate can still pay a synchronous
+            // keychain probe on the main thread (a reported launch hang).
+            // Its own guard (rather than folding into the block below) keeps
+            // the exact provider-connect gate the keychain-disabled source
+            // policy asserts on.
             if !keychainDisabledTestMode {
-                await MCPProviderManager.shared.connectEnabledProviders()
-                await RemoteProviderManager.shared.connectEnabledProviders()
+                await MasterKey.seedExistsCacheOffMainActor()
+            }
+            if !keychainDisabledTestMode {
+                // MCP and remote-provider startup connects run concurrently:
+                // one slow or unreachable MCP server must not delay every
+                // model provider (each connect has its own timeout and
+                // bounded transient retry inside its manager).
+                async let mcpConnects: Void = MCPProviderManager.shared.connectEnabledProviders()
+                async let remoteConnects: Void =
+                    RemoteProviderManager.shared.connectEnabledProviders()
+                _ = await (mcpConnects, remoteConnects)
                 // Touch the search-provider manager so its one-time migration
                 // of osaurus.search plugin keys runs at launch, not lazily on
                 // the first web_search call / Settings visit.
@@ -379,6 +402,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
             }
             await ModelPickerItemCache.shared.prewarmModelCache()
         }
+
+        // NOTE: an earlier build pre-warmed NSOpenPanel here (3s after launch)
+        // to move the cold ViewBridge file-picker cost off the user's first
+        // click. Production Sentry data (APPLE-MACOS-1AG, 20 users in one day
+        // on 0.22.12) showed the prewarm itself blocked the main thread for
+        // 3s+ — the launch window is exactly when the machine is most
+        // contended, so the deferred init still stalled inside
+        // `-[NSSavePanel _initBridgeAndStuff]` waiting on the remote service.
+        // The prewarm is intentionally removed: the one-time cost belongs on
+        // an explicit user action (where the beachball is attributable and
+        // rare), not injected into every launch.
 
         // VecturaKit inits run sequentially. Memory DB opens first because
         // MemorySearchService.initialize() needs it for reverse maps.
@@ -489,6 +523,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         // unchanged corpus costs one folder scan per collection.
         Task { @MainActor in
             await embeddingInitTask.value
+            // The registry now loads off-main after the cold `shared` touch;
+            // wait for that snapshot so the startup pass indexes the real
+            // collection set instead of an empty pre-load array.
+            await KnowledgeManager.shared.ensureLoaded()
             KnowledgeManager.shared.scheduleIndexAll()
             KnowledgeFolderWatcher.shared.start()
         }
@@ -1200,6 +1238,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
             replyToTerminationOnce()
         }
 
+        // Last-resort exit backstop, OFF the main thread. Every other safety
+        // net here (the 22s watchdog above, the teardown chain, the bounded
+        // flushes in `applicationWillTerminate`) runs on the main actor — so a
+        // single synchronous call that wedges the main thread disables all of
+        // them at once and the app hangs forever (0.22.11 factory-reset
+        // report: journey stuck on "Quitting Osaurus" with MainThreadWatchdog
+        // logging a blocked main thread for minutes). Once this method runs,
+        // the quit is committed (`isTerminating` is never reset and the reply
+        // is always `true`), and the normal path already ends in
+        // `Darwin._exit(0)` — so hard-exiting from a GCD timer changes nothing
+        // except guaranteeing the process actually dies. 45s comfortably
+        // exceeds the 22s reply watchdog plus every bounded flush in
+        // `applicationWillTerminate` (~10s), so it can only fire when the
+        // main thread is truly stuck; a normal quit exits long before.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 45) {
+            log.error(
+                "Exit backstop fired 45s after termination began — main thread presumed stuck; forcing exit"
+            )
+            Darwin._exit(0)
+        }
+
         Task { @MainActor in
             // ── Phase 0: freeze everything that can dispatch new work ──
             // All cheap + synchronous (cancel timers / tasks, stop FSEvents,
@@ -1363,6 +1422,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         // Same for the sandbox and agent-delegation stores.
         SandboxConfigurationStore.flushPendingWrites()
         SubagentConfigurationStore.flushPendingWrites()
+
+        // Provider/tool configuration files (remote.json, mcp.json, …) persist
+        // through ConfigDiskWriter's background queue, and credentials persist
+        // through the Keychain serial write queue. Drain both, bounded, so a
+        // provider added or edited right before quit survives relaunch —
+        // otherwise `_exit` below drops the pending write and the provider
+        // comes back disabled or credential-less.
+        ConfigDiskWriter.flushPendingWrites()
+        Keychain.flushPendingWrites()
 
         // Aptabase batches analytics in an in-memory queue and normally drains
         // it from its own `willTerminate` observer — but that flush is async and

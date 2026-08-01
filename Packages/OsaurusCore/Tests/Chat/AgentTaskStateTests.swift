@@ -57,6 +57,16 @@ struct AgentTaskStateTests {
         )
     }
 
+    private func targetedEditEnvelope(before: String, after: String) -> String {
+        ToolEnvelope.success(
+            tool: "file_edit",
+            result: [
+                "before_content_sha256": WorkspaceWriteSafety.contentSHA256(before),
+                "content_sha256": WorkspaceWriteSafety.contentSHA256(after),
+            ]
+        )
+    }
+
     // MARK: - Classification
 
     @Test func classify_populatedListing() {
@@ -204,7 +214,7 @@ struct AgentTaskStateTests {
         #expect(state.heldResult(name: "file_read", argsJSON: #"{"path":"b.txt"}"#) == nil)
     }
 
-    @Test func dedupe_writesAreNeverHeld() {
+    @Test func dedupe_overwriteWritesAreNeverHeld() {
         let state = AgentTaskState()
         state.record(
             name: "file_write",
@@ -213,6 +223,47 @@ struct AgentTaskStateTests {
         )
         // A repeated write must always run.
         #expect(state.heldResult(name: "file_write", argsJSON: #"{"path":"a.txt","content":"x"}"#) == nil)
+    }
+
+    @Test func dedupe_exactSuccessfulAppendBecomesTypedNoop() throws {
+        let state = AgentTaskState()
+        let args = #"{"path":"a.txt","content":"SECOND\n","mode":"append"}"#
+        let result = ToolEnvelope.success(
+            tool: "file_write",
+            result: [
+                "action": "update",
+                "applied": true,
+                "path": "a.txt",
+                "mode": "append",
+            ] as [String: Any]
+        )
+        state.record(name: "file_write", argsJSON: args, result: result)
+
+        let replay = try #require(state.heldResult(name: "file_write", argsJSON: args))
+        let payload = try #require(ToolEnvelope.successPayload(replay) as? [String: Any])
+        #expect(payload["action"] as? String == "noop")
+        #expect(payload["applied"] as? Bool == false)
+        #expect(payload["reason"] as? String == "exact_append_already_applied")
+    }
+
+    @Test func dedupe_appendReexecutesAfterInterveningMutationOrMessage() {
+        let state = AgentTaskState()
+        let append = #"{"path":"a.txt","content":"x","mode":"append"}"#
+        let success = ToolEnvelope.success(
+            tool: "file_write",
+            result: ["applied": true, "path": "a.txt"] as [String: Any]
+        )
+        state.record(name: "file_write", argsJSON: append, result: success)
+        state.record(
+            name: "file_write",
+            argsJSON: #"{"path":"a.txt","content":"reset","mode":"overwrite"}"#,
+            result: success
+        )
+        #expect(state.heldResult(name: "file_write", argsJSON: append) == nil)
+
+        state.record(name: "file_write", argsJSON: append, result: success)
+        state.beginMessage()
+        #expect(state.heldResult(name: "file_write", argsJSON: append) == nil)
     }
 
     /// The read -> edit -> read-to-verify pattern: the write to the path
@@ -346,6 +397,76 @@ struct AgentTaskStateTests {
             name: "file_read",
             argsJSON: #"{"path":"a.txt"}"#,
             result: fileContentEnvelope(path: "a.txt")
+        )
+        #expect(state.nextStepBias() == nil)
+    }
+
+    @Test func bias_oversizedFileWriteRequiresChunkedAppendRecovery() {
+        let state = AgentTaskState()
+        state.record(
+            name: "file_write",
+            argsJSON: #"{"path":"index.html","content":"oversized"}"#,
+            result: ToolEnvelope.failure(
+                kind: .invalidArgs,
+                message: "Property 'content' must contain at most 30000 characters (got 32000).",
+                field: "content",
+                expected: "at most 30000 characters",
+                tool: "file_write",
+                retryable: true
+            )
+        )
+
+        let bias = state.nextStepBias() ?? ""
+        #expect(bias.contains("did not execute"))
+        #expect(bias.contains("Do not regenerate another complete oversized payload"))
+        #expect(bias.contains("\(WorkspaceToolContract.recommendedWriteChunkCharacters)"))
+        #expect(bias.contains(#"mode: "append""#))
+    }
+
+    @Test func bias_runnableWriteRequiresVerificationAndExplainsTruncatedDiff() {
+        let state = AgentTaskState()
+        let result = ToolEnvelope.success(
+            tool: "file_edit",
+            result: [
+                "kind": "workspace_write_result",
+                "path": "minesweeper.html",
+                "applied": true,
+                "dry_run": false,
+                "diff_truncated": true,
+                "content_write_complete": true,
+                "verification": [
+                    "status": "not_run",
+                    "reason": "Persistence is not runtime correctness.",
+                ],
+            ] as [String: Any]
+        )
+        state.record(
+            name: "file_edit",
+            argsJSON: #"{"path":"minesweeper.html","old_string":"x","new_string":"y"}"#,
+            result: result
+        )
+
+        let bias = state.nextStepBias() ?? ""
+        #expect(bias.contains("succeeded"))
+        #expect(bias.contains("only the review preview was shortened"))
+        #expect(bias.contains("Do not rewrite the whole file"))
+        #expect(bias.contains("proves persistence, not that runnable code works"))
+        #expect(bias.contains("shell_run"))
+    }
+
+    @Test func bias_plainTextWriteWithoutVerificationMetadataHasNoNudge() {
+        let state = AgentTaskState()
+        state.record(
+            name: "file_write",
+            argsJSON: #"{"path":"notes.txt","content":"done"}"#,
+            result: ToolEnvelope.success(
+                tool: "file_write",
+                result: [
+                    "kind": "workspace_write_result",
+                    "path": "notes.txt",
+                    "applied": true,
+                ]
+            )
         )
         #expect(state.nextStepBias() == nil)
     }
@@ -1089,6 +1210,161 @@ struct AgentTaskStateTests {
         }
         // The dedupe path still declines to short-circuit non-read tools.
         #expect(state.heldResult(name: "sandbox_exec", argsJSON: args) == nil)
+    }
+
+    // MARK: - One-shot stale rewrite protection
+
+    @Test func stalePreEditWholeRewriteIsRejectedOnlyOnce() {
+        let state = AgentTaskState()
+        let before = "const cells = board;"
+        let after = "const cells = board.children;"
+        state.record(
+            name: "file_edit",
+            argsJSON: #"{"path":"index.html"}"#,
+            result: targetedEditEnvelope(before: before, after: after)
+        )
+
+        let first = state.guardedResult(
+            name: "file_write",
+            argsJSON: #"{"path":"index.html","content":"const cells = board;"}"#
+        )
+        #expect(first.map(ToolEnvelope.isError) == true)
+        #expect(first?.contains("stale_pre_edit_rewrite") == true)
+
+        #expect(
+            state.guardedResult(
+                name: "file_write",
+                argsJSON: #"{"path":"index.html","content":"const cells = board;"}"#
+            ) == nil
+        )
+    }
+
+    @Test func sandboxTargetedEditArmsSameOneShotGuard() {
+        let state = AgentTaskState()
+        state.record(
+            name: "sandbox_write_file",
+            argsJSON:
+                #"{"path":"/workspace/app.js","old_string":"old","new_string":"new"}"#,
+            result: ToolEnvelope.success(
+                tool: "sandbox_write_file",
+                result: [
+                    "before_content_sha256": WorkspaceWriteSafety.contentSHA256("old"),
+                    "content_sha256": WorkspaceWriteSafety.contentSHA256("new"),
+                ]
+            )
+        )
+
+        #expect(
+            state.guardedResult(
+                name: "sandbox_write_file",
+                argsJSON: #"{"path":"/workspace/app.js","content":"old"}"#
+            ).map(ToolEnvelope.isError) == true
+        )
+    }
+
+    @Test func laterSamePathMutationDisarmsStaleRewriteGuard() {
+        let state = AgentTaskState()
+        let before = "old"
+        let after = "edited"
+        state.record(
+            name: "file_edit",
+            argsJSON: #"{"path":"app.js"}"#,
+            result: targetedEditEnvelope(before: before, after: after)
+        )
+        state.record(
+            name: "file_write",
+            argsJSON: #"{"path":"app.js","content":"appended","mode":"append"}"#,
+            result: ToolEnvelope.success(tool: "file_write", text: "appended")
+        )
+
+        #expect(
+            state.guardedResult(
+                name: "file_write",
+                argsJSON: #"{"path":"app.js","content":"old"}"#
+            ) == nil
+        )
+    }
+
+    @Test func dryRunDoesNotArmOrDisarmStaleRewriteGuard() {
+        let previewOnly = AgentTaskState()
+        previewOnly.record(
+            name: "file_edit",
+            argsJSON: #"{"path":"preview.js","dry_run":true}"#,
+            result: ToolEnvelope.success(
+                tool: "file_edit",
+                result: [
+                    "before_content_sha256": WorkspaceWriteSafety.contentSHA256("old"),
+                    "content_sha256": WorkspaceWriteSafety.contentSHA256("new"),
+                    "dry_run": true,
+                ] as [String: Any]
+            )
+        )
+        #expect(
+            previewOnly.guardedResult(
+                name: "file_write",
+                argsJSON: #"{"path":"preview.js","content":"old"}"#
+            ) == nil
+        )
+
+        let armed = AgentTaskState()
+        armed.record(
+            name: "file_edit",
+            argsJSON: #"{"path":"app.js"}"#,
+            result: targetedEditEnvelope(before: "old", after: "new")
+        )
+        armed.record(
+            name: "file_write",
+            argsJSON: #"{"path":"app.js","content":"preview","dry_run":true}"#,
+            result: ToolEnvelope.success(
+                tool: "file_write",
+                result: ["dry_run": true] as [String: Any]
+            )
+        )
+        #expect(
+            armed.guardedResult(
+                name: "file_write",
+                argsJSON: #"{"path":"app.js","content":"old"}"#
+            ).map(ToolEnvelope.isError) == true
+        )
+    }
+
+    @Test func fileUndoClearsOnlyAffectedEditSnapshot() {
+        let state = AgentTaskState()
+        state.record(
+            name: "file_edit",
+            argsJSON: #"{"path":"a.js"}"#,
+            result: targetedEditEnvelope(before: "a-old", after: "a-new")
+        )
+        state.record(
+            name: "file_edit",
+            argsJSON: #"{"path":"b.js"}"#,
+            result: targetedEditEnvelope(before: "b-old", after: "b-new")
+        )
+        state.record(
+            name: "file_undo",
+            argsJSON: #"{"path":"a.js"}"#,
+            result: ToolEnvelope.success(
+                tool: "file_undo",
+                result: [
+                    "kind": "file_undo",
+                    "undone_count": 1,
+                    "undone": [["path": "a.js"]],
+                ] as [String: Any]
+            )
+        )
+
+        #expect(
+            state.guardedResult(
+                name: "file_write",
+                argsJSON: #"{"path":"a.js","content":"a-old"}"#
+            ) == nil
+        )
+        #expect(
+            state.guardedResult(
+                name: "file_write",
+                argsJSON: #"{"path":"b.js","content":"b-old"}"#
+            ).map(ToolEnvelope.isError) == true
+        )
     }
 
     // MARK: - Native image generation → follow-up edit bias (#88)

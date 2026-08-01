@@ -91,13 +91,27 @@ extension ChatSession: ChatWarmupSessionContext {
             .sorted()
             .joined(separator: ",")
 
-        let fingerprint = "\(model)|\(context.cacheHint)|\(optionsFingerprint)|\(historyFingerprint)"
+        // Hash of the FULL rendered system prompt (static + dynamic sections
+        // + plugin instructions), not just `cacheHint`. `cacheHint` covers
+        // only the static prefix and tool schemas, so an edit that rewrites a
+        // dynamic section — a channel-destination mode change, an agent DB
+        // schema change, a sandbox-state flip — left the old fingerprint
+        // intact and the controller kept claiming a warm prefix for bytes
+        // the next send would no longer compose. The send then diverged
+        // inside the system message and cold-re-prefilled the entire
+        // conversation. Folding the rendered bytes in makes such edits
+        // re-warm with the current prompt instead.
+        let promptFingerprint = PromptSurfaceEvaluator.fnv1a(sys)
+
+        let fingerprint =
+            "\(model)|\(context.cacheHint)|\(promptFingerprint)|\(optionsFingerprint)|\(historyFingerprint)"
 
         return ChatWarmupPayload(
             model: model,
             messages: messages,
             tools: toolSpecs.isEmpty ? nil : toolSpecs,
             modelOptions: activeModelOptions.isEmpty ? nil : activeModelOptions,
+            cacheStableSystemPrefix: context.staticPrefix,
             fingerprint: fingerprint
         )
     }
@@ -188,7 +202,7 @@ extension ChatSession: ChatWarmupSessionContext {
     }
 
     func notifySessionBecameActive() {
-        warmupController.scheduleWarmup(session: self)
+        warmupController.handleSessionBecameActive(session: self)
     }
 
     func handleWarmupAfterRunCompleted(wasCancelled: Bool, hadError: Bool) {
@@ -207,7 +221,6 @@ extension ChatSession: ChatWarmupSessionContext {
     }
 
     func invalidateWarmupAfterContextShapeChange() {
-        warmupController.invalidateWarmState()
-        warmupController.scheduleWarmup(session: self)
+        warmupController.handleContextShapeChange(session: self)
     }
 }

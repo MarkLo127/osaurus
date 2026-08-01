@@ -272,11 +272,62 @@ struct SlackConnectionTests {
         )
 
         let body = try #require(SlackHTTPStubProtocol.lastRequestJSONBody())
-        #expect(body["parse"] as? String == "none")
+        // Agent sends post native Markdown through `markdown_text`; `parse`
+        // only applies to the plain-text mode.
+        #expect(body["markdown_text"] as? String == "Hello @channel <@U23456>")
+        #expect(body["text"] == nil)
+        #expect(body["parse"] == nil)
         #expect(body["link_names"] as? Bool == false)
         #expect(body["reply_broadcast"] as? Bool == false)
         #expect(body["unfurl_links"] as? Bool == false)
         #expect(body["unfurl_media"] as? Bool == false)
+    }
+
+    @Test func apiClientPlainTextModeStillDisablesParse() async throws {
+        let token = "xoxb-slack-bot-token-super-secret"
+        let session = SlackHTTPStubProtocol.session(
+            statusCode: 200,
+            body: """
+            {
+              "ok": true,
+              "channel": "C34567",
+              "ts": "1718800000.000100",
+              "message": {
+                "type": "message",
+                "user": "U12345",
+                "text": "plain",
+                "ts": "1718800000.000100"
+              }
+            }
+            """
+        )
+        let client = SlackAPIClient(
+            baseURL: URL(string: "https://slack.test/api")!,
+            sessionProvider: { session }
+        )
+
+        _ = try await client.sendMessage(
+            SlackOutboundMessageRequest(
+                channelId: "C34567",
+                content: "plain",
+                threadTs: nil,
+                useMarkdownText: false
+            ),
+            token: token
+        )
+
+        let body = try #require(SlackHTTPStubProtocol.lastRequestJSONBody())
+        #expect(body["text"] as? String == "plain")
+        #expect(body["markdown_text"] == nil)
+        #expect(body["parse"] as? String == "none")
+    }
+
+    @Test func recommendedManifestMarksBotAlwaysOnlineWithSocketMode() {
+        // Slack has no runtime presence API for bot tokens: `always_online`
+        // in the manifest is the only supported way to show the bot online.
+        let manifest = SlackSettingsView.recommendedManifest
+        #expect(manifest.contains("always_online: true"))
+        #expect(manifest.contains("socket_mode_enabled: true"))
     }
 
     @Test func apiClientHonorsBoundedConversationListLimit() async throws {
@@ -516,6 +567,36 @@ struct SlackConnectionTests {
             #expect(rows.count == 2)
             #expect(rows.compactMap { $0["id"] as? String } == ["C11111", "C22222"])
             #expect(await fake.conversationCursorsRequested() == [nil, "cursor-1"])
+        }
+    }
+
+    @Test func listChannelsResolvesDirectMessageNamesFromUsers() async throws {
+        try await withIsolatedSlackStores { credentials in
+            let fake = FakeSlackAPIClient()
+            // A DM has no name — only the peer user id. The row must surface
+            // the person's name (from users.list), never a bare D… id.
+            await fake.setConversationPages([
+                [
+                    SlackConversation(id: "C11111", name: "content", isChannel: true, isMember: true),
+                    SlackConversation(id: "D77777", user: "U55555", isIM: true),
+                ]
+            ])
+            let service = SlackConnectionService(client: fake, credentialStore: credentials)
+            try service.saveBotToken("xoxb-slack-bot-token-super-secret")
+            try service.saveConfiguration(
+                SlackConnectionConfiguration(
+                    configuredTeamIds: ["T12345"],
+                    readableChannelIds: ["C11111"]
+                )
+            )
+
+            let rows = try await service.listChannels(teamId: "T12345")
+
+            let dmRow = try #require(rows.first { $0["id"] as? String == "D77777" })
+            #expect(dmRow["name"] as? String == "Mike")
+            #expect(dmRow["type"] as? String == "im")
+            let channelRow = try #require(rows.first { $0["id"] as? String == "C11111" })
+            #expect(channelRow["name"] as? String == "content")
         }
     }
 

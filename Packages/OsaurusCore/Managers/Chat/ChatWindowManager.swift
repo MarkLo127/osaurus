@@ -486,6 +486,56 @@ public final class ChatWindowManager: NSObject, ObservableObject {
         )
     }
 
+    /// Stop visible and detached chat work that owns `name`, and cancel every
+    /// matching session's speculative warm-up before an explicit cache unload.
+    /// The runtime remains authoritative for HTTP/plugin consumers; this
+    /// bridge exists so chat-owned cancellation also updates chat lifecycle
+    /// state (`stopRequested`, terminal controls, and post-run warm-up policy).
+    @discardableResult
+    func prepareSessionsForExplicitModelUnload(named name: String) -> Int {
+        let sessions =
+            windowStates.values.map { $0.session }
+            + BackgroundTaskManager.shared.activeTaskSessions()
+        var seen: Set<ObjectIdentifier> = []
+        var prepared = 0
+
+        for session in sessions {
+            guard seen.insert(ObjectIdentifier(session)).inserted,
+                let selectedModel = session.selectedModel,
+                ChatWarmupController.isSelectedModelResident(
+                    selectedModel,
+                    in: [name]
+                )
+            else { continue }
+
+            session.prepareForExplicitModelUnload()
+            prepared += 1
+        }
+        return prepared
+    }
+
+    /// True only for the visible key chat while Osaurus is frontmost. Runtime
+    /// residency notifications use this stronger predicate instead of
+    /// `lastFocusedWindowId`, which can still refer to a hidden/background
+    /// window and must never authorize a speculative replacement warm-up.
+    func isChatWindowActive(id: UUID) -> Bool {
+        guard NSApp.isActive, let window = nsWindows[id] else { return false }
+        return window.isVisible && window.isKeyWindow
+    }
+
+    /// Re-arm speculative warm-up on the active chat window after a
+    /// registry-owned background run reaches a terminal state. While that run
+    /// streamed, `shouldAttemptWarmup` refused every warm-up; nothing else
+    /// re-triggers one until the user refocuses the window, so a chat left
+    /// open through a dispatched run stayed cold indefinitely. Only the
+    /// visible key window re-arms — hidden windows warm on their next focus,
+    /// by which point the finished run's residency release has settled.
+    func rearmChatWarmupAfterBackgroundWork() {
+        for (id, state) in windowStates where isChatWindowActive(id: id) {
+            state.session.notifySessionBecameActive()
+        }
+    }
+
     /// Set a callback to be invoked when window is about to close (for session saving)
     public func setCloseCallback(for windowId: UUID, callback: @escaping () -> Void) {
         sessionCallbacks[windowId] = callback
@@ -729,6 +779,11 @@ public final class ChatWindowManager: NSObject, ObservableObject {
     // Called by delegate when window becomes key
     fileprivate func windowDidBecomeKey(id: UUID) {
         lastFocusedWindowId = id
+        // Idle residency may have unloaded this window's selected model while
+        // the user was away. Re-arm the existing speculative warm-up when the
+        // user returns; its RAM and competing-residency gates still decide
+        // whether background loading is safe.
+        windowStates[id]?.session.notifySessionBecameActive()
         // Distinguishes "user was in a chat window" from a management tab when
         // localizing a layout-engine app hang (no first-party frame in stack).
         CrashReportingService.recordBreadcrumb(category: "navigation", message: "chat.window focused")

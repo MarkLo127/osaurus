@@ -4,7 +4,9 @@ import SwiftUI
 // MARK: - Configuration View
 struct ConfigurationView: View {
     @ObservedObject private var themeManager = ThemeManager.shared
+    @ObservedObject private var onboardingService = OnboardingService.shared
     @EnvironmentObject private var updater: UpdaterViewModel
+    @EnvironmentObject private var server: ServerController
 
     /// Use computed property to always get the current theme from ThemeManager
     private var theme: ThemeProtocol { themeManager.currentTheme }
@@ -56,12 +58,12 @@ struct ConfigurationView: View {
     /// thread each (auto-)save.
     @State private var loadedServerConfig: ServerConfiguration = .default
 
-    /// System runtime knobs for subagent helper jobs (local handoff, RAM-safety
-    /// preflight, image load policy). Backed by `SubagentConfigurationStore`;
-    /// the per-agent spawn/image config lives in each agent's Subagents tab.
-    /// Saved immediately on change (like the toast toggles), not through the
-    /// debounced `saveConfiguration` path.
+    /// Built-in/main-chat Spawn policy plus system runtime knobs for subagent
+    /// helper jobs. Backed by `SubagentConfigurationStore`; custom agents keep
+    /// their own policy in their Subagents tab. Saved immediately on change
+    /// (like the toast toggles), not through the debounced configuration path.
     @State private var subagentConfiguration = SubagentConfigurationStore.snapshot()
+    @State private var subagentConfigurationBaseline = SubagentConfigurationStore.snapshot()
 
     // Search (passed from sidebar)
     @Binding var searchText: String
@@ -305,8 +307,8 @@ struct ConfigurationView: View {
         }
     }
 
-    /// The relocated subagent runtime knobs (was the dedicated Spawn tab). The
-    /// component wraps itself in a `SettingsSection` card, so this only adds the
+    /// Main-chat Spawn policy and shared subagent runtime knobs. The component
+    /// wraps itself in a `SettingsSection` card, so this only adds the
     /// search-visibility gate.
     @ViewBuilder private var subagentSection: some View {
         if matchesSearch(Self.subagentKeywords) {
@@ -475,10 +477,6 @@ struct ConfigurationView: View {
                         .ignoresSafeArea()
 
                     VStack(spacing: 24) {
-                        ProgressView()
-                            .scaleEffect(1.5)
-                            .tint(theme.accentColor)
-
                         VStack(spacing: 8) {
                             Text("Resetting Osaurus", bundle: .module)
                                 .font(.system(size: 18, weight: .bold))
@@ -487,6 +485,29 @@ struct ConfigurationView: View {
                             Text("Deleting data and preferences. Please wait…", bundle: .module)
                                 .font(.system(size: 14))
                                 .foregroundColor(theme.secondaryText)
+                        }
+
+                        if let journey = onboardingService.resetJourney {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(journey.steps) { step in
+                                    FactoryResetStepRow(step: step)
+                                }
+                            }
+                            .frame(width: 260)
+                            .padding(14)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(theme.primaryBackground.opacity(0.5))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(theme.cardBorder, lineWidth: 1)
+                                    )
+                            )
+                            .animation(.easeOut(duration: 0.2), value: journey)
+                        } else {
+                            ProgressView()
+                                .scaleEffect(1.5)
+                                .tint(theme.accentColor)
                         }
                     }
                     .padding(40)
@@ -507,10 +528,26 @@ struct ConfigurationView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.primaryBackground)
+        // Wipe-failure notice: `.contained` so it layers above the reset
+        // overlay in this view rather than routing to the window host. The
+        // binding's setter fires on dismiss and resumes `performFactoryReset`,
+        // which then terminates the app.
+        .themedAlert(
+            "Factory Reset Incomplete",
+            isPresented: Binding(
+                get: { onboardingService.wipeFailureMessage != nil },
+                set: { if !$0 { OnboardingService.shared.acknowledgeWipeFailure() } }
+            ),
+            message: onboardingService.wipeFailureMessage,
+            buttons: [.destructive(L("Quit")) {}],
+            presentationStyle: .contained
+        )
         .environment(\.theme, themeManager.currentTheme)
         .onAppear {
             loadConfiguration()
-            subagentConfiguration = SubagentConfigurationStore.snapshot()
+            let latest = SubagentConfigurationStore.snapshot()
+            subagentConfigurationBaseline = latest
+            subagentConfiguration = latest
             withAnimation(.easeOut(duration: 0.25).delay(0.05)) {
                 hasAppeared = true
             }
@@ -522,13 +559,41 @@ struct ConfigurationView: View {
         // `saveConfiguration`). The re-snapshot on the change notification keeps
         // this in sync if an agent's Subagents tab edits the shared store.
         .onChange(of: subagentConfiguration) { _, newValue in
-            SubagentConfigurationStore.save(newValue)
+            // Only a direct edit of this form's batch limit may turn Server
+            // Concurrent Sessions from Automatic into an explicit number.
+            // Store notifications update the baseline before they update the
+            // form, so their mirrored value compares equal here and cannot
+            // echo back as a new user-authored Server override.
+            let batchLimitWasExplicitlyEdited =
+                SpawnBatchConcurrencyContract.configuredLimit(for: newValue)
+                != SpawnBatchConcurrencyContract.configuredLimit(
+                    for: subagentConfigurationBaseline
+                )
+            let saved = SubagentConfigurationStore.saveEditorSnapshot(
+                newValue,
+                loadedBaseline: subagentConfigurationBaseline
+            )
+            subagentConfigurationBaseline = saved
+            if saved != newValue { subagentConfiguration = saved }
+            if batchLimitWasExplicitlyEdited {
+                Task { @MainActor in
+                    await server.applyMainChatBatchLimit(from: saved)
+                }
+            }
         }
         .onReceive(
             NotificationCenter.default.publisher(for: .subagentConfigurationChanged)
         ) { _ in
             let latest = SubagentConfigurationStore.snapshot()
-            if latest != subagentConfiguration { subagentConfiguration = latest }
+            let reconciled = SubagentConfiguration.mergingEditorSnapshot(
+                subagentConfiguration,
+                loadedBaseline: subagentConfigurationBaseline,
+                live: latest
+            )
+            subagentConfigurationBaseline = latest
+            if reconciled != subagentConfiguration {
+                subagentConfiguration = reconciled
+            }
         }
         // Any edit to a save-relevant field reschedules the debounced save.
         // `currentFormState` is the same snapshot the dirty check uses, so
@@ -1194,3 +1259,64 @@ private struct ToastPositionPicker: View {
 // `SettingsButtonStyle`) now live in
 // `Packages/OsaurusCore/Views/Settings/Shared/SettingsPrimitives.swift`
 // so the Server → Settings tab can reuse them.
+
+// MARK: - Factory Reset Journey Row
+
+/// One row of the factory-reset overlay: status icon + phase label, in the
+/// same visual language as the sandbox provisioning journey's `StepRow`.
+private struct FactoryResetStepRow: View {
+    let step: FactoryResetJourney.Step
+
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        HStack(spacing: 10) {
+            statusIcon
+                .frame(width: 16)
+            Text(label)
+                .font(.system(size: 13, weight: step.status == .inProgress ? .semibold : .regular))
+                .foregroundColor(labelColor)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var label: String {
+        switch step.id {
+        case .browser: return L("Clearing browser data")
+        case .keychain: return L("Removing Keychain secrets")
+        case .preferences: return L("Clearing preferences")
+        case .data: return L("Deleting app data")
+        case .quit: return L("Quitting Osaurus")
+        }
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        switch step.status {
+        case .completed:
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 14))
+                .foregroundColor(theme.successColor)
+        case .inProgress:
+            ProgressView()
+                .controlSize(.small)
+                .scaleEffect(0.7)
+        case .pending:
+            Image(systemName: "circle")
+                .font(.system(size: 14))
+                .foregroundColor(theme.tertiaryText.opacity(0.6))
+        case .failed:
+            Image(systemName: "xmark.octagon.fill")
+                .font(.system(size: 14))
+                .foregroundColor(theme.errorColor)
+        }
+    }
+
+    private var labelColor: Color {
+        switch step.status {
+        case .completed, .inProgress: return theme.primaryText
+        case .pending: return theme.tertiaryText
+        case .failed: return theme.errorColor
+        }
+    }
+}

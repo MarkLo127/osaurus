@@ -20,6 +20,49 @@ struct ModelManagerTests {
         ModelManager.skipBackgroundOrgFetchForTests = true
     }
 
+    @Test("installed matcher prefers full ids and rejects ambiguous short aliases")
+    func installedMatcherUsesStableIdentity() {
+        let models = [
+            MLXModel(
+                id: "Org-A/Shared-Bundle",
+                name: "Shared A",
+                description: "",
+                downloadURL: "https://example.com/a"
+            ),
+            MLXModel(
+                id: "Org-B/Shared-Bundle",
+                name: "Shared B",
+                description: "",
+                downloadURL: "https://example.com/b"
+            ),
+        ]
+
+        #expect(
+            ModelManager.matchInstalledMLXModel(
+                named: "org-a/shared-bundle",
+                in: models
+            )?.id == "Org-A/Shared-Bundle"
+        )
+        #expect(
+            ModelManager.matchInstalledMLXModel(
+                named: "ORG-B/SHARED-BUNDLE",
+                in: models
+            )?.id == "Org-B/Shared-Bundle"
+        )
+        #expect(
+            ModelManager.matchInstalledMLXModel(
+                named: "Shared-Bundle",
+                in: [models[0]]
+            )?.id == "Org-A/Shared-Bundle"
+        )
+        #expect(
+            ModelManager.matchInstalledMLXModel(
+                named: "Shared-Bundle",
+                in: models
+            ) == nil
+        )
+    }
+
     @Test func loadAvailableModels_initializesStates() async throws {
         // `ModelManager.init` calls `loadAvailableModels()` synchronously, while
         // download-state probing is intentionally applied off-main so startup
@@ -300,10 +343,15 @@ struct ModelManagerTests {
         try fm.createDirectory(at: repo, withIntermediateDirectories: true)
         try Data("{}".utf8).write(to: repo.appendingPathComponent("config.json"))
         try Data("{}".utf8).write(to: repo.appendingPathComponent("tokenizer.json"))
-        try Data("{}".utf8).write(to: repo.appendingPathComponent("model.safetensors.index.json"))
+        try Data(#"{"metadata":{"total_size":44298536392}}"#.utf8)
+            .write(to: repo.appendingPathComponent("model.safetensors.index.json"))
 
         let detected = ModelManager.scanLocalModels(at: root)
         #expect(detected.map(\.id).contains("JANGQ-AI/Step-3.7-Flash-JANGTQ_K"))
+        #expect(
+            detected.first { $0.id == "JANGQ-AI/Step-3.7-Flash-JANGTQ_K" }?
+                .downloadSizeBytes == 44_298_536_392
+        )
     }
 
     @Test func scanLocalModels_detectsHighShardCountWithoutFixedMissLoop() async throws {

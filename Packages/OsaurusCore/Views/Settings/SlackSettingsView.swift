@@ -104,7 +104,7 @@ struct SlackSettingsView: View {
             icon: AgentChannelKind.slack.icon,
             gradient: AgentChannelKind.slack.brandGradient,
             title: AgentChannelKind.slack.displayName,
-            subtitle: L("Read and reply in allowlisted workspace channels"),
+            subtitle: L("Read and reply in allowlisted channels and DMs"),
             sections: AgentChannelProviderSetupSection.sections,
             selection: $selectedSectionId,
             sectionStatus: sectionStatus(for:),
@@ -292,6 +292,14 @@ struct SlackSettingsView: View {
             .font(.system(size: 11))
             .foregroundColor(theme.tertiaryText)
             .fixedSize(horizontal: false, vertical: true)
+
+            Text(
+                "The manifest marks the bot as always online so it shows a green presence dot in Slack. For an existing app, reapply the manifest under “App Manifest” on api.slack.com/apps — the flag only takes effect after the manifest is saved again.",
+                bundle: .module
+            )
+            .font(.system(size: 11))
+            .foregroundColor(theme.tertiaryText)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -424,7 +432,7 @@ struct SlackSettingsView: View {
 
     private var accessSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            AgentChannelSectionHeading(L("Choose channels and people"))
+            AgentChannelSectionHeading(L("Choose conversations and people"))
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -481,7 +489,7 @@ struct SlackSettingsView: View {
             VStack(alignment: .leading, spacing: 12) {
                 SettingsToggle(
                     title: L("Allow Sending on Slack"),
-                    description: L("Let agents post to write-allowlisted Slack channels. Channel writes must also be on globally."),
+                    description: L("Let agents post to write-allowlisted Slack channels. The global Sending switch in Channels must also be on."),
                     isOn: $writeEnabled.animation(.easeOut(duration: 0.2))
                 )
 
@@ -501,12 +509,12 @@ struct SlackSettingsView: View {
 
     private var stepDispatchSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            AgentChannelSectionHeading(L("Send incoming messages to an agent"))
+            AgentChannelSectionHeading(L("Reply to incoming messages"))
 
             SettingsToggle(
-                title: L("Dispatch Incoming Messages to an Agent"),
+                title: L("Reply with an Agent"),
                 description: L(
-                    "Run verified, allowlisted Slack messages in a private channel session. External-surface tool restrictions still apply."
+                    "Choose which agent answers verified, allowlisted Slack messages. Replies run in a private channel session; external-surface tool restrictions still apply."
                 ),
                 isOn: $inboundDispatchEnabled.animation(.easeOut(duration: 0.2))
             )
@@ -625,15 +633,18 @@ struct SlackSettingsView: View {
     }
 
     /// Discovered conversations mapped into the shared routing editor's
-    /// room shape, member channels first.
+    /// room shape, member channels first. DMs resolve to the person's name.
     private var routableRooms: [AgentChannelRoutableRoom] {
         guard let discovery else { return [] }
+        let userNames = discoveredUserNames(discovery)
         return discovery.conversations
             .sorted { ($0.isMember ? 0 : 1, $0.name ?? $0.id) < ($1.isMember ? 0 : 1, $1.name ?? $1.id) }
             .map { conversation in
-                AgentChannelRoutableRoom(
+                let name = conversation.resolvedDisplayName(userNames: userNames)
+                let kind = AgentChannelRoomKind.from(providerKind: conversation.kind)
+                return AgentChannelRoutableRoom(
                     id: conversation.id,
-                    name: conversation.name.map { "#\($0)" } ?? conversation.id
+                    name: name != conversation.id && kind.usesHashPrefix ? "#\(name)" : name
                 )
             }
     }
@@ -681,7 +692,7 @@ struct SlackSettingsView: View {
                     title: L("Writable Channel IDs"),
                     text: $writableChannelIdsText,
                     placeholder: L("C0123ABC — one per line"),
-                    help: L("Channels agents may post to when Slack and global channel writes are enabled.")
+                    help: L("Channels agents may post to when Slack sending and the global Sending switch are on.")
                 )
                 AgentChannelMultilineSettingsField(
                     title: L("Authorized Sender IDs"),
@@ -735,13 +746,23 @@ struct SlackSettingsView: View {
         )
     }
 
+    /// Names for DM conversations, resolved from the discovered user list.
+    private func discoveredUserNames(_ discovery: SlackConnectionDiscovery) -> [String: String] {
+        var names: [String: String] = [:]
+        for user in discovery.users {
+            names[user.id] = user.displayName
+        }
+        return names
+    }
+
     private func channelSelector(_ discovery: SlackConnectionDiscovery) -> some View {
         let readableIds = Set(parseIds(readableChannelIdsText))
         let writableIds = Set(parseIds(writableChannelIdsText))
+        let userNames = discoveredUserNames(discovery)
         let shaped = AgentChannelSelectorList.shape(
             discovery.conversations,
             query: channelSearch,
-            fields: { [$0.displayName, $0.id, $0.kind] },
+            fields: { [$0.resolvedDisplayName(userNames: userNames), $0.id, $0.kind] },
             state: {
                 AgentChannelReadWriteSelection(
                     read: readableIds.contains($0.id),
@@ -752,7 +773,7 @@ struct SlackSettingsView: View {
         )
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Channels", bundle: .module)
+                Text("Conversations", bundle: .module)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(theme.primaryText)
                 Spacer()
@@ -761,20 +782,28 @@ struct SlackSettingsView: View {
                     .foregroundColor(theme.tertiaryText)
             }
 
+            Text(
+                "Channels, private channels, and direct messages the bot can see. Read lets agents see a conversation, Write lets them post there.",
+                bundle: .module
+            )
+            .font(.system(size: 10))
+            .foregroundColor(theme.tertiaryText)
+            .fixedSize(horizontal: false, vertical: true)
+
             AgentChannelSelectorSearchField(
-                placeholder: L("Search channels by name or ID"),
+                placeholder: L("Search conversations by name or ID"),
                 text: $channelSearch
             )
 
             AgentChannelSelectorListCard(
                 shaped: shaped,
-                emptyText: L("No matching Slack channels")
+                emptyText: L("No matching Slack conversations")
             ) { item in
-                channelSelectionRow(item.entry, access: item.state)
+                channelSelectionRow(item.entry, access: item.state, userNames: userNames)
             }
 
             Text(
-                "Read and Write are independent allowlists. Unjoined channels stay unavailable until the bot is invited.",
+                "Channels stay unavailable until the bot is invited; direct messages work right away.",
                 bundle: .module
             )
             .font(.system(size: 10))
@@ -785,27 +814,34 @@ struct SlackSettingsView: View {
 
     private func channelSelectionRow(
         _ channel: SlackConversation,
-        access: AgentChannelReadWriteSelection
+        access: AgentChannelReadWriteSelection,
+        userNames: [String: String]
     ) -> some View {
         let canUse = channel.isMember || channel.isIM || channel.isMPIM
         let readSelected = access.read
         let writeSelected = access.write
+        let kind = AgentChannelRoomKind.from(providerKind: channel.kind)
+        let name = channel.resolvedDisplayName(userNames: userNames)
+        let nameIsResolved = name != channel.id
         return HStack(spacing: 9) {
-            Image(systemName: channelIcon(channel))
+            Image(systemName: kind.icon)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(canUse ? theme.secondaryText : theme.tertiaryText)
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
-                    Text(channel.displayName)
+                    Text(nameIsResolved && kind.usesHashPrefix ? "#\(name)" : name)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(canUse ? theme.primaryText : theme.tertiaryText)
                         .lineLimit(1)
-                    if channel.isPrivate {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 8))
+                    if let badge = kind.badgeLabel {
+                        Text(badge)
+                            .font(.system(size: 8, weight: .semibold))
                             .foregroundColor(theme.tertiaryText)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(theme.tertiaryBackground))
                     }
                     if !canUse {
                         Text("Invite bot", bundle: .module)
@@ -925,13 +961,6 @@ struct SlackSettingsView: View {
         }
     }
 
-    private func channelIcon(_ channel: SlackConversation) -> String {
-        if channel.isIM { return "person.fill" }
-        if channel.isMPIM { return "person.2.fill" }
-        if channel.isPrivate { return "number.square.fill" }
-        return "number"
-    }
-
     private func loadConfiguration() {
         let configuration = SlackConnectionConfigurationStore.load()
         configuredTeamIdsText = configuration.configuredTeamIds.joined(separator: "\n")
@@ -947,9 +976,12 @@ struct SlackSettingsView: View {
         inboundRequireMention = configuration.inboundDispatch.requireMention
         inboundContinueThreads = configuration.inboundDispatch.continueThreads
         inboundAutoReplyEnabled = configuration.inboundDispatch.autoReplyEnabled
-        botTokenSaved = SlackConnectionService.shared.hasBotToken()
-        signingSecretSaved = SlackConnectionService.shared.hasSigningSecret()
-        appTokenSaved = SlackConnectionService.shared.hasAppToken()
+        Task {
+            let presence = await SlackConnectionService.shared.credentialPresenceOffMain()
+            botTokenSaved = presence.botToken
+            signingSecretSaved = presence.signingSecret
+            appTokenSaved = presence.appToken
+        }
         // Arm autosave only after the stored configuration has hydrated the
         // draft, so hydration itself is never mistaken for an edit.
         lastSavedDraft = currentDraft
@@ -960,9 +992,12 @@ struct SlackSettingsView: View {
     }
 
     private func refreshDiscovery(showStatus announce: Bool) {
-        guard persistPendingSecrets() else { return }
         isDiscovering = true
         Task {
+            guard await persistPendingSecrets() else {
+                isDiscovering = false
+                return
+            }
             do {
                 let loaded = try await SlackConnectionService.shared.discoverConfigurationOptions()
                 await MainActor.run {
@@ -1003,20 +1038,29 @@ struct SlackSettingsView: View {
     }
 
     /// Persist any pasted secrets to Keychain before the configuration save.
-    private func persistPendingSecrets() -> Bool {
+    /// Awaited off the main thread so a slow securityd never beachballs the
+    /// Save/Test buttons.
+    private func persistPendingSecrets() async -> Bool {
+        let pendingBot = hasPendingBotToken ? botToken : nil
+        let trimmedSigning = signingSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingSigning = trimmedSigning.isEmpty ? nil : signingSecret
+        let trimmedApp = appToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingApp = trimmedApp.isEmpty ? nil : appToken
         do {
-            if hasPendingBotToken {
-                try SlackConnectionService.shared.saveBotToken(botToken)
+            try await SlackConnectionService.shared.saveCredentialsOffMain(
+                botToken: pendingBot,
+                signingSecret: pendingSigning,
+                appToken: pendingApp
+            )
+            if pendingBot != nil {
                 botToken = ""
                 botTokenSaved = true
             }
-            if !signingSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                try SlackConnectionService.shared.saveSigningSecret(signingSecret)
+            if pendingSigning != nil {
                 signingSecret = ""
                 signingSecretSaved = true
             }
-            if !appToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                try SlackConnectionService.shared.saveAppToken(appToken)
+            if pendingApp != nil {
                 appToken = ""
                 appTokenSaved = true
             }
@@ -1105,26 +1149,30 @@ struct SlackSettingsView: View {
     }
 
     private func removeBotToken() {
-        _ = SlackConnectionService.shared.deleteBotToken()
         botToken = ""
         botTokenSaved = false
         discovery = nil
-        refreshReceiveRuntime()
+        Task {
+            await SlackConnectionService.shared.deleteBotTokenOffMain()
+            refreshReceiveRuntime()
+        }
         showStatus(L("Slack bot token removed"), isError: false)
     }
 
     private func removeSigningSecret() {
-        _ = SlackConnectionService.shared.deleteSigningSecret()
         signingSecret = ""
         signingSecretSaved = false
+        Task { await SlackConnectionService.shared.deleteSigningSecretOffMain() }
         showStatus(L("Slack signing secret removed"), isError: false)
     }
 
     private func removeAppToken() {
-        _ = SlackConnectionService.shared.deleteAppToken()
         appToken = ""
         appTokenSaved = false
-        refreshReceiveRuntime()
+        Task {
+            await SlackConnectionService.shared.deleteAppTokenOffMain()
+            refreshReceiveRuntime()
+        }
         showStatus(L("Slack Socket Mode app token removed"), isError: false)
     }
 
@@ -1176,9 +1224,12 @@ struct SlackSettingsView: View {
     /// than dismissing on a superficially successful save.
     private func saveAndDismiss() {
         autosaveTask?.cancel()
-        guard persistPendingSecrets(), saveConfiguration(), persistAdditionalWorkspace() else { return }
         isSaving = true
         Task {
+            guard await persistPendingSecrets(), saveConfiguration(), persistAdditionalWorkspace() else {
+                isSaving = false
+                return
+            }
             await AgentChannelTransportSupervisor.shared.refreshSlackRuntime()
             guard inboundDispatchEnabled else {
                 await MainActor.run {
@@ -1212,9 +1263,12 @@ struct SlackSettingsView: View {
     /// user sees in the form, not a stale save.
     private func testConnection() {
         autosaveTask?.cancel()
-        guard persistPendingSecrets(), saveConfiguration(), persistAdditionalWorkspace() else { return }
         isTesting = true
         Task {
+            guard await persistPendingSecrets(), saveConfiguration(), persistAdditionalWorkspace() else {
+                isTesting = false
+                return
+            }
             await AgentChannelTransportSupervisor.shared.refreshSlackRuntime()
             let discoveryResult: Result<SlackConnectionDiscovery, any Error>
             do {
@@ -1444,7 +1498,7 @@ struct SlackSettingsView: View {
         }
         if inboundDispatchEnabled, inboundAgentId == nil, inboundRoutes.isEmpty {
             return (
-                L("Select a default agent or add a routing rule for incoming Slack messages."),
+                L("Choose an agent to reply, or add a rule for incoming Slack messages."),
                 .behavior
             )
         }
@@ -1464,13 +1518,17 @@ struct SlackSettingsView: View {
         return nil
     }
 
-    private static let recommendedManifest = """
+    /// Slack has no runtime presence API for bot tokens: the only supported
+    /// way to show the bot with a green presence dot is the static
+    /// `always_online` manifest flag. Existing apps must reapply the manifest
+    /// (App Manifest page) for the change to take effect.
+    static let recommendedManifest = """
     display_information:
       name: Osaurus
     features:
       bot_user:
         display_name: Osaurus
-        always_online: false
+        always_online: true
     oauth_config:
       scopes:
         bot:

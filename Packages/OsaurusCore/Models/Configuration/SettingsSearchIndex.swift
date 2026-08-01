@@ -486,15 +486,18 @@ public enum SettingsSearchIndex {
             title: "Channels",
             keywords: [
                 "agent channels", "integrations", "channels", "discord", "slack", "telegram",
-                "custom json", "custom http", "remote channel",
+                "imessage", "custom json", "custom http", "remote channel",
             ]
         ),
         .init(
             id: "agentChannels.globalWrites",
             tab: .agentChannels,
-            section: "Global Channel Safety",
-            title: "Global Channel Writes",
-            keywords: ["kill switch", "disable writes", "remote writes", "channel writes"]
+            section: "Sending",
+            title: "Allow Agents to Send Messages",
+            keywords: [
+                "kill switch", "disable writes", "remote writes", "channel writes",
+                "sending", "read-only", "pause sending",
+            ]
         ),
         .init(
             id: "agentChannels.discord",
@@ -525,11 +528,43 @@ public enum SettingsSearchIndex {
             ]
         ),
         .init(
+            id: "agentChannels.imessage",
+            tab: .agentChannels,
+            section: "Native Integrations",
+            title: "iMessage",
+            keywords: [
+                "imessage", "messages app", "imessage chats", "full disk access",
+                "messages automation", "imsg helper", "sender allowlist",
+                "tapback", "unsend", "sip", "library validation",
+            ]
+        ),
+        .init(
             id: "agentChannels.customJSON",
             tab: .agentChannels,
             section: "Custom JSON Connections",
             title: "Custom HTTP Connections",
             keywords: ["custom json channels", "webhook", "agent-channels.json", "secret references"]
+        ),
+        .init(
+            id: "agentChannels.destinations",
+            tab: .agentChannels,
+            section: "Messages Agents Can Start",
+            title: "Messages Agents Can Start",
+            keywords: [
+                "proactive", "publish", "destination", "binding", "outbound",
+                "autonomous", "draft", "confirm", "agent destinations",
+                "new messages", "agent posting", "post", "room", "auto-send",
+            ]
+        ),
+        .init(
+            id: "agentChannels.outbox",
+            tab: .agentChannels,
+            section: "Outbox",
+            title: "Channel Outbox",
+            keywords: [
+                "outbox", "pending approval", "approve message", "queued messages",
+                "outbound activity", "drafts",
+            ]
         ),
 
         // MARK: Image Generation tab (subTab values are ImageGenerationTab raw values)
@@ -575,14 +610,13 @@ public enum SettingsSearchIndex {
             subTab: "Models"
         ),
 
-        // MARK: Subagents (runtime knobs in the Settings tab)
+        // MARK: Subagents (main-chat policy + runtime knobs in Settings)
         // There is no global master switch and no dedicated Spawn tab anymore.
-        // What remains are the shared runtime knobs (local handoff, RAM-safety),
-        // folded into the Settings tab as a "Subagents" card. Per-agent
-        // spawn/image config (targets, models, permissions, budgets) — including
-        // the built-in main chat — is configured in each agent's Subagents tab
-        // (not indexed here). Global image-generation settings live in the
-        // Image Generation tab (indexed above).
+        // The built-in main chat has no AgentDetailView, so its allowed agents,
+        // models, notes, permission, worker tools, and budgets live alongside
+        // shared handoff/RAM-safety knobs in this card. Custom-agent spawn/image
+        // policy remains in each agent's Subagents tab. Global image-generation
+        // settings live in the Image Generation tab (indexed above).
         .init(
             id: "settings.subagents",
             tab: .settings,
@@ -590,7 +624,19 @@ public enum SettingsSearchIndex {
             title: "Subagents",
             keywords: [
                 "spawn", "delegate", "delegation", "subagent",
-                "helper jobs", "agent delegation",
+                "helper jobs", "agent delegation", "allowed agents",
+                "allowed models", "main chat", "batch subagents",
+            ]
+        ),
+        .init(
+            id: "settings.subagents.mainChat",
+            tab: .settings,
+            section: "Subagents",
+            title: "Main Chat Spawn",
+            keywords: [
+                "default agent", "built-in chat", "spawn pool", "model notes",
+                "worker tools", "max subagents", "permission", "cloud model",
+                "local model",
             ]
         ),
         .init(

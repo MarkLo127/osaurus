@@ -576,11 +576,14 @@ public struct AgentCapabilities: Sendable, Equatable {
     /// Like `image`, the effective tool is additionally gated on an installed
     /// AppleScript model (see `SubagentToolVisibility`).
     public var appleScriptEnabled: Bool
-    /// Agents this agent may launch via `spawn_agent`. Empty → the
+    /// Stable IDs of agents this agent may launch via `spawn_agent`. Empty → the
     /// `spawn_agent` tool stays hidden (nothing to spawn). The Default agent
     /// ignores this and uses the global
-    /// `SubagentConfiguration.spawnableAgentNames` pool instead.
-    public var spawnableAgentNames: [String]
+    /// `SubagentConfiguration.spawnableAgentIDs` pool instead.
+    public var spawnableAgentIDs: [UUID]
+    /// Transitional in-memory payload for callers constructing a capability
+    /// snapshot from legacy settings. It is never an authorization key.
+    var legacySpawnableAgentNames: [String]
     /// Raw model ids this agent may hand a task to via `spawn_model` (no agent).
     /// Empty → the `spawn_model` tool stays hidden. The Default agent ignores
     /// this and uses the global `SubagentConfiguration.spawnableModelNames` pool.
@@ -616,6 +619,7 @@ public struct AgentCapabilities: Sendable, Equatable {
         spawnDelegationEnabled: Bool = false,
         imageEnabled: Bool = false,
         appleScriptEnabled: Bool = false,
+        spawnableAgentIDs: [UUID] = [],
         spawnableAgentNames: [String] = [],
         spawnableModelNames: [String] = [],
         spawnableModelNotes: [String: String] = [:],
@@ -637,7 +641,8 @@ public struct AgentCapabilities: Sendable, Equatable {
         self.spawnDelegationEnabled = spawnDelegationEnabled
         self.imageEnabled = imageEnabled
         self.appleScriptEnabled = appleScriptEnabled
-        self.spawnableAgentNames = spawnableAgentNames
+        self.spawnableAgentIDs = SpawnableAgentIdentity.normalizedIDs(spawnableAgentIDs)
+        self.legacySpawnableAgentNames = spawnableAgentNames
         self.spawnableModelNames = spawnableModelNames
         self.spawnableModelNotes = spawnableModelNotes
         self.knowledgeEnabled = knowledgeEnabled
@@ -894,9 +899,9 @@ public struct AgentSettings: Codable, Sendable, Equatable {
     public var browserUseEnabled: Bool
     /// Per-agent opt-in for the `spawn` tool. Default off; gated
     /// authoritatively in `resolveTools` (stripped unless enabled AND the agent
-    /// has at least one spawnable agent). The global `SubagentConfiguration`
-    /// still supplies the system defaults (budgets, RAM safety, permissions);
-    /// this is the per-agent enable.
+    /// has at least one spawnable agent or model). Custom agents resolve their
+    /// own pool, notes, permissions, worker-tool access, and budgets; global
+    /// engine and RAM-safety ceilings still apply to every local launch.
     public var spawnDelegationEnabled: Bool
     /// Per-agent opt-in for the `image` tool (generate + edit). Default off;
     /// split from `spawnDelegationEnabled` so an agent can spawn without image.
@@ -915,11 +920,15 @@ public struct AgentSettings: Codable, Sendable, Equatable {
     /// with a warning). The Default agent uses the global
     /// `SubagentConfiguration.defaultAppleScriptExecutionMode` instead.
     public var appleScriptExecutionMode: AppleScriptExecutionMode
-    /// Agents this agent may launch via `spawn_agent` (per-agent allow-list).
+    /// Stable IDs of agents this agent may launch via `spawn_agent`
+    /// (per-agent allow-list).
     /// Empty → the `spawn_agent` tool stays hidden (nothing to spawn). The
     /// Default agent ignores this and uses the global pool in
     /// `SubagentConfiguration`.
-    public var spawnableAgentNames: [String]
+    public var spawnableAgentIDs: [UUID]
+    /// Decode-only compatibility payload for pre-UUID agent JSON. Runtime
+    /// authorization never matches this list directly.
+    var legacySpawnableAgentNames: [String]
     /// Raw model ids this agent may hand a task to via `spawn_model` (no agent;
     /// per-agent allow-list). Empty → the `spawn_model` tool stays hidden. The
     /// Default agent ignores this and uses the global
@@ -992,6 +1001,7 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         appleScriptEnabled: Bool = false,
         appleScriptModelId: String? = nil,
         appleScriptExecutionMode: AppleScriptExecutionMode = .default,
+        spawnableAgentIDs: [UUID] = [],
         spawnableAgentNames: [String] = [],
         spawnableModelNames: [String] = [],
         spawnableModelNotes: [String: String] = [:],
@@ -1024,7 +1034,8 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         self.appleScriptEnabled = appleScriptEnabled
         self.appleScriptModelId = appleScriptModelId
         self.appleScriptExecutionMode = appleScriptExecutionMode
-        self.spawnableAgentNames = spawnableAgentNames
+        self.spawnableAgentIDs = SpawnableAgentIdentity.normalizedIDs(spawnableAgentIDs)
+        self.legacySpawnableAgentNames = spawnableAgentNames
         self.spawnableModelNames = spawnableModelNames
         self.spawnableModelNotes = spawnableModelNotes
         self.imageGenerationModelId = imageGenerationModelId
@@ -1095,8 +1106,10 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         appleScriptExecutionMode =
             (try? c.decodeIfPresent(AppleScriptExecutionMode.self, forKey: .appleScriptExecutionMode))
             ?? .default
-        spawnableAgentNames =
-            try c.decodeIfPresent([String].self, forKey: .spawnableAgentNames) ?? []
+        spawnableAgentIDs =
+            (try? c.decodeIfPresent([UUID].self, forKey: .spawnableAgentIDs)) ?? []
+        legacySpawnableAgentNames =
+            (try? c.decodeIfPresent([String].self, forKey: .spawnableAgentNames)) ?? []
         // Raw model ids for `spawn_model` + their notes. Lenient (`try?`) so a
         // malformed pool/notes map never discards the rest of the settings.
         spawnableModelNames =
@@ -1154,6 +1167,19 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         return result
     }
 
+    /// Convert a legacy display-name allow-list to stable identity only when a
+    /// name has exactly one current match. Case-colliding names fail closed.
+    func migratingLegacySpawnableAgents(using agents: [Agent]) -> AgentSettings {
+        var migrated = self
+        migrated.spawnableAgentIDs = SpawnableAgentIdentity.migratedIDs(
+            ids: spawnableAgentIDs,
+            legacyNames: legacySpawnableAgentNames,
+            agents: agents
+        )
+        migrated.legacySpawnableAgentNames = []
+        return migrated
+    }
+
     private enum CodingKeys: String, CodingKey {
         case dbEnabled
         case schedule
@@ -1174,6 +1200,8 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         case appleScriptEnabled
         case appleScriptModelId
         case appleScriptExecutionMode
+        case spawnableAgentIDs
+        /// Legacy decode-only key.
         case spawnableAgentNames
         case spawnableModelNames
         case spawnableModelNotes
@@ -1211,7 +1239,10 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         try c.encode(appleScriptEnabled, forKey: .appleScriptEnabled)
         try c.encodeIfPresent(appleScriptModelId, forKey: .appleScriptModelId)
         try c.encode(appleScriptExecutionMode, forKey: .appleScriptExecutionMode)
-        try c.encode(spawnableAgentNames, forKey: .spawnableAgentNames)
+        try c.encode(
+            SpawnableAgentIdentity.normalizedIDs(spawnableAgentIDs),
+            forKey: .spawnableAgentIDs
+        )
         try c.encode(spawnableModelNames, forKey: .spawnableModelNames)
         try c.encode(spawnableModelNotes, forKey: .spawnableModelNotes)
         try c.encodeIfPresent(imageGenerationModelId, forKey: .imageGenerationModelId)

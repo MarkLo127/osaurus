@@ -351,6 +351,20 @@ struct RuntimePolicySourceTests {
         #expect(serverView.contains("reloadAccessKeys(readKeychain: true)"))
     }
 
+    @Test("automatic relay identity assignment keeps Keychain work off the main actor")
+    func automaticRelayIdentityAssignmentKeepsKeychainWorkOffMainActor() throws {
+        let agentManager = try Self.source("Managers/AgentManager.swift")
+        let serverView = try Self.source("Views/Settings/ServerView.swift")
+        let relayManager = try Self.source("Networking/RelayTunnelManager.swift")
+
+        #expect(agentManager.contains("func assignAddressInBackground(to agent: Agent)"))
+        #expect(agentManager.contains("Task.detached(priority: .userInitiated)"))
+        #expect(serverView.contains("agentManager.assignAddressInBackground(to: agent)"))
+        #expect(!serverView.contains("try? agentManager.assignAddress(to: agent)"))
+        #expect(relayManager.contains("AgentManager.shared.assignAddressInBackground(to: agent)"))
+        #expect(!relayManager.contains("try? AgentManager.shared.assignAddress(to: agent)"))
+    }
+
     @Test("plugin host inference carries agent memory like HTTP chat")
     func pluginHostInferenceInjectsAgentMemoryPrefix() throws {
         let source = try Self.source("Services/Plugin/PluginHostAPI.swift")
@@ -762,11 +776,12 @@ struct RuntimePolicySourceTests {
         // This assertion is a repin tripwire, and it earned its keep: PR #1986
         // shipped titled "(+ vmlx repin)" carrying no repin at all, and the live
         // gate run against that build proved only the osaurus-side change while
-        // appearing to bless the engine work too. Note the pin lives in FOUR
-        // files -- Package.swift, Packages/OsaurusCore/Package.resolved, and both
-        // xcworkspace Package.resolved files. Miss one and the app resolves a
-        // revision nobody proved.
-        let expectedRuntimeHardenedRevision = "64b6ca2433c12af2dd6955f317366f0f9626e061"
+        // appearing to bless the engine work too. Note the checked-in pin
+        // lives in FOUR files -- Package.swift, OsaurusCore Package.resolved,
+        // and both xcworkspace Package.resolved files. Miss one and a release
+        // surface resolves a revision nobody proved. OsaurusEvals resolves
+        // this manifest transitively and its local Package.resolved is ignored.
+        let expectedRuntimeHardenedRevision = "0d838879a7ea102eb6e034f1d33ac0dbb51c02c3"
         let manifestRevision = try Self.vmlxPinRevision(in: manifest)
         let coreResolvedRevision = try Self.vmlxPinRevision(in: coreResolved)
         let workspaceRevision = try Self.vmlxPinRevision(in: workspaceResolved)
@@ -776,7 +791,7 @@ struct RuntimePolicySourceTests {
         #expect(manifestRevision == appRevision)
         #expect(
             manifestRevision == expectedRuntimeHardenedRevision,
-            "Osaurus must consume the proven vmlx-swift revision with schema-bound Qwen XML string-array recovery, Gemma reasoning routing, and static system-prefix SSD cache boundaries together with the existing runtime checkpoints. An internally-consistent older pin is still not wired"
+            "Osaurus must consume the proven vmlx-swift revision with schema-bound Qwen XML string-array recovery, Gemma reasoning routing, scalar text-only Gemma system prompts, static system-prefix SSD cache boundaries, Nanbeige 4.2 looped-transformer runtime support, and actor-consistent atomic BatchEngine capacity snapshots together with the existing runtime checkpoints. An internally-consistent older pin is still not wired"
         )
         #expect(manifest.contains("https://github.com/osaurus-ai/vmlx-swift"))
         #expect(!manifest.contains("https://github.com/osaurus-ai/vmlx-swift-lm"))
@@ -796,7 +811,7 @@ struct RuntimePolicySourceTests {
         let source = try Self.source("Services/ModelRuntime.swift")
         let taskStart = try #require(source.range(of: "let task = Task<SessionHolder, Error>"))
         let taskStore = try #require(
-            source.range(of: "loadingTasks[name] = LoadingTaskRecord(id: loadID, task: task)")
+            source.range(of: "loadingTasks[name] = LoadingTaskRecord(")
         )
         let success = try #require(
             source.range(of: "return try await finishLoadedContainer", range: taskStore.upperBound ..< source.endIndex)
@@ -1153,6 +1168,8 @@ struct RuntimePolicySourceTests {
         let api = try Self.source("Models/API/OpenAIAPI.swift")
         let chatEngine = try Self.source("Services/Chat/ChatEngine.swift")
         let chatView = try Self.source("Views/Chat/ChatView.swift")
+        let chatWarmup = try Self.source("Services/Chat/ChatSessionWarmup.swift")
+        let warmupController = try Self.source("Services/Chat/ChatWarmupController.swift")
         let httpHandler = try Self.source("Networking/HTTPHandler.swift")
         let adapter = try Self.source("Services/ModelRuntime/MLXBatchAdapter.swift")
 
@@ -1163,6 +1180,12 @@ struct RuntimePolicySourceTests {
         #expect(chatView.contains("req.cacheStableSystemPrefix ="))
         #expect(chatView.contains("finalReq.cacheStableSystemPrefix ="))
         #expect(chatView.contains("self.isRemoteAgentTarget ? nil : context.staticPrefix"))
+        #expect(chatWarmup.contains("cacheStableSystemPrefix: context.staticPrefix"))
+        #expect(
+            warmupController.contains(
+                "request.cacheStableSystemPrefix = payload.cacheStableSystemPrefix"
+            )
+        )
         #expect(httpHandler.contains("enriched.cacheStableSystemPrefix = composed.staticPrefix"))
         #expect(adapter.contains("cacheStableSystemPrefix: buildRawPrompt == nil"))
         #expect(adapter.contains("cacheStableSystemPrefix: cacheStableSystemPrefix"))
@@ -1229,10 +1252,13 @@ struct RuntimePolicySourceTests {
         #expect(http.contains(#""resolved_kv_retention_tokens""#))
     }
 
-    @Test("Server settings concurrency UI does not advertise false restart or runtime wiring")
-    func serverSettingsConcurrencyUIDoesNotAdvertiseFalseRestartOrRuntimeWiring() throws {
+    @Test("Server settings concurrency UI exposes only runtime-wired controls")
+    func serverSettingsConcurrencyUIExposesOnlyRuntimeWiredControls() throws {
         let tab = try Self.source("Views/Settings/ServerSettingsTabContent.swift")
         let concurrency = try Self.source("Views/Settings/ServerSettings/ConcurrencySection.swift")
+        let store = try Self.source(
+            "Models/Configuration/ServerRuntimeSettingsStore.swift"
+        )
 
         guard let restartStart = tab.range(of: "private var pendingRestart: Bool"),
             let restartEnd = tab.range(
@@ -1247,16 +1273,22 @@ struct RuntimePolicySourceTests {
         #expect(!pendingRestart.contains("concurrency.maxConcurrentSequences"))
 
         #expect(concurrency.contains("`maxConcurrentSequences` hot-resizes"))
-        #expect(concurrency.contains("runtime consumers for these fields are not yet implemented"))
-        #expect(concurrency.contains("pins the BatchEngine to one active slot"))
+        #expect(concurrency.contains("pins each local model to one active job"))
         #expect(concurrency.contains("Concurrent Sessions"))
+        #expect(concurrency.contains("Shared with Main Chat Spawn"))
+        #expect(concurrency.contains("SpawnBatchConcurrencyContract.bounds"))
         #expect(concurrency.contains("Continuous Batching"))
         #expect(concurrency.contains("Prompt Prefill Chunk Size"))
-        #expect(
-            concurrency.contains(
-                "draft.concurrency.maxConcurrentSequences != nil || clamped != 1"
-            )
-        )
+        #expect(!concurrency.contains("Planned Batching Controls"))
+        #expect(!concurrency.contains("Prefill Batch Size"))
+        #expect(!concurrency.contains("Completion Batch Size"))
+        #expect(!concurrency.contains("SMELT Mode"))
+        #expect(!concurrency.contains("$draft.concurrency.prefillBatchSize"))
+        #expect(!concurrency.contains("$draft.concurrency.completionBatchSize"))
+        #expect(!concurrency.contains("$draft.concurrency.smeltMode"))
+        #expect(store.contains("canonical.concurrency.smeltMode = .disabled"))
+        #expect(concurrency.contains("if trimmed.isEmpty"))
+        #expect(concurrency.contains("draft.concurrency.maxConcurrentSequences = nil"))
     }
 
     @Test("Tools settings panel separates wired parser overrides from planned host bridges")
@@ -1440,6 +1472,28 @@ struct RuntimePolicySourceTests {
             ),
             "ChatEngine stream logging wrapper must pass StreamingStatsHint through before honoring cancellation"
         )
+    }
+
+    @Test("iteration-cap wrap-up uses the typed chat stream decoder")
+    func iterationCapWrapUpCannotLeakStreamingSentinels() throws {
+        let chat = try Self.source("Views/Chat/ChatView.swift")
+        let start = try #require(
+            chat.range(of: "if runResult.exit == .iterationCapReached && isRunActive(runId)")
+        )
+        let end = try #require(
+            chat.range(
+                of: "} catch is CancellationError {",
+                range: start.upperBound ..< chat.endIndex
+            )
+        )
+        let block = String(chat[start.lowerBound ..< end.lowerBound])
+
+        #expect(block.contains("try await processStreamDeltas("))
+        #expect(block.contains("assistantTurn = finalTurn"))
+        #expect(block.contains("AgentLoopBudget.appendingTransientNotices("))
+        #expect(block.contains("AgentToolLoop.iterationCapWrapUpNotice"))
+        #expect(!block.contains("let processor = StreamingDeltaProcessor("))
+        #expect(!block.contains("processor.receiveDelta(delta)"))
     }
 
     @Test("ChatEngine honors tool choice none by bypassing local tool dispatch")
@@ -1912,6 +1966,72 @@ struct RuntimePolicySourceTests {
         )
     }
 
+    @Test("explicit model unload drains its generation wrapper before waiting for the lease")
+    func explicitModelUnloadDrainsGenerationBeforeLease() throws {
+        let runtime = try Self.source("Services/ModelRuntime.swift")
+        let start = try #require(runtime.range(of: "private func unloadClaimed("))
+        let end = try #require(
+            runtime.range(
+                of: "private func finishResidencyUnloadClaim(",
+                range: start.upperBound ..< runtime.endIndex
+            )
+        )
+        let unloadBody = String(runtime[start.lowerBound ..< end.lowerBound])
+
+        let shutdown = try #require(
+            unloadBody.range(of: "await MLXBatchAdapter.Registry.shared.shutdownEngine(for: name)")
+        )
+        let cancel = try #require(
+            unloadBody.range(
+                of: "await cancelActiveGeneration(for: name)",
+                range: shutdown.upperBound ..< unloadBody.endIndex
+            )
+        )
+        let leaseWait = try #require(
+            unloadBody.range(
+                of: "await ModelLease.shared.waitForZero(",
+                range: cancel.upperBound ..< unloadBody.endIndex
+            )
+        )
+
+        #expect(shutdown.lowerBound < cancel.lowerBound)
+        #expect(cancel.lowerBound < leaseWait.lowerBound)
+        #expect(
+            unloadBody.components(separatedBy: "await cancelActiveGeneration(for: name)").count == 2,
+            "Explicit unload must cancel the selected model exactly once"
+        )
+    }
+
+    @Test("model cache unload UI exposes progress and fail-closed result")
+    func modelCacheUnloadUIExposesProgressAndFailure() throws {
+        let service = try Self.source("Services/Inference/MLXService.swift")
+        let windows = try Self.source("Managers/Chat/ChatWindowManager.swift")
+        let chat = try Self.source("Views/Chat/ChatView.swift")
+        let warmup = try Self.source("Services/Chat/ChatWarmupController.swift")
+        let view = try Self.source("Views/Model/ModelCacheInspectorView.swift")
+
+        #expect(service.contains("leaseDrainTimeoutSeconds: Double = 5"))
+        #expect(service.contains(") async -> Bool"))
+        #expect(service.contains("leaseDrainTimeoutSeconds: leaseDrainTimeoutSeconds"))
+        #expect(
+            service.contains(
+                "ChatWindowManager.shared.prepareSessionsForExplicitModelUnload(named: name)"
+            )
+        )
+        #expect(windows.contains("func prepareSessionsForExplicitModelUnload(named name: String)"))
+        #expect(windows.contains("session.prepareForExplicitModelUnload()"))
+        #expect(chat.contains("func prepareForExplicitModelUnload()"))
+        #expect(chat.contains("if isSendActiveForComposer"))
+        #expect(chat.contains("stop()"))
+        #expect(warmup.contains("func cancelPendingWorkForExplicitModelUnload()"))
+        #expect(view.contains("isUnloading: unloadingNames.contains(item.name)"))
+        #expect(view.contains("Text(isUnloading ? \"Unloading…\" : \"Unload\", bundle: .module)"))
+        #expect(view.contains(".disabled(isUnloading)"))
+        #expect(view.contains("guard didUnload else"))
+        #expect(view.contains("model-cache-unload-failure"))
+        #expect(view.contains(".modelRuntimeResidencyChanged"))
+    }
+
     /// Lock the cold-load drain discipline. Swift task cancellation is
     /// cooperative; a cancelled `loadModelContainer` can still be inside MLX
     /// weight materialization. Starting a replacement load before the old task
@@ -2010,6 +2130,19 @@ struct RuntimePolicySourceTests {
             ensureShutdown.lowerBound < clearRuntime.lowerBound,
             "network/VM teardown must run before the abandonable MLX clearAll tail"
         )
+
+        let runtime = try Self.source("Services/ModelRuntime.swift")
+        let clearAllBody = try Self.functionBody("func clearAll(quit:", in: runtime)
+        let clearCancel = try #require(
+            clearAllBody.range(of: "await cancelAllGenerations()")
+        )
+        let awaitIdleTeardown = try #require(
+            clearAllBody.range(of: "let idleTeardownTasks = idleResidencyTeardowns.values.map")
+        )
+        #expect(
+            clearCancel.lowerBound < awaitIdleTeardown.lowerBound,
+            "clearAll must cancel generations before awaiting pre-commit idle teardown tasks"
+        )
     }
 
     @Test("NIO server stop reports completion so the group isn't dropped mid-shutdown")
@@ -2028,15 +2161,19 @@ struct RuntimePolicySourceTests {
         )
         let body = String(controller[start.lowerBound ..< end.lowerBound])
 
-        // On timeout the actor (and its EventLoopGroup) must stay rooted — only
-        // drop it when shutdown actually completed (issue #860).
+        // Quit-path drain must be bounded (`gracefully: false`) so a
+        // lingering SSE child channel can't stall quit. Server lifecycles
+        // now run on the process-wide shared EventLoopGroup which is never
+        // shut down, so there is no mid-shutdown group to keep rooted (the
+        // issue #860 "stay rooted on timeout" contract no longer applies)
+        // and the actor is always released.
         #expect(
-            body.contains("let completed = await server.stop(gracefully: false)"),
-            "ensureShutdown must capture whether the bounded NIO shutdown completed"
+            body.contains("await server.stop(gracefully: false)"),
+            "ensureShutdown must run a bounded (non-graceful) NIO drain on the quit path"
         )
         #expect(
-            body.contains("if completed {") && body.contains("serverActor = nil"),
-            "ensureShutdown must only release serverActor when the group fully shut down"
+            body.contains("serverActor = nil"),
+            "ensureShutdown must release the server actor after the bounded drain"
         )
         #expect(
             body.contains("BonjourAdvertiser.shared.stopAdvertising()"),
@@ -2200,11 +2337,28 @@ struct RuntimePolicySourceTests {
         #expect(appDelegate.contains("OSAURUS_KEYCHAIN_FREE_SHOW_UI"))
         #expect(appDelegate.contains("Keychain disabled by OSAURUS_DISABLE_KEYCHAIN_FOR_TESTS=1"))
         #expect(appDelegate.contains("if keychainDisabledTestMode {"))
-        #expect(
-            appDelegate.contains(
-                "if !keychainDisabledTestMode {\n                await MCPProviderManager.shared.connectEnabledProviders()"
+        // The provider connects stay behind the keychain-disabled gate and
+        // run concurrently (one slow MCP server must not delay every model
+        // provider).
+        let mcpConnect = try #require(
+            appDelegate.range(
+                of: "async let mcpConnects: Void = MCPProviderManager.shared.connectEnabledProviders()"
             )
         )
+        let remoteConnect = try #require(
+            appDelegate.range(
+                of:
+                    "async let remoteConnects: Void =\n                    RemoteProviderManager.shared.connectEnabledProviders()"
+            )
+        )
+        let connectGate = try #require(
+            appDelegate.range(
+                of:
+                    "if !keychainDisabledTestMode {\n                // MCP and remote-provider startup connects run concurrently:"
+            )
+        )
+        #expect(connectGate.lowerBound < mcpConnect.lowerBound)
+        #expect(mcpConnect.lowerBound < remoteConnect.lowerBound)
         #expect(
             appDelegate.contains(
                 "if !keychainDisabledTestMode && !LaunchGuard.shouldSkip(.sandbox) {\n            SandboxToolRegistrar.shared.start()"
@@ -2525,12 +2679,15 @@ struct RuntimePolicySourceTests {
 
         let diagnosticsSnapshot = try Self.source("Services/ModelRuntime/BatchDiagnosticsSnapshot.swift")
         #expect(diagnosticsSnapshot.contains("nativeMTPDepthSummary"))
+        #expect(diagnosticsSnapshot.contains("configuredEngineCapacity"))
+        #expect(diagnosticsSnapshot.contains("engineCapacitySummary"))
         #expect(diagnosticsSnapshot.contains("prefixHits"))
         #expect(diagnosticsSnapshot.contains("pagedEvictions"))
         #expect(diagnosticsSnapshot.contains("ssmCompanionReDerives"))
 
         let diagnosticsView = try Self.source("Views/Settings/ServerSettings/BatchDiagnosticsView.swift")
         #expect(diagnosticsView.contains("\"Native MTP\""))
+        #expect(diagnosticsView.contains("\"Configured engine capacity\""))
         #expect(diagnosticsView.contains("\"Prefix hits / misses\""))
         #expect(diagnosticsView.contains("\"Paged evictions\""))
         #expect(diagnosticsView.contains("\"SSM hits / misses / re-derives\""))
@@ -2715,9 +2872,8 @@ struct RuntimePolicySourceTests {
     func modelRuntimeWiresIdleResidencyAroundLeases() throws {
         let runtime = try Self.source("Services/ModelRuntime.swift")
         let manager = try Self.source("Services/ModelRuntime/ModelResidencyManager.swift")
-
         #expect(runtime.contains("ModelResidencyManager.shared.markActive(modelName: modelName)"))
-        #expect(runtime.contains("ModelResidencyManager.shared.markActive(modelName: holder.name)"))
+        #expect(runtime.contains("await markModelActiveForResidency(holder.name)"))
         #expect(runtime.contains("private func scheduleIdleResidency(for modelName: String) async"))
         #expect(runtime.contains("ServerConfigurationStore.load()?.modelIdleResidencyPolicy"))
         #expect(runtime.contains("ModelResidencyManager.shared.scheduleIdleUnload"))
@@ -2726,6 +2882,47 @@ struct RuntimePolicySourceTests {
         #expect(runtime.contains("await ModelResidencyManager.shared.cancelAll()"))
         #expect(manager.contains("guard await leaseCount(modelName) == 0"))
         #expect(manager.contains("guard await isResident(modelName)"))
+
+        // Exact/owned teardown lives in the claimed helper so handoff ABA
+        // guards and idle-decision commit ordering share one destructive path.
+        let unloadBody = try Self.functionBody("private func unloadClaimed(", in: runtime)
+        let idleBranch = try #require(unloadBody.range(of: "if reason == .idlePolicy, let idleDecisionID"))
+        let finalDecisionGate = try #require(
+            unloadBody.range(
+                of: "guard inFlightIdleResidencyDecisions[name] == idleDecisionID else {",
+                range: idleBranch.upperBound ..< unloadBody.endIndex
+            )
+        )
+        let commit = try #require(
+            unloadBody.range(
+                of: "committedIdleResidencyDecisions[name] = idleDecisionID",
+                range: finalDecisionGate.upperBound ..< unloadBody.endIndex
+            )
+        )
+        let idleShutdown = try #require(
+            unloadBody.range(
+                of: "await MLXBatchAdapter.Registry.shared.shutdownEngine(for: name)",
+                range: commit.upperBound ..< unloadBody.endIndex
+            )
+        )
+        #expect(finalDecisionGate.lowerBound < commit.lowerBound)
+        #expect(commit.lowerBound < idleShutdown.lowerBound)
+
+        let markActiveBody = try Self.functionBody(
+            "private func markModelActiveForResidency(",
+            in: runtime
+        )
+        let committedWait = try #require(markActiveBody.range(of: "await teardown.task.value"))
+        let cancelPrecommit = try #require(
+            markActiveBody.range(
+                of: "inFlightIdleResidencyDecisions.removeValue(forKey: modelName)"
+            )
+        )
+        let managerMark = try #require(
+            markActiveBody.range(of: "await ModelResidencyManager.shared.markActive")
+        )
+        #expect(committedWait.lowerBound < managerMark.lowerBound)
+        #expect(cancelPrecommit.lowerBound < managerMark.lowerBound)
     }
 
     @Test("RuntimeConfig snapshot does not hop to MainActor before model load")
@@ -2755,11 +2952,87 @@ struct RuntimePolicySourceTests {
         #expect(health.contains("\"idle_unload_at\""))
         #expect(health.contains("\"idle_seconds_remaining\""))
         #expect(windows.contains("modelIdleResidencyPolicy"))
+        let focusBody = try Self.functionBody(
+            "fileprivate func windowDidBecomeKey(id: UUID)",
+            in: windows
+        )
+        #expect(focusBody.contains("windowStates[id]?.session.notifySessionBecameActive()"))
+        let activationBody = try Self.functionBody(
+            "func notifySessionBecameActive()",
+            in: try Self.source("Services/Chat/ChatSessionWarmup.swift")
+        )
+        #expect(activationBody.contains("handleSessionBecameActive(session: self)"))
+        let warmup = try Self.source("Services/Chat/ChatWarmupController.swift")
+        let activationRearmBody = try Self.functionBody(
+            "func handleSessionBecameActive(",
+            in: warmup
+        )
+        #expect(activationRearmBody.contains("sessionActivation = Task"))
+        #expect(
+            activationRearmBody.contains(
+                "let activation = await self.chatActivationResidencySnapshot(selectedModel)"
+            )
+        )
+        #expect(activationRearmBody.contains("self.sessionActivationID == id"))
+        #expect(activationRearmBody.contains("self.switchEpoch == epoch"))
+        #expect(activationRearmBody.contains("activation.residency"))
+        #expect(activationRearmBody.contains("allowDuplicateRevision: true"))
+        #expect(activationRearmBody.contains("activation.recoverableIdleDecisionID"))
+        #expect(activationRearmBody.contains("activationRecovery = ActivationRecovery("))
+        #expect(
+            activationRearmBody.contains(
+                "revalidateResidencyAfterDebounce: true"
+            )
+        )
+        let removalRecoveryBody = try Self.functionBody(
+            "func handleRuntimeResidencyChanged(",
+            in: warmup
+        )
+        #expect(removalRecoveryBody.contains("snapshot: ModelRuntimeResidencySnapshot"))
+        #expect(
+            removalRecoveryBody.contains(
+                "guard acceptResidencySnapshot(snapshot, selectedModel: selectedModel) else { return }"
+            )
+        )
+        #expect(removalRecoveryBody.contains("snapshot.reason == .idlePolicy"))
+        #expect(removalRecoveryBody.contains("recovery?.idleDecisionID == snapshot.idleDecisionID"))
+        #expect(removalRecoveryBody.contains("let matchesActivationIdleDecision = isSessionActive"))
+        #expect(
+            removalRecoveryBody.contains(
+                "if matchesActivationIdleDecision,\n            state == .warming,\n            scheduledActivationID != nil"
+            )
+        )
+        #expect(
+            removalRecoveryBody.contains(
+                "revalidateResidencyAfterDebounce: true"
+            )
+        )
+        let revisionGateBody = try Self.functionBody(
+            "private func acceptResidencySnapshot(",
+            in: warmup
+        )
+        #expect(revisionGateBody.contains("snapshot.revision < lastResidencyRevision"))
+        #expect(
+            revisionGateBody.contains(
+                "snapshot.revision == lastResidencyRevision, !allowDuplicateRevision"
+            )
+        )
+        #expect(revisionGateBody.contains("lastResidencyRevision = max("))
+        let activeWindowBody = try Self.functionBody(
+            "func isChatWindowActive(id: UUID)",
+            in: windows
+        )
+        #expect(activeWindowBody.contains("NSApp.isActive"))
+        #expect(activeWindowBody.contains("window.isVisible && window.isKeyWindow"))
+        let chatView = try Self.source("Views/Chat/ChatView.swift")
+        #expect(chatView.contains("ChatWindowManager.shared.isChatWindowActive"))
+        #expect(chatView.contains("warmupController.handleRuntimeResidencyChanged("))
         // Window close must branch on the full policy: immediate GC for
         // `.immediately`, short-grace acceleration for `.afterSeconds`
         // (chat-sourced models only, with a fire-time reopen guard), and no
         // action for `.never`.
         #expect(windows.contains("case .immediately:"))
+        #expect(windows.contains("await ModelRuntime.shared.unloadModelsNotIn(active)"))
         #expect(windows.contains("case .afterSeconds:"))
         #expect(windows.contains("accelerateIdleUnloadAfterChatClose"))
         #expect(
@@ -2767,6 +3040,79 @@ struct RuntimePolicySourceTests {
                 && windows.contains("return found.name"),
             "Chat UI active-model cleanup must use ModelRuntime's canonical repo-tail cache key, not the raw picker id (cache-only lookup: this runs on the main actor)."
         )
+    }
+
+    /// A dispatched background run (schedule, plugin, HTTP dispatch, watcher)
+    /// must release its residency claim when it reaches a terminal state and
+    /// re-arm warm-up on the active chat window. Without this, the finished
+    /// run's model sat resident until the full idle policy expired while every
+    /// speculative chat warm-up was refused ("a different model is resident"),
+    /// leaving an open chat cold indefinitely.
+    @Test("background task completion releases residency and re-arms chat warm-up")
+    func backgroundTaskCompletionReleasesResidencyAndRearmsWarmup() throws {
+        let tasks = try Self.source("Managers/BackgroundTaskManager.swift")
+
+        // Both terminal funnels must trigger the release: completion/failure
+        // and cancellation.
+        let completedBody = try Self.functionBody(
+            "private func markCompleted(",
+            in: tasks
+        )
+        #expect(completedBody.contains("releaseResidencyAndRearmChatWarmup(after: state)"))
+        let cancelBody = try Self.functionBody(
+            "public func cancelTask(",
+            in: tasks
+        )
+        #expect(cancelBody.contains("releaseResidencyAndRearmChatWarmup(after: state)"))
+
+        let releaseBody = try Self.functionBody(
+            "private func releaseResidencyAndRearmChatWarmup(",
+            in: tasks
+        )
+        #expect(releaseBody.contains("state.source.inferenceSource"))
+        #expect(releaseBody.contains("taskSource != .chatUI"))
+        #expect(releaseBody.contains("accelerateIdleUnloadAfterBackgroundTaskCompleted"))
+        #expect(releaseBody.contains("ChatWindowManager.shared.activeLocalModelNames()"))
+        #expect(releaseBody.contains("rearmChatWarmupAfterBackgroundWork()"))
+
+        // The runtime side keeps every chat-close protection: policy gate,
+        // source-class ownership, keep-set, lease drain, pending idle
+        // decision, and the fire-time re-check.
+        let runtime = try Self.source("Services/ModelRuntime.swift")
+        let acceleratedReleaseBody = try Self.functionBody(
+            "func accelerateIdleUnloadAfterBackgroundTaskCompleted(",
+            in: runtime
+        )
+        #expect(acceleratedReleaseBody.contains("guard taskSource != .chatUI else { return }"))
+        #expect(acceleratedReleaseBody.contains("guard case .afterSeconds = policy else { return }"))
+        #expect(acceleratedReleaseBody.contains("guard !activeNames.contains(name) else { return }"))
+        #expect(
+            acceleratedReleaseBody.contains("guard lastUseSource[name] == taskSource else { return }")
+        )
+        #expect(acceleratedReleaseBody.contains("ModelLease.shared.count(for: name) == 0"))
+        #expect(acceleratedReleaseBody.contains("pendingIdleResidencyDecisions[name]"))
+        #expect(acceleratedReleaseBody.contains("shouldStillUnload"))
+
+        // Only the visible key chat re-arms; hidden windows warm on focus.
+        let windows = try Self.source("Managers/Chat/ChatWindowManager.swift")
+        let rearmBody = try Self.functionBody(
+            "func rearmChatWarmupAfterBackgroundWork()",
+            in: windows
+        )
+        #expect(rearmBody.contains("isChatWindowActive(id: id)"))
+        #expect(rearmBody.contains("notifySessionBecameActive()"))
+
+        // The freed-slot rewarm closes the different-model race (rearm can
+        // fire before the release unload lands): the residency notification
+        // for the idle removal that empties the runtime schedules the
+        // warm-up, and only when the removed model was not the chat's own.
+        let warmup = try Self.source("Services/Chat/ChatWarmupController.swift")
+        let removalBody = try Self.functionBody(
+            "func handleRuntimeResidencyChanged(",
+            in: warmup
+        )
+        #expect(removalBody.contains("guard !wasSelectedModelResident,"))
+        #expect(removalBody.contains("snapshot.names.isEmpty"))
     }
 
     /// Management-window deeplink reuse swaps the hosting controller of a
@@ -2807,6 +3153,20 @@ struct RuntimePolicySourceTests {
         )
         #expect(reuseWindow.contains("existingWindow.endSheet(sheet)"))
         #expect(reuseWindow.contains("replacement.sizingOptions = []"))
+    }
+
+    @Test("Settings sidebar keeps bounded navigation rows accessibility-stable")
+    func settingsSidebarUsesEagerRowsForAccessibility() throws {
+        let sidebar = try Self.source("Views/Management/SidebarNavigation.swift")
+        let start = try #require(sidebar.range(of: "var itemList: some View"))
+        let end = try #require(
+            sidebar.range(of: "func sectionHeader(", range: start.upperBound ..< sidebar.endIndex)
+        )
+        let itemList = String(sidebar[start.lowerBound ..< end.lowerBound])
+
+        #expect(itemList.contains("VStack("))
+        #expect(!itemList.contains("LazyVStack("))
+        #expect(itemList.contains("proxy.scrollTo(newValue, anchor: .center)"))
     }
 
     @Test("Local bundle config readers preserve discovered bundle paths")
@@ -2872,6 +3232,20 @@ struct RuntimePolicySourceTests {
         #expect(
             !evaluator.contains("temperature: 0.0"),
             "The eval harness must not silently force greedy decoding for bundles tuned for sampling."
+        )
+        #expect(
+            evaluator.contains("ChatExecutionContext.$currentModelName.withValue(resolvedModel)"),
+            "Agent-loop tools must see the exact invoking parent model so residency handoff stays production-equivalent."
+        )
+        #expect(
+            evaluator.contains("let sessionSource: SessionSource = .chat")
+                && evaluator.contains("ChatEngine(source: sessionSource.inferenceSource)")
+                && evaluator.contains("ChatExecutionContext.$currentSessionSource.withValue("),
+            "Agent-loop eval inference and tool dispatch must share Chat provenance so parent residency ownership matches the live UI."
+        )
+        #expect(
+            evaluator.contains("ChatExecutionContext.$currentEnableThinking.withValue(enableThinking)"),
+            "Agent-loop spawned work must inherit the explicit Thinking setting exercised by the eval row."
         )
     }
 
@@ -3235,13 +3609,16 @@ struct RuntimePolicySourceTests {
         let featuresDoc = try Self.source("../../docs/FEATURES.md")
         let adapter = try Self.source("Services/ModelRuntime/MLXBatchAdapter.swift")
 
-        #expect(flags.contains("Defaults to **1**"))
-        #expect(flags.contains("return raw > 0 ? min(raw, 32) : 1"))
-        #expect(runtimeDoc.contains("Defaults to `1`, clamped to `[1, 32]`"))
+        #expect(flags.contains("server-runtime.json"))
+        #expect(flags.contains("resolvedBatchEngineMaxBatchSize"))
+        #expect(runtimeDoc.contains("Performance/Balanced resolve to `2`"))
+        #expect(runtimeDoc.contains("Safe Auto/Strict to `1`"))
+        #expect(runtimeDoc.contains("clamped to `[1, 32]`"))
         #expect(runtimeDoc.contains("mutable at runtime"))
         #expect(runtimeDoc.contains("updateMaxBatchSize"))
-        #expect(featuresDoc.contains("default `1`, clamped to `[1, 32]`"))
-        #expect(featuresDoc.contains("hot-resized via `BatchEngine.updateMaxBatchSize(_:)`"))
+        #expect(featuresDoc.contains("Performance/Balanced automatically resolve to `2`"))
+        #expect(featuresDoc.contains("Safe Auto/Strict to `1`"))
+        #expect(featuresDoc.contains("hot-resizes the cached engine"))
         #expect(!runtimeDoc.contains("Defaults to `4`"))
         #expect(!featuresDoc.contains("default `4`"))
         #expect(adapter.contains("hot-resized BatchEngine"))

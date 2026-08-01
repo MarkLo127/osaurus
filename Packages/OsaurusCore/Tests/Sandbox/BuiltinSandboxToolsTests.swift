@@ -783,6 +783,9 @@ struct BuiltinSandboxToolsTests {
 
         let payload = try successPayload(output)
         #expect((payload["path"] as? String)?.contains("notes/index.html") == true)
+        #expect(payload["content_write_complete"] as? Bool == true)
+        let verification = try #require(payload["verification"] as? [String: Any])
+        #expect(verification["status"] as? String == "not_run")
 
         let calls = await runner.calls
         let commands = calls.compactMap { call -> String? in
@@ -792,6 +795,25 @@ struct BuiltinSandboxToolsTests {
         #expect(commands.contains { $0.contains("printf") && $0.contains("notes/index.html") })
         // The whole-file write must NOT touch the in-place edit machinery.
         #expect(!commands.contains { $0.contains("python3 -c") })
+    }
+
+    @Test @MainActor
+    func sandboxWriteFile_rejectsTextWrittenToBinaryDocumentExtension() async throws {
+        let runner = MockSandboxToolCommandRunner(rootResults: [], agentResults: [])
+
+        let output = try await withRegisteredSandboxTools(runner: runner) {
+            try await ToolRegistry.shared.execute(
+                name: "sandbox_write_file",
+                argumentsJSON: #"{"path":"report.docx","content":"not a real package"}"#
+            )
+        }
+
+        let payload = try failurePayload(output)
+        #expect(payload["kind"] as? String == "rejected")
+        #expect(payload["field"] as? String == "path")
+        #expect((payload["message"] as? String)?.contains("only writes UTF-8 text") == true)
+        let calls = await runner.calls
+        #expect(calls.isEmpty)
     }
 
     /// `sandbox_write_file` with `old_string` selects the in-place edit
@@ -1124,13 +1146,10 @@ struct BuiltinSandboxToolsTests {
         #expect(contentCmd.contains("--glob"))
     }
 
-    /// Combined mode: a relative / default path keeps `file_read` on the
-    /// host workspace even with a sandbox bridge bound — the exact "what's
-    /// on my Desktop?" listing that the old two-family split kept getting
-    /// wrong. A directory path lists the host folder; no sandbox call is
-    /// issued.
+    /// A bound VM bridge is authoritative. Legacy combined-mode callers
+    /// cannot recover host reads through a relative/default path.
     @Test @MainActor
-    func combinedMode_fileRead_defaultDirectoryListsHostWorkspace() async throws {
+    func legacyCombinedMode_fileReadCannotReachHostWorkspace() async throws {
         let runner = MockSandboxToolCommandRunner(rootResults: [], agentResults: [])
         let bridge = SandboxReadBridge(
             agentName: "test-agent",
@@ -1155,9 +1174,9 @@ struct BuiltinSandboxToolsTests {
             }
         }
 
-        #expect(output.contains("hello.txt"))
+        #expect(!output.contains("hello.txt"))
         let calls = await runner.calls
-        #expect(calls.isEmpty, "a default/relative path must stay on the host, not hit the sandbox")
+        #expect(!calls.isEmpty, "a VM-bound public file_read must use the sandbox backend")
     }
 
     /// WRITABLE combined mode: `file_write` on a `/workspace/...` path
@@ -1203,6 +1222,42 @@ struct BuiltinSandboxToolsTests {
         #expect(writeCmd?.contains("/workspace/agents/test-agent/notes.txt") == true)
     }
 
+    @Test @MainActor
+    func vmFileWrite_appendNeverFallsBackToOverwriteWhenDiffReadFails() async throws {
+        let runner = MockSandboxToolCommandRunner(
+            rootResults: [],
+            agentResults: [
+                .init(stdout: "", stderr: "transient read failure", exitCode: 1),
+                .init(stdout: "", stderr: "", exitCode: 0),
+                .init(stdout: "", stderr: "", exitCode: 0),
+            ]
+        )
+        let bridge = SandboxReadBridge(
+            agentName: "test-agent",
+            home: "/workspace/agents/test-agent"
+        )
+
+        let output = try await withRegisteredSandboxTools(runner: runner) {
+            try await ChatExecutionContext.$sandboxReadBridge.withValue(bridge) {
+                try await FileWriteTool().execute(
+                    argumentsJSON:
+                        #"{"path":"notes.txt","content":"new chunk","mode":"append"}"#
+                )
+            }
+        }
+
+        #expect(ToolEnvelope.isSuccess(output))
+        let calls = await runner.calls
+        let writeCommand = calls.compactMap { call -> String? in
+            guard case .agent(_, let command) = call, command.contains("printf") else {
+                return nil
+            }
+            return command
+        }.first
+        #expect(writeCommand?.contains(">> '/workspace/agents/test-agent/notes.txt'") == true)
+        #expect(writeCommand?.contains("new chunk") == true)
+    }
+
     /// WRITABLE combined mode: `file_edit` on a `/workspace/...` path
     /// routes to the sandbox writer's in-place edit branch (`old_string`
     /// present selects it — same argument shape as the host tool).
@@ -1245,11 +1300,18 @@ struct BuiltinSandboxToolsTests {
         #expect(issuedPython, "the sandbox edit branch runs the python replace script")
     }
 
-    /// Combined mode: a relative path keeps `file_write` on the host even
-    /// with a bridge bound — the path, not the mode, picks the filesystem.
+    /// A bound VM bridge is authoritative. A relative public write resolves
+    /// under the VM home and cannot mutate the legacy host root.
     @Test @MainActor
-    func combinedMode_fileWrite_relativePathStaysOnHost() async throws {
-        let runner = MockSandboxToolCommandRunner(rootResults: [], agentResults: [])
+    func legacyCombinedMode_fileWriteRelativePathStaysInVM() async throws {
+        let runner = MockSandboxToolCommandRunner(
+            rootResults: [],
+            agentResults: [
+                .init(stdout: "0\n", stderr: "", exitCode: 0),
+                .init(stdout: "", stderr: "", exitCode: 0),
+                .init(stdout: "", stderr: "", exitCode: 0),
+            ]
+        )
         let bridge = SandboxReadBridge(
             agentName: "test-agent",
             home: "/workspace/agents/test-agent"
@@ -1268,11 +1330,15 @@ struct BuiltinSandboxToolsTests {
         }
 
         #expect(!ToolEnvelope.isError(output))
-        let written = try String(
-            contentsOf: hostRoot.appendingPathComponent("notes.txt"), encoding: .utf8)
-        #expect(written == "hello host")
+        #expect(!FileManager.default.fileExists(atPath: hostRoot.appendingPathComponent("notes.txt").path))
         let calls = await runner.calls
-        #expect(calls.isEmpty, "a relative path must write the host, not the sandbox")
+        let writeCommand = calls.compactMap { call -> String? in
+            guard case .agent(_, let command) = call, command.contains("printf") else {
+                return nil
+            }
+            return command
+        }.first
+        #expect(writeCommand?.contains("/workspace/agents/test-agent/notes.txt") == true)
     }
 
     /// `dry_run` previews are host-only; the sandbox route refuses them

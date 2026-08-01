@@ -3,6 +3,174 @@
   <channel>
     <title>Osaurus</title>
         <item>
+            <title>0.22.14</title>
+            <pubDate>Sat, 01 Aug 2026 10:17:19 +0000</pubDate>
+            <sparkle:channel>release</sparkle:channel>
+            <sparkle:version>0.22.14</sparkle:version>
+            <sparkle:shortVersionString>0.22.14</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/osaurus-ai/osaurus/releases/download/0.22.14/Osaurus-0.22.14.dmg" length="69422433" type="application/octet-stream" sparkle:edSignature="bibA71zRb/hUmjmUQ4k8aUbx32bi223xtU6jSMccMiDW4X8HaR1uHlzgbOSJvH0xTSfGE4/AmKcKRH0lO2flCw=="/>
+            <description sparkle:format="markdown"><![CDATA[
+## What's Changed
+
+- Fix explicit model unload and cache telemetry continuity (#2248) by @jjang-ai
+- i18n(zh-Hans): call Osaurus's own server 服务端, not 服务器 (#2246) by @YspritanHyzygy
+- i18n: split the "Server" key, which three unrelated UI elements share (#2243) by @YspritanHyzygy
+- i18n(zh-Hans): keys that differ only in casing should not say different things (#2230) by @YspritanHyzygy
+- Fix four reported runtime and model metadata issues (#2235) by @jjang-ai
+- Unify subagent and server batching concurrency (#2234) by @jjang-ai
+
+## 🐛 Bug Fixes
+
+- Harden AgentDB imports and saved views (#2255) by @tpae
+- Exclude warm-up calls from Insights (#2254) by @tpae
+- Stabilize execution modes, prompts, and cache warmup (#2253) by @tpae
+- Prevent stale whole-file rewrites after targeted edits (#2252) by @tpae
+- fixed text selection in agent responses (#2247) by @RaajeevChandran
+- fix tool permission panel sizing and card appearance issues (#2244) by @RaajeevChandran
+- fix tool approval dialog overflow and add auto-allow all tools setting (#2241) by @RaajeevChandran
+
+## 🧰 Maintenance
+
+- Make the Mac harness leaner and more reliable (#2250) by @tpae
+- Keep notch overlay pinned to the screen edge (#2240) by @tpae
+- Eliminate app hangs: unblock MainActor, bounded cancellation, killable plugin host (#2239) by @tpae
+- Add localized Channels What's New announcement (#2238) by @tpae
+
+**Full Changelog**: https://github.com/osaurus-ai/osaurus/compare/0.22.13...0.22.14
+]]></description>
+        </item>
+        <item>
+            <title>0.22.13</title>
+            <pubDate>Thu, 30 Jul 2026 04:14:08 +0000</pubDate>
+            <sparkle:channel>release</sparkle:channel>
+            <sparkle:version>0.22.13</sparkle:version>
+            <sparkle:shortVersionString>0.22.13</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/osaurus-ai/osaurus/releases/download/0.22.13/Osaurus-0.22.13.dmg" length="69218201" type="application/octet-stream" sparkle:edSignature="j1vaVE2qSUr5ngNHCGdlUi+2VrZV7/FtGRo8vvBQEVyIi/9IXmnnrfpsUM13y2PYoDjwHLJXkXEzow0pkaNzDA=="/>
+            <description sparkle:format="markdown"><![CDATA[
+## What's Changed
+
+- fix(i18n): lint-zh-style.py refuses to run again — the catalog gained a final newline (#2229) by @YspritanHyzygy
+- i18n: add 16 UI strings localized inside helper functions but never in the catalog (#2224) by @YspritanHyzygy
+- i18n(zh-Hans): one word per concept, where the rest of the catalog already agrees (#2225) by @YspritanHyzygy
+- fix(i18n): make lint-zh-style.py runnable, and stop it breaking shell commands (#2223) by @YspritanHyzygy
+- Add safe heterogeneous subagent batching and delegation controls (#2221) by @jjang-ai
+- i18n(zh-Hans): use one Chinese word for a UI tab (#2215) by @YspritanHyzygy
+- i18n(zh-Hans): one second-person pronoun, and translate "Insights" (#2218) by @YspritanHyzygy
+- Fix selected-chat idle warmup recovery (#2216) by @jjang-ai
+- i18n(zh-Hans): use one Chinese word for "transcription" (#2207) by @YspritanHyzygy
+- i18n(zh-Hans): add the missing space between Chinese and Latin runs (#2209) by @YspritanHyzygy
+- i18n: add 22 UI strings that are localized indirectly but never entered the catalog (#2213) by @YspritanHyzygy
+
+## 🚀 Features
+
+- Add native iMessage agent channel with download-only imsg helper (#2227) by @tpae
+- added chat import guide (#2222) by @RaajeevChandran
+- import conversations from chatgpt, claude, grok and gemini (#2217) by @RaajeevChandran
+- fix fireworks providers only showing 6 models (#2214) by @RaajeevChandran
+
+## 🐛 Bug Fixes
+
+- Make headless dispatches follow the agent's current default model (#2232) by @tpae
+- Make web\_search schema immutable so tool payloads never invalidate the KV-cache prefix (#2226) by @tpae
+- fix app freeze when saving channel tokens in 
+  keychain (#2208) by @RaajeevChandran
+
+## 🧰 Maintenance
+
+- Make the model-selector dot reflect true model residency (#2231) by @tpae
+- Fix plugin layout at compact widths (#2220) by @tpae
+- Fix OsaurusAI model catalog cutoff (#2219) by @tpae
+- Harden keychain reliability on relaunch; add identity restore from recovery phrase (#2212) by @tpae
+- Redesign channels UX: name-first destinations, DM identity, intent-based setup (#2210) by @tpae
+
+**Full Changelog**: https://github.com/osaurus-ai/osaurus/compare/0.22.12...0.22.13
+]]></description>
+        </item>
+        <item>
+            <title>0.22.12</title>
+            <pubDate>Tue, 28 Jul 2026 16:08:55 +0000</pubDate>
+            <sparkle:channel>release</sparkle:channel>
+            <sparkle:version>0.22.12</sparkle:version>
+            <sparkle:shortVersionString>0.22.12</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/osaurus-ai/osaurus/releases/download/0.22.12/Osaurus-0.22.12.dmg" length="68353377" type="application/octet-stream" sparkle:edSignature="kIL1LJSzWPU71DeCm/7czBMV1cdBIdRFouXmjHZuGo3T0dmBNBs5aVmU/s6LU+bv6KoPUHLeRXyBwRrf0HINBQ=="/>
+            <description sparkle:format="markdown"><![CDATA[
+## What's Changed
+
+- Match assistant and user chat text sizing (#2201) by @hkay-dev
+- fix(i18n): two render sites that bypass localization (#2199) by @YspritanHyzygy
+- Pin Nanbeige vMLX runtime (#2198) by @jjang-ai
+- Wire remaining OsaurusCore network call sites into global proxy (#2169) by @peterlodri-sec
+- i18n(zh-Hans): unify Computer Use naming, fix a label collision and four mistranslations (#2195) by @YspritanHyzygy
+- Fix stale settings warmup and add SSD cache regression eval (#2194) by @jjang-ai
+- i18n(zh): fix malformed format specifier in channel member count (#2176) by @YspritanHyzygy
+- i18n: add 43 Settings-search strings that never entered the catalog (#2193) by @YspritanHyzygy
+
+## 🐛 Bug Fixes
+
+- fall back to lenient decode for nonstandard streaming chunks during tool calls (#2205) by @RaajeevChandran
+- fixed app hangs (#2203) by @RaajeevChandran
+- added guardrails for factory reset auto quit (#2200) by @RaajeevChandran
+
+## 🧰 Maintenance
+
+- Native channel presence, formatting, and reactions (#2202) by @tpae
+- Clarify channel messaging UX with Replies/New Messages model and localize the channel surface (#2196) by @tpae
+
+**Full Changelog**: https://github.com/osaurus-ai/osaurus/compare/0.22.11...0.22.12
+]]></description>
+        </item>
+        <item>
+            <title>0.22.11</title>
+            <pubDate>Mon, 27 Jul 2026 20:47:16 +0000</pubDate>
+            <sparkle:channel>release</sparkle:channel>
+            <sparkle:version>0.22.11</sparkle:version>
+            <sparkle:shortVersionString>0.22.11</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/osaurus-ai/osaurus/releases/download/0.22.11/Osaurus-0.22.11.dmg" length="68244091" type="application/octet-stream" sparkle:edSignature="EmCSGl0tW54Jzkr8nX3XlmoSzixhWAzabWoFEH2nMKeke4aHpM0+wBsO39ReiCR9p9Nmg+pxLHr+k03YS0wIAw=="/>
+            <description sparkle:format="markdown"><![CDATA[
+## What's Changed
+
+- Fix stale Todo agent-loop completion and strengthen cache proof (#2192) by @jjang-ai
+- i18n(zh-Hans): quality pass — 859 fixes across eight defect classes + style linter (#2188) by @YspritanHyzygy
+- Add scored agent-loop and disk-cache proof gates (#2179) by @jjang-ai
+- Update Traditional Chinese translations (#2178) by @ftzahao
+- Stop completed agent runs from reopening on stale todos (#2175) by @jjang-ai
+- Update Simplified Chinese and Traditional Chinese translations (#2172) by @ftzahao
+- Fix tracked tool completion and prompt cache stability (#2171) by @jjang-ai
+- fix: don't install CLI symlink into Homebrew's managed bin directory (#2166) by @peterlodri-sec
+- Add connectivity-driven offline mode for chat (#2170) by @tpae
+- Unify runtime policy and bounded subagent delegation (#2165) by @jjang-ai
+- Redact secret tool arguments across agent surfaces (#2157) by @mimeding
+- Report MCP tool envelope failures (#2156) by @mimeding
+- Preserve SSD warmup across chat lifecycle transitions (#2161) by @jjang-ai
+
+## 🚀 Features
+
+- inject current date and timezone into the latest user turn (#2173) by @RaajeevChandran
+
+## 🐛 Bug Fixes
+
+- fix factory reset hanging indefinitely and add reset progress ui (#2191) by @RaajeevChandran
+- Fix Gemma and Qwen post-tool completion (#2167) by @jjang-ai
+
+## 🧰 Maintenance
+
+- Add proactive agent channel publishing with zero-config destinations (#2190) by @tpae
+- Channels: focused setup UX, scalable access lists, and autosave (#2164) by @tpae
+- improved chat UX (#2163) by @RaajeevChandran
+- Channels: multi-agent routing and guided setup across all providers (#2162) by @tpae
+
+**Full Changelog**: https://github.com/osaurus-ai/osaurus/compare/0.22.10...0.22.11
+]]></description>
+        </item>
+        <item>
             <title>0.22.10</title>
             <pubDate>Fri, 24 Jul 2026 17:32:03 +0000</pubDate>
             <sparkle:channel>release</sparkle:channel>

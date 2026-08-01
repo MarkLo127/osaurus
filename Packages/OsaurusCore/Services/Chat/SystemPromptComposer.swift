@@ -128,9 +128,9 @@ public struct SystemPromptComposer: Sendable {
     /// so optional bits (trace, frozen snapshot, mid-session loaded
     /// names) stay grouped instead of trailing the signature.
     ///
-    /// `request.query` is the effective user query (for memory recall and
-    /// the trivial-input fast path). If empty, the most recent `"user"`
-    /// message in `request.messages` is used. Pass `additionalToolNames` so
+    /// `request.query` is the effective user query for memory recall. If
+    /// empty, the most recent `"user"` message in `request.messages` is used.
+    /// Pass `additionalToolNames` so
     /// tools the agent loaded mid-session via `capabilities_load` survive
     /// across subsequent composes.
     @MainActor
@@ -171,7 +171,8 @@ public struct SystemPromptComposer: Sendable {
 
     /// Derive the effective user query: prefer the explicit `query`, else
     /// the most recent user message text. Returns "" if neither is available.
-    /// Feeds memory recall and the trivial-input fast path.
+    /// This feeds memory recall only; prompt and tool shape must not depend on
+    /// query wording.
     static func resolveEffectiveQuery(query: String, messages: [ChatMessage]) -> String {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return trimmed }
@@ -183,36 +184,6 @@ public struct SystemPromptComposer: Sendable {
             }
         }
         return ""
-    }
-
-    /// Greetings and acknowledgements are high-volume "no work yet" turns.
-    /// Skipping dynamic capability prose and the tool schema for these keeps
-    /// TTFT tied to the answer the user actually asked for. Empty queries are
-    /// not classified as trivial because preview and cache-parity composes
-    /// intentionally use `""` as "unknown next input" rather than as a user
-    /// greeting.
-    static func isTrivialUserQuery(_ query: String) -> Bool {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= 32 else { return false }
-
-        let keptScalars = trimmed.lowercased().unicodeScalars.map { scalar -> Character in
-            if CharacterSet.alphanumerics.contains(scalar)
-                || CharacterSet.whitespacesAndNewlines.contains(scalar)
-            {
-                return Character(String(scalar))
-            }
-            return " "
-        }
-        let normalized = String(keptScalars)
-            .split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-        let trivialInputs: Set<String> = [
-            "hi", "hello", "hey", "yo", "hiya", "howdy",
-            "good morning", "good afternoon", "good evening",
-            "thanks", "thank you", "thx", "ty",
-            "ok", "okay", "cool", "nice", "great",
-        ]
-        return trivialInputs.contains(normalized)
     }
 
     /// Shared pipeline: assemble memory (returned separately) + resolve
@@ -261,8 +232,6 @@ public struct SystemPromptComposer: Sendable {
             snapshot: snapshot,
             agentId: agentId,
             executionMode: executionMode,
-            query: query,
-            messages: messages,
             additionalToolNames: additionalToolNames,
             frozenAlwaysLoadedNames: frozenAlwaysLoadedNames,
             frozenToolSpecs: frozenToolSpecs,
@@ -521,12 +490,53 @@ public struct SystemPromptComposer: Sendable {
     /// auto-disable, final tool set, always-loaded snapshot, and the frozen
     /// enabled-capabilities manifest.
     @MainActor
+    private static func configuredSpawnPools(
+        snapshot: AgentConfigSnapshot
+    ) -> (
+        agents: [UUID],
+        models: [String],
+        notes: [String: String],
+        launcherModelOverride: String?
+    ) {
+        if let frozen = snapshot.spawnConfiguration {
+            return (
+                agents: frozen.agentIDs,
+                models: frozen.modelNames,
+                notes: frozen.modelNotes,
+                launcherModelOverride: frozen.launcherModelOverride
+            )
+        }
+        let config = SubagentConfigurationStore.snapshot()
+        let isDefault = snapshot.agentId == Agent.defaultId
+        let settings = AgentManager.shared.agent(for: snapshot.agentId)?.settings
+        return (
+            agents: SubagentToolVisibility.effectiveSpawnableAgents(
+                isDefault: isDefault,
+                config: config,
+                perAgentEnabled: snapshot.spawnDelegationEnabled,
+                perAgentTargets: snapshot.spawnableAgentIDs
+            ),
+            models: SubagentToolVisibility.effectiveSpawnableModels(
+                isDefault: isDefault,
+                config: config,
+                perAgentEnabled: snapshot.spawnDelegationEnabled,
+                perAgentModelTargets: snapshot.spawnableModelNames
+            ),
+            notes: isDefault ? config.spawnableModelNotes : snapshot.spawnableModelNotes,
+            launcherModelOverride: SubagentToolVisibility.effectiveSubagentModel(
+                capabilityId: SubagentCapabilityRegistry.spawn.id,
+                isDefault: isDefault,
+                config: config,
+                settings: settings
+            )
+        )
+    }
+
+    @MainActor
     private static func resolveToolset(
         snapshot: AgentConfigSnapshot,
         agentId: UUID,
         executionMode: ExecutionMode,
-        query: String,
-        messages: [ChatMessage],
         additionalToolNames: LoadedTools,
         frozenAlwaysLoadedNames: LoadedTools?,
         frozenToolSpecs: [Tool]?,
@@ -556,7 +566,16 @@ public struct SystemPromptComposer: Sendable {
             trace?.set("contextSizeClass", String(describing: window.sizeClass))
         }
 
-        let isTrivialInput = isTrivialUserQuery(query)
+        let configuredSpawn = configuredSpawnPools(snapshot: snapshot)
+        let spawnTargets =
+            effectiveToolsOff
+            ? .empty
+            : await SpawnDescriptors.resolveForRequest(
+                agentIDs: configuredSpawn.agents,
+                modelNames: configuredSpawn.models,
+                modelNotes: configuredSpawn.notes,
+                launcherModelOverride: configuredSpawn.launcherModelOverride
+            )
 
         trace?.mark("resolve_tools_start")
         let resolvedTools = resolveTools(
@@ -565,26 +584,10 @@ public struct SystemPromptComposer: Sendable {
             toolsDisabled: effectiveToolsOff,
             additionalToolNames: additionalToolNames,
             frozenAlwaysLoadedNames: frozenAlwaysLoadedNames,
-            frozenToolSpecs: frozenToolSpecs
+            frozenToolSpecs: frozenToolSpecs,
+            spawnTargets: spawnTargets
         )
         trace?.mark("resolve_tools_done")
-        let suppressTrivialToolSchema = shouldSuppressTrivialToolSchema(
-            isTrivialInput: isTrivialInput,
-            executionMode: executionMode,
-            messages: messages,
-            additionalToolNames: additionalToolNames,
-            frozenAlwaysLoadedNames: frozenAlwaysLoadedNames,
-            resolvedTools: resolvedTools
-        )
-        if suppressTrivialToolSchema {
-            trace?.set("toolSchemaSuppressed", "trivial")
-        }
-        // #1161 reports clean raw local completions but corrupted UI/local
-        // chat for greetings. Keep those tiny turns on the no-tool path, while
-        // preserving the baseline below so the next real task can still freeze
-        // against the always-loaded tools that were available at session start.
-        let tools = suppressTrivialToolSchema ? [] : resolvedTools
-
         let alwaysLoadedNames = resolveAlwaysLoadedNames(
             tools: resolvedTools,
             executionMode: executionMode,
@@ -594,49 +597,24 @@ public struct SystemPromptComposer: Sendable {
         let enabledManifest = resolveEnabledManifest(
             snapshot: snapshot,
             agentId: agentId,
-            tools: tools,
+            tools: resolvedTools,
             effectiveToolsOff: effectiveToolsOff,
             frozenManifest: frozenManifest,
             trace: trace
         )
 
         return ResolvedToolset(
-            tools: tools,
+            tools: resolvedTools,
             sessionBaselineTools: resolvedTools,
             enabledManifest: enabledManifest,
             alwaysLoadedNames: alwaysLoadedNames,
+            spawnTargets: spawnTargets,
             contextDisable: contextDisable,
             sizeClass: window.sizeClass,
             effectiveToolsOff: effectiveToolsOff,
-            // Tied to the tool-schema fast path, NOT to `isTrivialInput`
-            // alone: capability prose sections are static prefix content, so
-            // dropping them for a trivial query in a session that keeps its
-            // tool schema (sandbox mode, existing history, frozen state)
-            // would rewrite the cached prefix — busting the warm-up KV on a
-            // "hey" first send and the whole conversation KV on any
-            // mid-session "thanks"/"ok" turn, with zero prefill savings.
-            capabilityPromptSectionsEnabled: !suppressTrivialToolSchema,
+            capabilityPromptSectionsEnabled: true,
             prefersCompactPrompt: window.prefersCompactPrompt
         )
-    }
-
-    /// Keep #1161's greeting-only fast path to the clean first-turn shape.
-    /// Frozen baselines, loaded tools, execution modes, or prior messages all
-    /// mean the user is already in a task context where an acknowledgement
-    /// like "ok" may still need loop/discovery tools.
-    private static func shouldSuppressTrivialToolSchema(
-        isTrivialInput: Bool,
-        executionMode: ExecutionMode,
-        messages: [ChatMessage],
-        additionalToolNames: LoadedTools,
-        frozenAlwaysLoadedNames: LoadedTools?,
-        resolvedTools: [Tool]
-    ) -> Bool {
-        guard isTrivialInput, !resolvedTools.isEmpty else { return false }
-        guard case .none = executionMode else { return false }
-        return messages.isEmpty
-            && additionalToolNames.isEmpty
-            && frozenAlwaysLoadedNames == nil
     }
 
     /// Render the complete enabled-capabilities manifest section for this
@@ -763,6 +741,93 @@ public struct SystemPromptComposer: Sendable {
         let tools = toolset.tools
         let effectiveToolsOff = toolset.effectiveToolsOff
         let resolvedNames = Set(tools.map { $0.function.name })
+
+        // Production's default harness contract is intentionally small.
+        // Tool schemas are the operational source of truth; security is
+        // enforced by path validation, Seatbelt, and the VM boundary rather
+        // than repeated prompt policy. Rich feature guidance remains
+        // schema-gated on non-workspace/configuration surfaces.
+        if snapshot.agentId != Agent.defaultId
+            || executionMode.usesHostFolderTools
+            || executionMode.usesSandboxTools
+        {
+            if executionMode.usesSandboxTools, let soulSection {
+                composer.append(
+                    .static(
+                        id: "soul",
+                        label: "Soul",
+                        content: SystemPromptTemplates.soulSection(soulSection)
+                    )
+                )
+            }
+            if !effectiveToolsOff, executionMode.usesSandboxTools {
+                let home = OsaurusPaths.inContainerAgentHome(
+                    SandboxAgentProvisioner.linuxName(for: agentId.uuidString)
+                )
+                composer.append(
+                    .static(
+                        id: "sandbox",
+                        label: L("Working Directory"),
+                        content:
+                            "## Working directory\n**Path:** \(home)\n"
+                            + "This run is isolated in the VM. Host folders are unavailable. "
+                            + "Use paths relative to this directory. "
+                            + "Use the workspace tools to complete requested work now; "
+                            + "do not only describe or promise it. "
+                            + "After creating or changing runnable code, run an available "
+                            + "syntax/build/test/behavior check before saying it works; a successful "
+                            + "file mutation proves only that bytes were saved. "
+                            + "To append while preserving a file, call file_write with mode "
+                            + "append and put only the new bytes in content. "
+                            + "Keep each file_write content under "
+                            + "\(WorkspaceToolContract.recommendedWriteChunkCharacters) characters; "
+                            + "for larger files use repeated calls with mode append."
+                    )
+                )
+                let state = SystemPromptTemplates.sandboxState(
+                    secretNames: AgentSecretsKeychain.secretIDs(agentId: agentId),
+                    installedPackages: SandboxPackageManifest.shared.installed(
+                        agentId: agentId.uuidString
+                    )
+                )
+                if !state.isEmpty {
+                    composer.append(
+                        .dynamic(
+                            id: "sandboxState",
+                            label: L("Sandbox State"),
+                            content: state
+                        )
+                    )
+                }
+            } else if !effectiveToolsOff, let folder = executionMode.folderContext {
+                composer.append(
+                    .static(
+                        id: "folderContext",
+                        label: L("Working Directory"),
+                        content: SystemPromptTemplates.leanFolderContext(from: folder)
+                    )
+                )
+            }
+            if !effectiveToolsOff,
+                snapshot.dbEnabled,
+                !resolvedNames.isDisjoint(with: agentDBToolNames)
+            {
+                let schema = Self.renderSchemaSnapshot(
+                    agentId: agentId,
+                    allowOpen: allowBlockingDBOpen
+                )
+                if !schema.isEmpty {
+                    composer.append(
+                        .dynamic(
+                            id: "agentDBSchema",
+                            label: L("Agent DB Schema"),
+                            content: schema
+                        )
+                    )
+                }
+            }
+            return
+        }
 
         // Mid-session-mutable content captured while building the static
         // framing, but emitted LATER as dynamic sections (after the static
@@ -987,10 +1052,10 @@ public struct SystemPromptComposer: Sendable {
             }
         }
 
-        // Spawn guidance is DYNAMIC — it enumerates the launching agent's ACTUAL
+        // Spawn guidance enumerates the launching agent's request-local ACTUAL
         // spawnable agents + models — so it can't ride the generic guidance loop
         // above (whose `spawn` entry intentionally keeps `guidance == nil`).
-        // Render a dedicated block whenever either spawn tool reached the schema,
+        // Render a dedicated block whenever any spawn tool reached the schema,
         // listing only the tool(s) that resolved and reading the same pools
         // (`SubagentToolVisibility` + the snapshot/config) the visibility gate
         // used, so the prompt and the callable tools can never disagree. It joins
@@ -1004,55 +1069,42 @@ public struct SystemPromptComposer: Sendable {
             let modelToolResolved = resolvedNames.contains(
                 SubagentCapabilityRegistry.spawnModelToolName
             )
-            if agentToolResolved || modelToolResolved {
-                let config = SubagentConfigurationStore.snapshot()
-                let isDefault = snapshot.agentId == Agent.defaultId
-                let agentNames =
-                    agentToolResolved
-                    ? SubagentToolVisibility.effectiveSpawnableAgents(
-                        isDefault: isDefault,
-                        config: config,
-                        perAgentEnabled: snapshot.spawnDelegationEnabled,
-                        perAgentTargets: snapshot.spawnableAgentNames
-                    )
-                    : []
-                let modelNames =
-                    modelToolResolved
-                    ? SubagentToolVisibility.effectiveSpawnableModels(
-                        isDefault: isDefault,
-                        config: config,
-                        perAgentEnabled: snapshot.spawnDelegationEnabled,
-                        perAgentModelTargets: snapshot.spawnableModelNames
-                    )
-                    : []
-                let modelNotes =
-                    isDefault ? config.spawnableModelNotes : snapshot.spawnableModelNotes
-                let descriptors = SpawnDescriptors.resolve(
-                    agentNames: agentNames,
-                    modelNames: modelNames,
-                    modelNotes: modelNotes
-                )
+            let batchToolResolved = resolvedNames.contains(
+                SubagentCapabilityRegistry.spawnBatchToolName
+            )
+            if agentToolResolved || modelToolResolved || batchToolResolved {
+                let fallbackConfig = SubagentConfigurationStore.snapshot()
                 // The worker tool-reach line must match what the runtime will
                 // actually grant, so resolve it through the SAME helper the
                 // spawn kind uses (default agent → global config, custom →
                 // its own settings).
-                let toolAccess = SubagentToolVisibility.effectiveSpawnToolAccess(
-                    isDefault: isDefault,
-                    config: config,
-                    settings: AgentManager.shared.agent(for: snapshot.agentId)?.settings
-                )
-                let maxParallel = SubagentToolVisibility.effectiveBudgets(
-                    isDefault: isDefault,
-                    config: config,
-                    settings: AgentManager.shared.agent(for: snapshot.agentId)?.settings
-                ).normalized.maxParallelSpawns
+                let toolAccess =
+                    snapshot.spawnConfiguration?.toolAccess
+                    ?? SubagentToolVisibility.effectiveSpawnToolAccess(
+                        isDefault: snapshot.agentId == Agent.defaultId,
+                        config: fallbackConfig,
+                        settings: AgentManager.shared.agent(for: snapshot.agentId)?.settings
+                    )
+                let maxParallel =
+                    snapshot.spawnConfiguration?.budgets.maxParallelSpawns
+                    ?? SubagentToolVisibility.effectiveBudgets(
+                        isDefault: snapshot.agentId == Agent.defaultId,
+                        config: fallbackConfig,
+                        settings: AgentManager.shared.agent(for: snapshot.agentId)?.settings,
+                        sharedParallelLimit: SpawnBatchConcurrencyContract.configuredLimit(
+                            for: ServerRuntimeSettingsStore.snapshot()
+                        )
+                    ).normalized.maxParallelSpawns
                 composer.append(
                     .static(
                         id: "spawn",
                         label: L("Subagents"),
                         content: SystemPromptTemplates.spawnGuidance(
-                            agents: descriptors.agents,
-                            models: descriptors.models,
+                            agents: (agentToolResolved || batchToolResolved)
+                                ? toolset.spawnTargets.agents : [],
+                            models: (modelToolResolved || batchToolResolved)
+                                ? toolset.spawnTargets.models : [],
+                            availableToolNames: resolvedNames,
                             toolAccess: toolAccess,
                             maxParallel: maxParallel
                         )
@@ -1194,15 +1246,8 @@ public struct SystemPromptComposer: Sendable {
         // `capabilities_discover` / `capabilities_load` as pragmatic
         // always-loaded tools.
         //
-        // KV-cache stability: `capabilityPromptSectionsEnabled` goes false
-        // ONLY on the greeting-only cold first turn in `.none` mode where
-        // the whole tool schema is dropped too (the #1161 fast path — the
-        // `capabilities_discover` check below would fail there anyway). Like
-        // `pluginCreator`, this section must NOT vanish for a trivial query
-        // in a session that keeps its schema: warm-up composes with
-        // `query: ""` and includes it, so dropping it on a "hey" send (or a
-        // mid-session "thanks") would rewrite the static prefix and force a
-        // full re-prefill.
+        // KV-cache stability: capability prompt sections are determined only
+        // by the resolved static schema, never by query wording.
         if toolset.capabilityPromptSectionsEnabled,
             !effectiveToolsOff,
             tools.contains(where: { $0.function.name == "capabilities_discover" })
@@ -1367,6 +1412,127 @@ public struct SystemPromptComposer: Sendable {
             trace?.set("sandboxUnavailable", reason.kind.rawValue)
         }
 
+        // Channel destinations: the redacted list of operator-approved
+        // proactive publish routes for THIS agent and THIS run source.
+        // Dynamic on purpose — destination settings are mid-session-mutable
+        // (mode/rate/guidance edits, new bindings), so the section re-reads
+        // the store each turn without rewriting the cached static prefix.
+        // Gated on the publish tool actually being in the schema so the
+        // prompt never advertises a capability the model can't invoke.
+        if !effectiveToolsOff,
+            resolvedNames.contains(AgentChannelPublishTool.toolName),
+            let destinationsSection = Self.channelDestinationsSection(
+                bindings: AgentChannelAutoDestinationResolver.effectiveConfiguration()
+                    .usableBindings(agentId: agentId),
+                source: ChatExecutionContext.currentSessionSource
+            )
+        {
+            composer.append(
+                .dynamic(
+                    id: "channelDestinations",
+                    label: L("Channel Destinations"),
+                    content: destinationsSection
+                )
+            )
+        }
+
+    }
+
+    /// True when any Agent Channel surface is configured: an enabled custom
+    /// JSON connection, a native provider (Discord/Slack/Telegram/iMessage)
+    /// with configured rooms, or any outbound destination binding. The old
+    /// check only saw enabled CUSTOM connections, so agents using only the
+    /// native providers never got the `agent_channel_*` family into their
+    /// enabled manifest.
+    @MainActor
+    static func hasAnyConfiguredAgentChannel(
+        configuration: AgentChannelConfiguration
+    ) -> Bool {
+        if configuration.connections.contains(where: \.enabled) { return true }
+        if !configuration.bindings.isEmpty { return true }
+        let discord = DiscordConnectionService.shared.configuration()
+        if !discord.readableChannelIds.isEmpty || !discord.writableChannelIds.isEmpty {
+            return true
+        }
+        let slack = SlackConnectionService.shared.configuration()
+        if !slack.readableChannelIds.isEmpty || !slack.writableChannelIds.isEmpty
+            || !slack.workspaceAccounts.isEmpty
+        {
+            return true
+        }
+        let telegram = TelegramConnectionService.shared.configuration()
+        if !telegram.readableChatIds.isEmpty || !telegram.writableChatIds.isEmpty {
+            return true
+        }
+        let imessage = IMessageConnectionService.shared.configuration()
+        if !imessage.readableChatIds.isEmpty || !imessage.writableChatIds.isEmpty {
+            return true
+        }
+        return false
+    }
+
+    /// Render the redacted, deterministic "Channel Destinations" section for
+    /// one agent + run source. Lists ONLY this agent's usable bindings that
+    /// allow the current run source — stable binding ids, labels,
+    /// connection/room display ids, outbound mode, and operator guidance.
+    /// Never secrets, credentials, sender identities, or another agent's
+    /// destinations. Returns nil when nothing is publishable from this run
+    /// (including unmappable/absent sources — plugin, HTTP, and inbound
+    /// channel runs must not be told they can publish).
+    static func channelDestinationsSection(
+        bindings: [AgentChannelBinding],
+        source: SessionSource?
+    ) -> String? {
+        guard let source,
+            let runSource = AgentChannelBindingRunSource(sessionSource: source)
+        else { return nil }
+        let visible =
+            bindings
+            .filter { $0.isUsable && $0.allows(source: runSource) }
+            .sorted { $0.id < $1.id }
+        guard !visible.isEmpty else { return nil }
+
+        var lines: [String] = []
+        lines.append(
+            "You may proactively publish messages to these operator-approved destinations "
+                + "with the `agent_channel_publish` tool. Reference destinations ONLY by "
+                + "`binding_id`; never invent destinations or raw room ids. Use a stable "
+                + "`intent_key` per logical message so retries never double-send."
+        )
+        lines.append("")
+        for binding in visible {
+            let modeNote: String
+            switch binding.outboundMode {
+            case .off:
+                continue
+            case .draft:
+                modeNote = "records a local draft for the operator; nothing is sent"
+            case .confirm:
+                modeNote = "requires operator confirmation before sending"
+            case .autonomous:
+                modeNote = "sends directly (host-enforced rate limits apply)"
+            }
+            var row =
+                "- binding_id: `\(binding.id)` — \(binding.displayLabel) "
+                + "(\(binding.connectionId) room \(binding.roomId)"
+            if let threadId = binding.threadId, !threadId.isEmpty {
+                row += ", thread \(threadId)"
+            }
+            row += "; mode: \(binding.outboundMode.rawValue) — \(modeNote))"
+            lines.append(row)
+            if !binding.guidance.isEmpty {
+                lines.append("  When to use: \(binding.guidance)")
+            }
+        }
+        lines.append("")
+        lines.append(
+            "Only publish when the destination's \"when to use\" guidance applies. "
+                + "A `queued_for_approval`, `draft_recorded`, or `delivery_unknown` result "
+                + "is final for this run — do not retry it. An optional `thread_id` may "
+                + "target a thread inside the destination's room only when the destination "
+                + "does not already pin a thread."
+        )
+        return lines.joined(separator: "\n")
     }
 
     /// Build the **complete** enabled-capabilities manifest: every tool the
@@ -1409,9 +1575,9 @@ public struct SystemPromptComposer: Sendable {
         // no enabled-minus-loaded subtraction, so the manifest stays constant
         // as the agent loads tools mid-session.
         var toolsByGroup: [String: [SystemPromptTemplates.ManifestCapability]] = [:]
-        let hasEnabledAgentChannel = AgentChannelConfigurationStore.load()
-            .connections
-            .contains(where: \.enabled)
+        let hasEnabledAgentChannel = Self.hasAnyConfiguredAgentChannel(
+            configuration: AgentChannelConfigurationStore.load()
+        )
         for entry in ToolRegistry.shared.listDynamicTools() {
             guard allowedTools?.contains(entry.name) ?? true,
                 hasEnabledAgentChannel
@@ -1601,8 +1767,27 @@ public struct SystemPromptComposer: Sendable {
     /// A sentence ends only on `.`/`!`/`?` that is followed by whitespace or
     /// the end of the string, so periods inside paths (`~/.venv/`) or
     /// abbreviations (`e.g.`) don't truncate the description mid-token.
+    /// Compaction is a pure function of the description string, but the
+    /// per-character Unicode scans below run for every bootstrap tool on
+    /// every fresh compose (including the preview compose inside a view-body
+    /// evaluation), so identical inputs are memoized.
+    nonisolated(unsafe) private static var oneLineDescriptionMemo: [String: String] = [:]
+    private static let oneLineDescriptionMemoLock = NSLock()
+
     private static func oneLineToolDescription(_ description: String?) -> String? {
         guard let description else { return nil }
+        oneLineDescriptionMemoLock.lock()
+        let cached = oneLineDescriptionMemo[description]
+        oneLineDescriptionMemoLock.unlock()
+        if let cached { return cached.isEmpty ? nil : cached }
+        let result = oneLineToolDescriptionImpl(description)
+        oneLineDescriptionMemoLock.lock()
+        oneLineDescriptionMemo[description] = result ?? ""
+        oneLineDescriptionMemoLock.unlock()
+        return result
+    }
+
+    private static func oneLineToolDescriptionImpl(_ description: String) -> String? {
         let collapsed =
             description
             .split(whereSeparator: { $0.isWhitespace })
@@ -1890,13 +2075,8 @@ public struct SystemPromptComposer: Sendable {
     /// `composeChatContext(query: "")` would emit, not a mid-session
     /// freeze.
     ///
-    /// Known, deliberate divergence: `capabilityPromptSectionsEnabled` is
-    /// hardcoded `true` here, while a greeting-only cold first send in
-    /// `.none` mode drops the schema AND the capability nudge (see
-    /// `shouldSuppressTrivialToolSchema`). The popover therefore prices the
-    /// prompt a *real task* will produce — slightly overstating that one
-    /// fast-path turn is the honest side to err on, and pricing against
-    /// `""` already means "unknown next input" rather than "greeting".
+    /// Prompt and tool shape are query-independent, so pricing against `""`
+    /// matches every send made with the same settings and execution mode.
     @MainActor
     private static func previewToolset(
         snapshot: AgentConfigSnapshot,
@@ -1916,10 +2096,21 @@ public struct SystemPromptComposer: Sendable {
             agentToolsOff: snapshot.toolsDisabled,
             agentMemoryOff: snapshot.memoryDisabled
         )
+        let configuredSpawn = configuredSpawnPools(snapshot: snapshot)
+        let spawnTargets =
+            effectiveToolsOff
+            ? .empty
+            : SpawnDescriptors.resolveForPreview(
+                agentIDs: configuredSpawn.agents,
+                modelNames: configuredSpawn.models,
+                modelNotes: configuredSpawn.notes,
+                launcherModelOverride: configuredSpawn.launcherModelOverride
+            )
         let tools = resolveTools(
             snapshot: snapshot,
             executionMode: executionMode,
-            toolsDisabled: effectiveToolsOff
+            toolsDisabled: effectiveToolsOff,
+            spawnTargets: spawnTargets
         )
         let alwaysLoadedNames = resolveAlwaysLoadedNames(
             tools: tools,
@@ -1942,6 +2133,7 @@ public struct SystemPromptComposer: Sendable {
             sessionBaselineTools: tools,
             enabledManifest: enabledManifest,
             alwaysLoadedNames: alwaysLoadedNames,
+            spawnTargets: spawnTargets,
             contextDisable: contextDisable,
             sizeClass: window.sizeClass,
             effectiveToolsOff: effectiveToolsOff,
@@ -1972,6 +2164,14 @@ public struct SystemPromptComposer: Sendable {
                     "Tell the user the sandbox couldn't start and suggest opening the "
                         + "Sandbox settings panel to retry or inspect the failure. Then "
                         + "help with whatever doesn't need sandbox tools."
+                )
+            case .vmnetOwnedByOtherProcess:
+                return (
+                    "The sandbox VM is currently owned by another Osaurus process. "
+                        + "Detail: \(reason.message)",
+                    "Tell the user which process owns the sandbox and ask them to stop "
+                        + "that app or eval run before retrying. Do not repeatedly retry "
+                        + "sandbox startup in this task."
                 )
             case .provisioningFailed:
                 return (
@@ -2121,9 +2321,11 @@ public struct SystemPromptComposer: Sendable {
         agentId: UUID,
         executionMode: ExecutionMode,
         toolsDisabled: Bool = false,
+        query _: String = "",
         additionalToolNames: LoadedTools = [],
         frozenAlwaysLoadedNames: LoadedTools? = nil,
-        frozenToolSpecs: [Tool]? = nil
+        frozenToolSpecs: [Tool]? = nil,
+        spawnTargets: SpawnTargetAvailabilitySnapshot? = nil
     ) -> [Tool] {
         let snapshot = AgentConfigSnapshot.capture(
             agentId: agentId,
@@ -2135,7 +2337,8 @@ public struct SystemPromptComposer: Sendable {
             toolsDisabled: toolsDisabled,
             additionalToolNames: additionalToolNames,
             frozenAlwaysLoadedNames: frozenAlwaysLoadedNames,
-            frozenToolSpecs: frozenToolSpecs
+            frozenToolSpecs: frozenToolSpecs,
+            spawnTargets: spawnTargets
         )
     }
 
@@ -2144,9 +2347,11 @@ public struct SystemPromptComposer: Sendable {
         snapshot: AgentConfigSnapshot,
         executionMode: ExecutionMode,
         toolsDisabled: Bool = false,
+        query _: String = "",
         additionalToolNames: LoadedTools = [],
         frozenAlwaysLoadedNames: LoadedTools? = nil,
-        frozenToolSpecs: [Tool]? = nil
+        frozenToolSpecs: [Tool]? = nil,
+        spawnTargets: SpawnTargetAvailabilitySnapshot? = nil
     ) -> [Tool] {
         guard !toolsDisabled else { return [] }
 
@@ -2229,6 +2434,17 @@ public struct SystemPromptComposer: Sendable {
                 ToolRegistry.shared.specs(forTools: ["search_and_extract"]),
                 replacingExisting: true
             )
+        }
+
+        // Proactive channel publishing: expose the ONE narrow, binding-scoped
+        // publish tool whenever this agent has usable outbound destination
+        // bindings. The broad `agent_channel_*` catalog stays deferred behind
+        // `capabilities_load` — the publish tool cannot address raw
+        // connections/rooms, only operator-approved bindings, so surfacing it
+        // directly is safe and lets scheduled/self-scheduled runs publish
+        // without a discovery round-trip.
+        if !isManual, snapshot.hasChannelPublishDestinations {
+            add(ToolRegistry.shared.specs(forTools: [AgentChannelPublishTool.toolName]))
         }
 
         // Per-agent built-in tool gates. These tools are registered as
@@ -2354,6 +2570,11 @@ public struct SystemPromptComposer: Sendable {
             // when its pool is non-empty, image when the global switch is on).
             // The first actual call prompts for permission + spawn-model choice.
             allowed.formUnion(visibleDelegation)
+            // The Default agent may own destination bindings too; the narrow
+            // publish tool follows them (never the broad channel catalog).
+            if snapshot.hasChannelPublishDestinations {
+                allowed.insert(AgentChannelPublishTool.toolName)
+            }
             // Browser Use is a custom-agent capability (like `computer_use`):
             // the Default agent never gets it, so it stays off this allowlist
             // even if a stray snapshot carries the flag.
@@ -2426,55 +2647,6 @@ public struct SystemPromptComposer: Sendable {
             byName = byName.filter { allowed.contains($0.key) }
         }
 
-        // `spawn_model` is agent-scoped, so its request-local schema should be
-        // agent-scoped too. Publish the exact legal ids as a nested enum. Remote
-        // providers can validate/select them directly, local tool parsers receive
-        // the same contract, and a blank/guessed id is corrected before the
-        // provider-routing gate. Execution still re-checks the allow-list.
-        if let spawnModel = byName[SubagentCapabilityRegistry.spawnModelToolName] {
-            let config = SubagentConfigurationStore.snapshot()
-            let allowedModelIds = SubagentToolVisibility.effectiveSpawnableModels(
-                isDefault: snapshot.agentId == Agent.defaultId,
-                config: config,
-                perAgentEnabled: snapshot.spawnDelegationEnabled,
-                perAgentModelTargets: snapshot.spawnableModelNames
-            )
-            byName[SubagentCapabilityRegistry.spawnModelToolName] =
-                SpawnModelTool.constrainedSpec(
-                    spawnModel,
-                    allowedModelIds: allowedModelIds
-                )
-        }
-        if let spawnBatch = byName[SubagentCapabilityRegistry.spawnBatchToolName] {
-            let config = SubagentConfigurationStore.snapshot()
-            let isDefault = snapshot.agentId == Agent.defaultId
-            let settings = AgentManager.shared.agent(for: snapshot.agentId)?.settings
-            let allowedAgentNames = SubagentToolVisibility.effectiveSpawnableAgents(
-                isDefault: isDefault,
-                config: config,
-                perAgentEnabled: snapshot.spawnDelegationEnabled,
-                perAgentTargets: snapshot.spawnableAgentNames
-            )
-            let allowedModelIds = SubagentToolVisibility.effectiveSpawnableModels(
-                isDefault: isDefault,
-                config: config,
-                perAgentEnabled: snapshot.spawnDelegationEnabled,
-                perAgentModelTargets: snapshot.spawnableModelNames
-            )
-            let maxParallel = SubagentToolVisibility.effectiveBudgets(
-                isDefault: isDefault,
-                config: config,
-                settings: settings
-            ).normalized.maxParallelSpawns
-            byName[SubagentCapabilityRegistry.spawnBatchToolName] =
-                SpawnBatchTool.constrainedSpec(
-                    spawnBatch,
-                    allowedAgentNames: allowedAgentNames,
-                    allowedModelIds: allowedModelIds,
-                    maxParallel: maxParallel
-                )
-        }
-
         // Generation-only image schema: when `image` survived the gates but no
         // ready edit model is installed, swap it to the edit-free variant (no
         // `source_paths` / `strength`, generation-only description) so the model
@@ -2491,12 +2663,23 @@ public struct SystemPromptComposer: Sendable {
             byName["image"] = imageLoadedExplicitly ? genOnly : compactBootstrapSpec(genOnly)
         }
 
+        // The chat contract exposes one compact capability gateway. Keep the
+        // legacy discover/load registrations executable for non-chat callers,
+        // but never publish both concepts to a custom agent.
+        if snapshot.agentId != Agent.defaultId {
+            byName.removeValue(forKey: "capabilities_discover")
+            byName.removeValue(forKey: "capabilities_load")
+        }
+
         // Freeze the exact first-compose payload for every baseline tool that
         // remains visible after the current permission/feature gates. Names
-        // alone are not sufficient: a computed schema can change while its
-        // registration and name remain identical (web_search categories are
-        // populated asynchronously after keychain/provider discovery). Such a
-        // change rewrites the tokenizer prefix and defeats disk-L2 reuse.
+        // alone are not sufficient: a schema can change while its registration
+        // and name remain identical (an MCP server re-registering a tool on
+        // reconnect, a plugin reload, a sandbox tool re-registered with new
+        // agent context). Such a change rewrites the tokenizer prefix and
+        // defeats disk-L2 reuse. Built-in baseline schemas are immutable by
+        // contract (see WebSearchTool.parameters) — this freeze is the
+        // backstop for dynamically registered tools.
         //
         // A tool explicitly loaded this session is the intentional exception:
         // `capabilities_load` must still be able to upgrade a compact
@@ -2511,6 +2694,148 @@ public struct SystemPromptComposer: Sendable {
                 if let frozen = frozenByName[name] {
                     byName[name] = frozen
                 }
+            }
+        }
+
+        // The baseline schema above is deliberately frozen for prefix-cache
+        // stability, but delegation targets and the per-launcher batch limit
+        // are request-local authorization guidance. Apply those constraints
+        // AFTER restoring frozen payloads so a settings edit cannot leave the
+        // model advertising stale targets or a stale maxItems value. Reapplying
+        // the same normalized constraints is byte-stable, so unchanged settings
+        // retain the frozen-prefix cache contract.
+        //
+        // Execution still enforces every allow-list and budget independently;
+        // these enums are provider/local-parser guidance, not the security
+        // boundary.
+        let config = SubagentConfigurationStore.snapshot()
+        let isDefault = snapshot.agentId == Agent.defaultId
+        let configuredAgentIDs =
+            snapshot.spawnConfiguration?.agentIDs
+            ?? SubagentToolVisibility.effectiveSpawnableAgents(
+                isDefault: isDefault,
+                config: config,
+                perAgentEnabled: snapshot.spawnDelegationEnabled,
+                perAgentTargets: snapshot.spawnableAgentIDs
+            )
+        let configuredModelIds =
+            snapshot.spawnConfiguration?.modelNames
+            ?? SubagentToolVisibility.effectiveSpawnableModels(
+                isDefault: isDefault,
+                config: config,
+                perAgentEnabled: snapshot.spawnDelegationEnabled,
+                perAgentModelTargets: snapshot.spawnableModelNames
+            )
+        let allowedAgentIDs =
+            (spawnTargets?.runnableAgentIDs ?? configuredAgentIDs)
+            .filter { $0 != snapshot.agentId }
+        let allowedModelIds =
+            spawnTargets?.runnableModelIds ?? configuredModelIds
+
+        if let spawnAgent = byName[SubagentCapabilityRegistry.spawnAgentToolName] {
+            if spawnTargets != nil, allowedAgentIDs.isEmpty {
+                byName.removeValue(forKey: SubagentCapabilityRegistry.spawnAgentToolName)
+            } else {
+                byName[SubagentCapabilityRegistry.spawnAgentToolName] =
+                    SpawnAgentTool.constrainedSpec(
+                        spawnAgent,
+                        allowedAgentIDs: allowedAgentIDs
+                    )
+            }
+        }
+        if let spawnModel = byName[SubagentCapabilityRegistry.spawnModelToolName] {
+            if spawnTargets != nil, allowedModelIds.isEmpty {
+                byName.removeValue(forKey: SubagentCapabilityRegistry.spawnModelToolName)
+            } else {
+                byName[SubagentCapabilityRegistry.spawnModelToolName] =
+                    SpawnModelTool.constrainedSpec(
+                        spawnModel,
+                        allowedModelIds: allowedModelIds
+                    )
+            }
+        }
+        if let spawnBatch = byName[SubagentCapabilityRegistry.spawnBatchToolName] {
+            if spawnTargets != nil, allowedAgentIDs.isEmpty, allowedModelIds.isEmpty {
+                byName.removeValue(forKey: SubagentCapabilityRegistry.spawnBatchToolName)
+            } else {
+                let maxParallel =
+                    snapshot.spawnConfiguration?.budgets.maxParallelSpawns
+                    ?? SubagentToolVisibility.effectiveBudgets(
+                        isDefault: isDefault,
+                        config: config,
+                        settings: AgentManager.shared.agent(for: snapshot.agentId)?.settings,
+                        sharedParallelLimit: SpawnBatchConcurrencyContract.configuredLimit(
+                            for: ServerRuntimeSettingsStore.snapshot()
+                        )
+                    ).normalized.maxParallelSpawns
+                byName[SubagentCapabilityRegistry.spawnBatchToolName] =
+                    SpawnBatchTool.constrainedSpec(
+                        spawnBatch,
+                        allowedAgentIDs: allowedAgentIDs,
+                        allowedModelIds: allowedModelIds,
+                        maxParallel: maxParallel
+                    )
+            }
+        }
+
+        // Execution mode selects the file/shell backend; it must not replace
+        // the agent's enabled capability set. Workspace primitives join the
+        // normal auto-mode tools, while manual mode remains the explicit user
+        // selection plus those required execution primitives.
+        let hasExecutionWorkspace =
+            executionMode.usesHostFolderTools || executionMode.usesSandboxTools
+        if snapshot.agentId != Agent.defaultId || hasExecutionWorkspace {
+            var allowed = additionalToolNames
+            if hasExecutionWorkspace {
+                add(
+                    ToolRegistry.shared.specs(
+                        forTools: Array(ToolRegistry.coreWorkspaceToolNames)
+                    ),
+                    replacingExisting: true
+                )
+                allowed.formUnion(ToolRegistry.coreWorkspaceToolNames)
+            }
+            if snapshot.dbEnabled { allowed.formUnion(agentDBToolNames) }
+            if snapshot.renderChartEnabled { allowed.insert("render_chart") }
+            if snapshot.speakEnabled { allowed.insert("speak") }
+            if snapshot.searchMemoryEnabled { allowed.insert("search_memory") }
+            if snapshot.webSearchEnabled {
+                allowed.formUnion(["web_search", "search_and_extract"])
+            }
+            if snapshot.selfSchedulingEnabled { allowed.formUnion(schedulerToolNames) }
+            if snapshot.knowledgeEnabled { allowed.formUnion(knowledgeToolNames) }
+            if snapshot.knowledgeCuratorEnabled {
+                allowed.formUnion(knowledgeCuratorToolNames)
+            }
+            allowed.formUnion(visibleDelegation)
+            if snapshot.computerUseEnabled { allowed.insert(ComputerUseTool.toolName) }
+            if snapshot.browserUseEnabled { allowed.insert(BrowserUseTool.toolName) }
+            if byName["capabilities"] != nil { allowed.insert("capabilities") }
+            if snapshot.hasChannelPublishDestinations {
+                allowed.insert(AgentChannelPublishTool.toolName)
+            }
+            if let shell = byName["shell_run"],
+                !(executionMode.usesSandboxTools
+                    && snapshot.autonomousConfig?.backgroundProcessEnabled == true)
+            {
+                byName["shell_run"] = removingProperty("background", from: shell)
+            }
+            if isManual, let manualNames = snapshot.manualToolNames {
+                allowed.formUnion(manualNames)
+            }
+            // These unconditionally available baseline tools are part of the
+            // stable schema. Query wording never adds or removes tools.
+            allowed.formUnion(["get_current_time", "sandbox_process"])
+            byName = byName.filter { allowed.contains($0.key) }
+
+            // The implementation keeps its full argument compatibility, while
+            // ordinary chat publishes only the common five-tool contract.
+            // Explicit manual/session loads retain the full schema.
+            let explicitlyFull = additionalToolNames.union(snapshot.manualToolNames ?? [])
+            for name in ToolRegistry.coreWorkspaceToolNames
+            where !explicitlyFull.contains(name) {
+                guard let full = byName[name] else { continue }
+                byName[name] = compactWorkspaceSpec(full)
             }
         }
 
@@ -2541,6 +2866,127 @@ public struct SystemPromptComposer: Sendable {
         return resolved
     }
 
+    private static func compactWorkspaceSpec(_ tool: Tool) -> Tool {
+        let description: String
+        let properties: [String: JSONValue]
+        let required: [String]
+        switch tool.function.name {
+        case "file_read":
+            description = "Read a file or list a directory in the working folder. Text lines use `N|` display prefixes."
+            properties = [
+                "path": .object([
+                    "type": .string("string"),
+                    "description": .string("Relative file or directory path"),
+                ]),
+                "start_line": .object([
+                    "type": .string("integer"),
+                    "description": .string("Optional first line, 1-indexed"),
+                ]),
+                "end_line": .object([
+                    "type": .string("integer"),
+                    "description": .string("Optional last line, inclusive"),
+                ]),
+            ]
+            required = ["path"]
+        case "file_write":
+            description = "Create, replace, or append a UTF-8 file. To preserve existing bytes, choose append and send only new content."
+            properties = [
+                "path": .object([
+                    "type": .string("string"),
+                    "description": .string("Relative file path"),
+                ]),
+                "content": .object([
+                    "type": .string("string"),
+                    "maxLength": .number(Double(WorkspaceToolContract.maxWriteContentCharacters)),
+                    "description": .string(
+                        "File content, at most \(WorkspaceToolContract.maxWriteContentCharacters) characters"
+                    ),
+                ]),
+                "mode": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("overwrite"), .string("append")]),
+                    "description": .string("Default overwrite; append adds content without replacing the file"),
+                ]),
+            ]
+            required = ["path", "content"]
+        case "file_edit":
+            description = "Replace one exact, unique text occurrence. For additive changes, use file_write append."
+            properties = [
+                "path": .object([
+                    "type": .string("string"),
+                    "description": .string("Relative file path"),
+                ]),
+                "old_string": .object([
+                    "type": .string("string"),
+                    "description": .string("Exact unique text; omit `N|` display prefixes"),
+                ]),
+                "new_string": .object([
+                    "type": .string("string"),
+                    "description": .string("Replacement text"),
+                ]),
+            ]
+            required = ["path", "old_string", "new_string"]
+        case "file_search":
+            description = "Search file contents or names in the working folder."
+            properties = [
+                "pattern": .object([
+                    "type": .string("string"),
+                    "description": .string("Text or filename pattern"),
+                ]),
+                "path": .object([
+                    "type": .string("string"),
+                    "description": .string("Optional relative search root"),
+                ]),
+                "target": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("content"), .string("files")]),
+                    "description": .string("Default content; files searches names"),
+                ]),
+            ]
+            required = ["pattern"]
+        case "shell_run":
+            description = "Run a build, test, git, process, network, or filesystem-mutation command in the working folder. Requires approval."
+            properties = [
+                "command": .object([
+                    "type": .string("string"),
+                    "description": .string("Shell command; do not `cd` to the working folder first"),
+                ])
+            ]
+            required = ["command"]
+        default:
+            return tool
+        }
+        return Tool(
+            type: tool.type,
+            function: ToolFunction(
+                name: tool.function.name,
+                description: description,
+                parameters: .object([
+                    "type": .string("object"),
+                    "additionalProperties": .bool(false),
+                    "properties": .object(properties),
+                    "required": .array(required.map { .string($0) }),
+                ])
+            )
+        )
+    }
+
+    private static func removingProperty(_ property: String, from tool: Tool) -> Tool {
+        guard case .object(var schema)? = tool.function.parameters,
+            case .object(var properties)? = schema["properties"]
+        else { return tool }
+        properties.removeValue(forKey: property)
+        schema["properties"] = .object(properties)
+        return Tool(
+            type: tool.type,
+            function: ToolFunction(
+                name: tool.function.name,
+                description: tool.function.description,
+                parameters: .object(schema)
+            )
+        )
+    }
+
     /// Stable order:
     ///   0. Agent-loop tools (`todo`, `complete`, `clarify`, `share_artifact`)
     ///      in fixed order. Pinned at the very top so a model scanning the
@@ -2548,9 +2994,8 @@ public struct SystemPromptComposer: Sendable {
     ///      sequence stable across sends regardless of what plugins or MCP
     ///      providers register later (KV-cache reuse).
     ///   1. Built-in sandbox tools (alphabetical).
-    ///   2. Capability discovery tools (`capabilities_discover`, then
-    ///      `capabilities_load`) in fixed order so the discovery tool sits
-    ///      ahead of the loader in the model's view.
+    ///   2. Compact capability gateway, followed by legacy compatibility
+    ///      aliases when a non-chat surface explicitly includes them.
     ///   3. Everything else, alphabetical.
     @MainActor
     static func canonicalToolOrder(_ tools: [Tool]) -> [Tool] {
@@ -2560,7 +3005,7 @@ public struct SystemPromptComposer: Sendable {
                 .enumerated().map { ($1, $0) }
         )
         let capabilityIndex = Dictionary(
-            uniqueKeysWithValues: ["capabilities_discover", "capabilities_load"]
+            uniqueKeysWithValues: ["capabilities", "capabilities_discover", "capabilities_load"]
                 .enumerated().map { ($1, $0) }
         )
 

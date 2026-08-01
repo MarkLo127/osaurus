@@ -97,16 +97,16 @@ enum AgentChannelProviderSetupSection: String, CaseIterable, Sendable {
     var title: String {
         switch self {
         case .connect: return L("Connect")
-        case .access: return L("Access")
-        case .behavior: return L("Behavior")
-        case .verify: return L("Verify")
+        case .access: return L("Conversations")
+        case .behavior: return L("Agent Behavior")
+        case .verify: return L("Test")
         }
     }
 
     var icon: String {
         switch self {
         case .connect: return "link"
-        case .access: return "person.2"
+        case .access: return "bubble.left.and.bubble.right"
         case .behavior: return "arrow.triangle.branch"
         case .verify: return "checkmark.seal"
         }
@@ -116,7 +116,7 @@ enum AgentChannelProviderSetupSection: String, CaseIterable, Sendable {
         switch self {
         case .connect: return L("Bot and tokens")
         case .access: return L("Rooms and people")
-        case .behavior: return L("Optional")
+        case .behavior: return L("Replies and sending")
         case .verify: return L("Live check")
         }
     }
@@ -140,7 +140,7 @@ enum AgentChannelProviderSetupSection: String, CaseIterable, Sendable {
 /// The unified "Add Channel" picker's catalog: guided native providers first,
 /// the advanced custom HTTP definition last.
 enum AgentChannelAddCatalog {
-    static let choices: [AgentChannelKind] = [.discord, .slack, .telegram, .customHTTP]
+    static let choices: [AgentChannelKind] = [.discord, .slack, .telegram, .imessage, .customHTTP]
 
     /// Custom HTTP is the advanced integration path, visually set apart from
     /// the guided native providers.
@@ -151,8 +151,9 @@ enum AgentChannelAddCatalog {
     static func tagline(for kind: AgentChannelKind) -> String {
         switch kind {
         case .discord: return L("Guided setup — bot access to allowlisted servers and channels")
-        case .slack: return L("Guided setup — bot access to allowlisted workspace channels")
+        case .slack: return L("Guided setup — bot access to allowlisted channels and DMs")
         case .telegram: return L("Guided setup — bot access to allowlisted chats and groups")
+        case .imessage: return L("Guided setup — this Mac's Messages app, allowlisted chats only")
         case .customHTTP: return L("Advanced — define your own HTTP JSON channel")
         }
     }

@@ -164,16 +164,97 @@ private struct EmptyStateContent: View, Equatable {
 
 @MainActor
 final class ChatSession: ObservableObject {
+    /// Notifications whose source data can rewrite the composed system/tool
+    /// prompt. Kept as one testable inventory so a new settings surface
+    /// cannot refresh only its display cache while leaving warm-up state on
+    /// the previous rendered bytes.
+    static let promptShapeNotificationNames: [Notification.Name] = [
+        .agentUpdated,
+        .activeAgentChanged,
+        .toolsListChanged,
+        .appConfigurationChanged,
+        .agentChannelConfigurationChanged,
+    ]
+
     @Published var turns: [ChatTurn] = []
     @Published var isStreaming: Bool = false {
         didSet {
             guard isStreaming != oldValue else { return }
             if isStreaming {
                 ChatPerfTrace.shared.begin("stream-\(Int(Date().timeIntervalSince1970))")
+                beginRunProgressMonitor()
             } else {
                 ChatPerfTrace.shared.end()
+                endRunProgressMonitor()
             }
         }
+    }
+
+    // MARK: - Run progress (slow / stalled surfacing)
+
+    /// Coarse liveness of the in-flight run, derived from time since the last
+    /// observed progress event (stream delta, tool event, image-generation
+    /// event). Drives a visible notice above the composer so a wedged
+    /// provider/model/tool reads as "stalled — Stop is right there" instead of
+    /// an indefinite shimmer the user can only interpret as a hang.
+    enum RunProgressState {
+        case active
+        /// No progress for `runSlowThreshold` — worth telling the user we're
+        /// still alive but waiting (long prefill, slow provider, big tool).
+        case slow
+        /// No progress for `runStalledThreshold` — likely wedged; surface
+        /// Stop as the recovery action. The run is NOT auto-killed: a huge
+        /// model load can legitimately take minutes, so the user decides.
+        case stalled
+    }
+
+    @Published private(set) var runProgressState: RunProgressState = .active
+
+    private var lastRunProgressAt = Date()
+    private var runProgressMonitorTask: Task<Void, Never>?
+    private static let runSlowThreshold: TimeInterval = 30
+    private static let runStalledThreshold: TimeInterval = 120
+
+    /// Record run liveness. Called from every streaming/tool/image event
+    /// loop; must stay cheap (a Date store; the published state only changes
+    /// on an actual transition).
+    func noteRunProgress() {
+        lastRunProgressAt = Date()
+        if runProgressState != .active {
+            runProgressState = .active
+        }
+    }
+
+    private func beginRunProgressMonitor() {
+        lastRunProgressAt = Date()
+        runProgressState = .active
+        runProgressMonitorTask?.cancel()
+        runProgressMonitorTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                let idle = Date().timeIntervalSince(self.lastRunProgressAt)
+                let newState: RunProgressState =
+                    idle >= Self.runStalledThreshold
+                    ? .stalled
+                    : idle >= Self.runSlowThreshold ? .slow : .active
+                if newState != self.runProgressState {
+                    self.runProgressState = newState
+                    if newState == .stalled {
+                        CrashReportingService.recordBreadcrumb(
+                            category: "chat.run",
+                            message: "run stalled: no progress for \(Int(idle))s"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func endRunProgressMonitor() {
+        runProgressMonitorTask?.cancel()
+        runProgressMonitorTask = nil
+        runProgressState = .active
     }
 
     @Published var lastStreamError: String?
@@ -671,15 +752,23 @@ final class ChatSession: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] note in
-            let residentModelNames = note.object as? [String] ?? []
+            guard let snapshot = note.object as? ModelRuntimeResidencySnapshot else { return }
             Task { @MainActor in
                 guard let self else { return }
-                self.warmupController.reconcileRuntimeResidency(
-                    selectedModel: self.selectedModel,
-                    residentModelNames: residentModelNames
+                let isSessionActive = self.windowState.map {
+                    ChatWindowManager.shared.isChatWindowActive(id: $0.windowId)
+                } ?? false
+                self.warmupController.handleRuntimeResidencyChanged(
+                    session: self,
+                    snapshot: snapshot,
+                    isSessionActive: isSessionActive
                 )
             }
         }
+        // Seed the residency-backed model dot before any runtime change
+        // fires — a freshly opened chat must show whether the selected
+        // model is already loaded, not a hardcoded default.
+        warmupController.seedRuntimeResidency(session: self)
 
         // Re-derive visible blocks when the activity-rollup toggle flips in
         // Chat settings; the memoizer's display pass re-reads the flag, so a
@@ -843,10 +932,12 @@ final class ChatSession: ObservableObject {
             NotificationCenter.default.publisher(for: $0)
                 .map { _ in () }.eraseToAnyPublisher()
         }
-        let budgetSignals: [AnyPublisher<Void, Never>] = [
-            voidNotification(.agentUpdated),
-            voidNotification(.activeAgentChanged),
-            voidNotification(.toolsListChanged),
+        // Channel destination edits rewrite a dynamic prompt section;
+        // Default-agent and global chat settings rewrite system/tool policy.
+        // All are equality-guarded by `recomputePreviewContext`, so unrelated
+        // settings notifications remain no-ops after recomposition.
+        let budgetSignals: [AnyPublisher<Void, Never>] =
+            Self.promptShapeNotificationNames.map(voidNotification) + [
             folderState.objectWillChange
                 .map { _ in () }.eraseToAnyPublisher(),
             $selectedModel.map { _ in () }.eraseToAnyPublisher(),
@@ -976,6 +1067,30 @@ final class ChatSession: ObservableObject {
         guard selectedModel == nil, !pickerItems.isEmpty else { return }
         applyEffectiveModel(for: agentId)
         Task { [weak self] in await self?.refreshContextEstimates() }
+    }
+
+    /// For headless dispatched runs (channel / schedule / HTTP / plugin /
+    /// watcher), make the agent's CURRENT default model win over whatever
+    /// the session had persisted. Reattached conversations (e.g. one
+    /// session per Slack room) otherwise pin the model that was selected
+    /// when the session was first created, so changing an agent's default
+    /// model never took effect on ongoing channel conversations — and a
+    /// cold-start fallback pick became permanent. The persisted model stays
+    /// as the fallback when the agent's default isn't available yet (remote
+    /// catalog still loading, model uninstalled). Never touches window
+    /// chats (`source == .chat`), where a manual pick must survive.
+    func applyAgentDefaultModelForDispatch() {
+        guard source != .chat else { return }
+        guard
+            let model = AgentManager.shared.effectiveModel(for: agentId ?? Agent.defaultId),
+            pickerItems.contains(where: { $0.id == model }),
+            selectedModel != model
+        else { return }
+        isLoadingModel = true
+        selectedModel = model
+        loadActiveModelOptions(for: model)
+        applyImageModelDefaults(for: model)
+        isLoadingModel = false
     }
 
     /// Pick the picker item that best matches the agent's preferred model
@@ -1921,6 +2036,8 @@ final class ChatSession: ObservableObject {
         // starts (a warm-up that already reached generation is covered by
         // the await below and only pre-warms this send's own prefix).
         warmupController.cancelScheduledWarmup()
+        await warmupController.awaitRequiredContextWarmup()
+        guard !Task.isCancelled else { return false }
         await warmupController.awaitInFlightWarmup()
         return !Task.isCancelled
     }
@@ -1931,6 +2048,12 @@ final class ChatSession: ObservableObject {
         if wasAwaitingPreSendHandshake {
             warmupController.cancelPendingWorkForUserStop()
         }
+        // Resolve every mounted/queued prompt (secret, clarify) BEFORE
+        // cancelling the run: a tool call parked on a prompt continuation
+        // does not observe task cancellation, so without this drain Stop
+        // would leave that continuation suspended forever, the overlay
+        // mounted, and the input bar hit-test disabled.
+        promptQueue.drainAll()
         stopRequested = true
         let task = currentTask
         task?.cancel()
@@ -1938,6 +2061,19 @@ final class ChatSession: ObservableObject {
             finalizeRun(runId: runId, persistConversationArtifacts: false)
         } else {
             completeRunCleanup()
+        }
+    }
+
+    /// Put this session on the same cancellation path as its visible Stop
+    /// control before an explicit model-cache unload tears down the runtime.
+    /// Cancelling only the runtime producer ends its stream without telling
+    /// the chat lifecycle that the run was stopped; cleanup can then classify
+    /// the partial response as successful and immediately warm-load the model
+    /// the user just unloaded.
+    func prepareForExplicitModelUnload() {
+        warmupController.cancelPendingWorkForExplicitModelUnload()
+        if isSendActiveForComposer {
+            stop()
         }
     }
 
@@ -2419,10 +2555,21 @@ final class ChatSession: ObservableObject {
         generativeGreetingState = .idle
     }
 
-    /// Invalidate the token cache (called when tools/skills change)
-    func invalidateTokenCache() {
+    /// Invalidate send-time token accounting (called when tools/skills or
+    /// agent configuration change).
+    ///
+    /// Prompt-shape notifications need the previous preview bytes as their
+    /// comparison baseline. When a settings observer clears that baseline,
+    /// SwiftUI can lazily compose the new preview during the intervening
+    /// redraw; the later equality detector then compares new-to-new and
+    /// leaves a stale warm-prefix claim green. Observer-driven source changes
+    /// therefore preserve the preview until `recomputePreviewContext()` has
+    /// compared it with the newly composed bytes.
+    func invalidateTokenCache(preservingPromptShapeBaseline: Bool = false) {
         cachedContext = nil
-        cachedPreviewContext = nil
+        if !preservingPromptShapeBaseline {
+            cachedPreviewContext = nil
+        }
         budgetTracker.clear()
         objectWillChange.send()
     }
@@ -2444,6 +2591,14 @@ final class ChatSession: ObservableObject {
         @discardableResult
         func resyncBudgetEstimateForTests() -> Bool {
             recomputePreviewContext()
+        }
+
+        /// Test seam for the authoritative pre-send prompt reconciliation.
+        /// Unlike the 80 ms UI-estimate debounce, this runs synchronously and
+        /// therefore covers a Settings Save -> immediate Send sequence.
+        @discardableResult
+        func reconcilePromptShapeBeforeSendForTests() -> Bool {
+            reconcilePromptShapeBeforeSend()
         }
     #endif
 
@@ -2651,9 +2806,15 @@ final class ChatSession: ObservableObject {
     /// sandbox / tool / folder / model state, store it in
     /// `cachedPreviewContext`, and report whether the displayed budget shape
     /// changed. The shape is compared via `cacheHint` (the static-prefix hash
-    /// that folds prompt sections + tool schemas) plus `toolTokens`, so a
+    /// that folds prompt sections + tool schemas) plus `toolTokens` plus the
+    /// full rendered prompt bytes — the last one catches edits that only
+    /// rewrite a DYNAMIC section (e.g. a channel-destination mode change),
+    /// which leave `cacheHint` untouched but must still invalidate the
+    /// warm-up so the send doesn't diverge against a stale warmed prefix.
+    /// Consecutive previews of unchanged state are byte-identical, so a
     /// burst of redundant signals (e.g. a sandbox toggle firing both
-    /// `.agentUpdated` and `.toolsListChanged`) collapses to no re-render.
+    /// `.agentUpdated` and `.toolsListChanged`) still collapses to no
+    /// re-render.
     ///
     /// The preview is recomposed even while a real send context is cached so
     /// consecutive previews stay a reliable config-change detector. That send
@@ -2681,6 +2842,7 @@ final class ChatSession: ObservableObject {
         let shapeChanged =
             previous?.cacheHint != preview.cacheHint
             || previous?.toolTokens != preview.toolTokens
+            || previous?.prompt != preview.prompt
 
         // No send context yet → the preview drives the popover directly.
         guard cachedContext != nil else { return shapeChanged }
@@ -2700,11 +2862,29 @@ final class ChatSession: ObservableObject {
     /// folder / model signals that feed the pipeline, and doing the
     /// `MemoryContextAssembler` read here once per signal, multiplied across
     /// open chat windows, saturated the cooperative pool (see #1324).
-    private func refreshPreviewEstimate() {
-        if recomputePreviewContext() {
-            invalidateWarmupAfterContextShapeChange()
+    @discardableResult
+    private func reconcilePromptShapeBeforeSend() -> Bool {
+        let hadPromptShapeBaseline = cachedPreviewContext != nil
+        guard recomputePreviewContext() else { return false }
+
+        // Nil -> first preview is initialization, not evidence that a warmed
+        // prompt became stale. Treating it as a required shape rewarm moves an
+        // immediate first send into an unnecessary async handshake (and delays
+        // its crash-safe persistence). A real Settings/agent/tool change has
+        // an established old preview — preserved by the source observers —
+        // and still takes the required-rewarm path below.
+        guard hadPromptShapeBaseline else {
             objectWillChange.send()
+            return false
         }
+
+        invalidateWarmupAfterContextShapeChange()
+        objectWillChange.send()
+        return true
+    }
+
+    private func refreshPreviewEstimate() {
+        reconcilePromptShapeBeforeSend()
     }
 
     /// Re-resolve every input the welcome-screen preview estimate needs —
@@ -3184,10 +3364,9 @@ final class ChatSession: ObservableObject {
         // Optimistic estimate: when autonomous is on but sandbox tools haven't
         // registered yet, report `.sandbox` so the budget preview matches what
         // the next send will most likely produce after `registerTools` runs.
-        // Thread the folder through so the combined sandbox + host-read mode
-        // is estimated correctly when a folder is also mounted.
+        // A selected host folder is suspended while sandbox is enabled.
         if autonomous && resolved.usesSandboxTools == false {
-            return .sandbox(hostRead: folder, hostWrite: folder != nil && hostWrites)
+            return .sandbox(hostRead: nil, hostWrite: false)
         }
         return resolved
     }
@@ -3618,6 +3797,7 @@ final class ChatSession: ObservableObject {
         debugLog("send: got stream, entering delta loop")
         do {
             for try await delta in stream {
+                noteRunProgress()
                 if !isRunActive(runId) {
                     await processor.finalize()
                     // Cancelled mid-run: don't leave a remote tool chip
@@ -3742,6 +3922,14 @@ final class ChatSession: ObservableObject {
                     if currentTurn.pendingToolName == nil {
                         currentTurn.pendingToolName = ToolDisplayName.pendingToolSentinel
                     }
+                    if currentTurn.pendingToolArgSize
+                        > AgentToolLoop.maxStreamingToolArgumentCharacters
+                    {
+                        throw OversizedStreamingToolCall(
+                            toolName: currentTurn.pendingToolName,
+                            argumentCharacters: currentTurn.pendingToolArgSize
+                        )
+                    }
                     let count = currentTurn.pendingToolArgFragmentCount
                     let now = Date()
                     if count <= 3 || now.timeIntervalSince(lastToolArgRebuildAt) >= 0.08 {
@@ -3771,6 +3959,14 @@ final class ChatSession: ObservableObject {
                         let name = FileDiff.partialToolName(inArgs: full)
                     {
                         currentTurn.pendingToolName = name
+                    }
+                    if currentTurn.pendingToolArgSize
+                        > AgentToolLoop.maxStreamingToolArgumentCharacters
+                    {
+                        throw OversizedStreamingToolCall(
+                            toolName: currentTurn.pendingToolName,
+                            argumentCharacters: currentTurn.pendingToolArgSize
+                        )
                     }
                     // Always rebuild for the first few fragments so the chip
                     // appears immediately; afterwards cap at ~12 rebuilds/sec
@@ -4140,6 +4336,7 @@ final class ChatSession: ObservableObject {
         }
         do {
             for try await event in stream {
+                noteRunProgress()
                 guard isRunActive(runId) else { break }
                 switch event {
                 case .loadingModel:
@@ -4251,6 +4448,18 @@ final class ChatSession: ObservableObject {
             restoreTurnsRollbackAfterAbortedRegeneration()
             return
         }
+
+        // Settings notifications intentionally debounce preview work by 80 ms
+        // to coalesce UI churn. A user can still click Send inside that
+        // window. Recompose from the authoritative stores *before* deciding
+        // whether a warm-up handshake is needed; if the rendered bytes
+        // changed, this synchronously invalidates the stale green claim and
+        // creates required rewarm work that the send below must await.
+        //
+        // This is an equality-guarded source reconciliation, not a blind
+        // delay. The later debounced notification observes the same bytes and
+        // becomes a no-op.
+        reconcilePromptShapeBeforeSend()
 
         // A scheduled-but-not-started warm-up must not fire mid-run.
         warmupController.cancelScheduledWarmup()
@@ -4471,17 +4680,28 @@ final class ChatSession: ObservableObject {
                 _ = await self.folderState.contextWaitingForRestore()
             }
             guard self.isRunActive(runId) else { return }
-            // Bind THIS session's folder root for the whole turn. Folder
-            // tools, undo roots, combined-mode policy, and external-tool
-            // context all resolve the root from this TaskLocal, so a folder
-            // picked in another chat window mid-run can never redirect this
-            // chat's tools. Resolved AFTER the restore wait so the bound
-            // root and the composed prompt always agree.
-            let turnFolderRoot = self.activeFolderContext(for: turnAgentId)?.rootPath
+            // Bind THIS session's trusted root for the whole turn. A selected
+            // folder is intentionally suspended while VM execution is enabled,
+            // so sandbox tools cannot inherit a host path even if the user
+            // switches modes in another window midway through the run.
+            let sandboxEnabled =
+                AgentManager.shared.effectiveAutonomousExec(for: turnAgentId)?.enabled == true
+            let turnFolderRoot =
+                sandboxEnabled ? nil : self.activeFolderContext(for: turnAgentId)?.rootPath
             await ChatExecutionContext.$currentFolderRoot.withValue(turnFolderRoot) { [self] in
+            // Typed run provenance for the whole turn. The session's own
+            // persisted `source` is authoritative here (a dispatched
+            // schedule/watcher/self-schedule run re-binds the same value the
+            // dispatcher already bound; a UI chat turn binds `.chat`).
+            // Source-scoped capabilities (proactive channel publishing) read
+            // this instead of inferring provenance from surface flags.
+            await ChatExecutionContext.$currentSessionSource.withValue(source) { [self] in
             await ChatExecutionContext.$currentAgentId.withValue(turnAgentId) { [self] in
             await ChatExecutionContext.$currentUserRequest.withValue(
                 trimmed.isEmpty ? nil : trimmed
+            ) { [self] in
+            await ChatExecutionContext.$currentModelName.withValue(
+                self.selectedModel
             ) { [self] in
             await ChatExecutionContext.$currentEnableThinking.withValue(
                 turnGenerationControls.enableThinking
@@ -5039,6 +5259,7 @@ final class ChatSession: ObservableObject {
                         // names persist into the session's tool union so the NEXT
                         // user turn composes their full schemas into `<tools>`.
                         if inv.toolName == "capabilities_load"
+                            || inv.toolName == "capabilities"
                             || inv.toolName == "sandbox_plugin_register"
                         {
                             // Always drain so a buffered spec can't leak into an
@@ -5093,6 +5314,15 @@ final class ChatSession: ObservableObject {
                                     await PluginManager.shared.notifyArtifactHandlers(artifact: artifact)
                                 }
                             }
+                        }
+                        if let fileCard = WorkspaceFileReference.cardResult(
+                            toolResult: resultText,
+                            toolName: inv.toolName
+                        ) {
+                            // Keep the compact typed reference in model history,
+                            // but make its Open/Reveal or Export path explicit
+                            // on the user-facing tool card.
+                            toolCardOverrides[callId] = fileCard
                         }
 
                         if inv.toolName == "sandbox_secret_set",
@@ -5679,6 +5909,22 @@ final class ChatSession: ObservableObject {
                                 // allowance.
                                 if invocations.isEmpty {
                                     transientRetries = 0
+                                    if assistantTurn.terminalStopReason == "length",
+                                        assistantTurn.pendingToolArgSize > 0
+                                    {
+                                        let pendingName =
+                                            assistantTurn.pendingToolName
+                                            == ToolDisplayName.pendingToolSentinel
+                                            ? nil : assistantTurn.pendingToolName
+                                        let argumentCharacters = assistantTurn.pendingToolArgSize
+                                        assistantTurn.pendingToolName = nil
+                                        assistantTurn.clearPendingToolArgs()
+                                        self.rebuildVisibleBlocks()
+                                        return .truncatedToolCall(
+                                            toolName: pendingName,
+                                            argumentCharacters: argumentCharacters
+                                        )
+                                    }
                                     return AgentLoopModelStep.classifyTerminal(
                                         contentIsBlank: assistantTurn.contentIsBlank,
                                         thinkingIsBlank: assistantTurn.thinkingIsBlank,
@@ -5696,6 +5942,19 @@ final class ChatSession: ObservableObject {
                                 }
                                 hasStructuredToolWorkThisRun = true
                                 return .toolCalls(invocations)
+                            } catch let oversized as OversizedStreamingToolCall {
+                                print(
+                                    "[Osaurus] Oversized streamed tool call "
+                                        + "tool=\(oversized.toolName ?? "unknown") "
+                                        + "chars=\(oversized.argumentCharacters); retrying with chunking notice"
+                                )
+                                assistantTurn.pendingToolName = nil
+                                assistantTurn.clearPendingToolArgs()
+                                self.rebuildVisibleBlocks()
+                                return .oversizedToolCall(
+                                    toolName: oversized.toolName,
+                                    argumentCharacters: oversized.argumentCharacters
+                                )
                             } catch let error as RemoteProviderServiceError {
                                 // Transient provider-side stream errors — most commonly
                                 // mid-tool-args truncation flagged by
@@ -5897,28 +6156,12 @@ final class ChatSession: ObservableObject {
                     let runResult = try await AgentToolLoop.run(
                         policy: AgentLoopPolicy(
                             maxIterations: maxAttempts,
+                            budgetWarningThreshold: 0,
                             stopOnToolRejection: true,
-                            dedupeNoticeEnabled: true,
+                            dedupeNoticeEnabled: false,
+                            todoStalenessThreshold: .max,
                             maxDataMovementSteps: min(16, maxAttempts),
-                            // Only the locally proven Gemma/Qwen-family rows
-                            // receive the third-action Todo precondition.
-                            // Bundle model_type is authoritative, so renamed
-                            // Ornith/Bonsai bundles do not depend on display
-                            // names. Remote and unrelated local families keep
-                            // their existing behavior.
-                            todoRequiredBeforeToolCallCount:
-                                AgentToolLoop.chatTodoPreconditionThreshold(
-                                    hasTodoTool: toolSpecs.contains {
-                                        $0.function.name == "todo"
-                                    },
-                                    // Catalog lookup remains authoritative
-                                    // even while picker rows are refreshing.
-                                    // It also covers externally registered
-                                    // bundles reconstructed from the persisted
-                                    // id -> path registry.
-                                    isLocalModel: selectedModelIsLocal,
-                                    modelType: selectedPickerItem?.modelType
-                                )
+                            todoRequiredBeforeToolCallCount: 0
                         ),
                         state: taskState,
                         hooks: loopHooks
@@ -5992,6 +6235,7 @@ final class ChatSession: ObservableObject {
                             rebuildVisibleBlocks()
                         } else {
                             do {
+
                             var finalReq = ChatCompletionRequest(
                                 model: selectedModel ?? "default",
                                 // Same watermark-trimmed view of history the
@@ -6053,6 +6297,87 @@ final class ChatSession: ObservableObject {
                                 if !delta.isEmpty { processor.receiveDelta(delta) }
                             }
                             await processor.finalize()
+
+                                let trimmedFinalMessages =
+                                    AgentLoopBudget.trimPreservingSystemPrefix(
+                                        buildMessages(),
+                                        with: loopBudgetManager,
+                                        watermark: compactionWatermark
+                                    )
+                                // The final request intentionally has no tool
+                                // schema. Make that boundary visible to the
+                                // model as transient tool-role feedback (when
+                                // the transcript ends in a tool result), so it
+                                // reports unfinished work instead of imitating
+                                // a tool/result envelope. Appending after trim
+                                // preserves the same stable-prefix contract as
+                                // ordinary loop notices.
+                                let finalMessages =
+                                    AgentLoopBudget.appendingTransientNotices(
+                                        [AgentToolLoop.iterationCapWrapUpNotice],
+                                        to: trimmedFinalMessages
+                                    )
+                                var finalReq = ChatCompletionRequest(
+                                    model: selectedModel ?? "default",
+                                    // Same watermark-trimmed view of history the
+                                    // loop iterations used — the raw array can
+                                    // exceed the window precisely when the cap
+                                    // hits after heavy tool traffic.
+                                    messages: finalMessages,
+                                    temperature: effectiveTemp,
+                                    max_tokens: effectiveMaxTokensForAgent,
+                                    stream: true,
+                                    top_p: chatCfg.topPOverride,
+                                    frequency_penalty: nil,
+                                    presence_penalty: nil,
+                                    stop: nil,
+                                    n: nil,
+                                    tools: nil,
+                                    tool_choice: nil,
+                                    session_id: sessionId?.uuidString
+                                )
+                                finalReq.samplingParametersAreImplicit = true
+                                finalReq.runAsRemoteAgent = isRemoteAgentTarget
+                                finalReq.cacheStableSystemPrefix =
+                                    isRemoteAgentTarget ? nil : context.staticPrefix
+                                // Carry the agent provider id on this path too so
+                                // the route-by-provider invariant holds for *every*
+                                // Mode 2 request — a `runAsRemoteAgent` send with no
+                                // provider id would fall back to model-string
+                                // routing (the exact mis-route this fix removes).
+                                finalReq.remoteAgentProviderId =
+                                    isRemoteAgentTarget
+                                    ? windowState?.selectedDiscoveredAgentProviderId : nil
+                                finalReq.remoteAgentLogModel =
+                                    isRemoteAgentTarget
+                                    ? windowState?.pinnedRemoteAgentEffectiveModel : nil
+                                finalReq.isAgentRequest = !toolSpecs.isEmpty || isRemoteAgentTarget
+                                turnGenerationControls.apply(to: &finalReq)
+                                finalReq.backgroundModelLoad = (loadIntent == .background)
+                                finalReq.turnId = assistantTurn.id
+                                // Distinct logical step (the post-cap summarizing
+                                // call) so it bills once and dedupes on its own
+                                // connect-phase retry without colliding with the
+                                // loop's per-iteration keys.
+                                finalReq.idempotencyKey = "\(runId.uuidString):final"
+
+                                // Route the capped-run wrap-up through the exact
+                                // same typed sentinel decoder as every ordinary
+                                // chat step. Feeding this stream directly into a
+                                // StreamingDeltaProcessor leaked U+FFFE prefill and
+                                // stats envelopes into ChatTurn.content (and then
+                                // transcript exports) whenever the agent reached
+                                // its iteration cap.
+                                let (_, finalTurn) = try await processStreamDeltas(
+                                    stream: try await engine.streamChat(request: finalReq),
+                                    assistantTurn: assistantTurn,
+                                    runId: runId,
+                                    streamStartTime: Date(),
+                                    ttftTrace: ttftTrace,
+                                    selectedModel: self.selectedModel
+                                )
+                                assistantTurn = finalTurn
+
                             } catch {
                                 let message =
                                     "The agent reached the configured step limit, and its final wrap-up failed: "
@@ -6134,8 +6459,10 @@ final class ChatSession: ObservableObject {
                     noteInsufficientFundsIfNeeded(error: error, blockedTurn: assistantTurn)
                 }
             }  // ChatExecutionContext.$currentEnableThinking.withValue
+            }  // ChatExecutionContext.$currentModelName.withValue
             }  // ChatExecutionContext.$currentUserRequest.withValue
             }  // ChatExecutionContext.$currentAgentId.withValue
+            }  // ChatExecutionContext.$currentSessionSource.withValue
             }  // ChatExecutionContext.$currentFolderRoot.withValue
         }
     }
@@ -6447,6 +6774,46 @@ struct ChatView: View {
                 // security badge (it morphs "Securing connection…" -> lock),
                 // so there's no separate connecting chip above the composer.
                 EmptyView()
+            }
+        }
+    }
+
+    /// Run-liveness chip shown above the composer while a run has produced no
+    /// stream/tool/image progress for a while. `slow` reassures ("still
+    /// working"); `stalled` names the likely wedge and points at Stop — the
+    /// recovery action — without auto-killing a run that may legitimately be
+    /// deep in a long model load or tool call.
+    @ViewBuilder
+    private var runProgressNotice: some View {
+        if observedSession.isStreaming {
+            switch observedSession.runProgressState {
+            case .active:
+                EmptyView()
+            case .slow:
+                remoteAgentNoticeRow(tint: theme.accentColor) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(L("Still working — waiting on the model or a tool…"))
+                        .font(theme.font(size: CGFloat(theme.captionSize), weight: .medium))
+                        .foregroundColor(theme.primaryText)
+                }
+            case .stalled:
+                remoteAgentNoticeRow(tint: theme.warningColor) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: CGFloat(theme.captionSize), weight: .semibold))
+                        .foregroundColor(theme.warningColor)
+                    Text(L("No response for a while — this run may be stuck."))
+                        .font(theme.font(size: CGFloat(theme.captionSize), weight: .medium))
+                        .foregroundColor(theme.primaryText)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(action: { observedSession.stop() }) {
+                        Text(L("Stop"))
+                            .font(theme.font(size: CGFloat(theme.captionSize), weight: .semibold))
+                            .foregroundColor(theme.warningColor)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
     }
@@ -6790,6 +7157,17 @@ struct ChatView: View {
                                 .frame(maxWidth: .infinity)
                                 .animation(theme.springAnimation(), value: windowState.remoteAgentConnectionPhase)
 
+                            // Run-liveness notice (slow / stalled) so a run
+                            // with no visible progress reads as a knowable
+                            // state with a recovery action, not a hang.
+                            runProgressNotice
+                                .frame(maxWidth: 1100)
+                                .frame(maxWidth: .infinity)
+                                .animation(
+                                    theme.springAnimation(),
+                                    value: observedSession.runProgressState
+                                )
+
                             // Floating input card. Dimmed and
                             // hit-test-disabled while a prompt overlay
                             // is mounted so the prompt's embedded
@@ -7081,6 +7459,8 @@ struct ChatView: View {
                         AppDelegate.shared?.showManagementWindow(initialTab: .knowledge)
                     case .openBrowserSettings:
                         AppDelegate.shared?.showManagementWindow(initialTab: .browser)
+                    case .openChannelsSettings:
+                        AppDelegate.shared?.showManagementWindow(initialTab: .agentChannels)
                     case .openSubagentSettings:
                         // Land on the first custom (non-built-in) agent's
                         // Subagents tab (per-agent spawn / image config). With
@@ -8104,6 +8484,17 @@ extension ChatView {
         let windowState = self.windowState
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak session, weak windowState] event in
+            // Cmd+C copies an active cross-block selection (a drag spanning
+            // multiple message blocks, see ChatCrossSelection). Individual
+            // NSTextViews only know their own slice, so the controller owns
+            // the concatenated copy.
+            if event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
+                event.charactersIgnoringModifiers?.lowercased() == "c",
+                ChatCrossSelection.shared.copyIfActive(window: event.window)
+            {
+                return nil
+            }
+
             // Cmd+F opens the in-conversation find bar.
             if event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
                 event.charactersIgnoringModifiers?.lowercased() == "f"

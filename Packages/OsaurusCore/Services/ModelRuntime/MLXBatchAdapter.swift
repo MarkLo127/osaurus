@@ -44,6 +44,20 @@ struct MLXBatchAdapter {
         await Registry.shared.snapshotDiagnostics()
     }
 
+    /// Exact per-model engine capacity for subagent scheduling diagnostics.
+    /// The returned values come from one vMLX actor turn; callers must not
+    /// treat `nominalAvailableCount` as a reservation because another request
+    /// may submit immediately after this observation.
+    static func capacitySnapshot(
+        for modelName: String,
+        reconcilingTo configuredMaximum: Int? = nil
+    ) async -> ModelBatchCapacitySnapshot? {
+        await Registry.shared.capacitySnapshot(
+            for: modelName,
+            reconcilingTo: configuredMaximum
+        )
+    }
+
     /// Exact live cache-class transitions keyed by the model name used to
     /// create each BatchEngine. Unlike the aggregate compression counter,
     /// these snapshots prove how many layers converted and which mixed-cache
@@ -345,6 +359,13 @@ struct MLXBatchAdapter {
         private let coalescer = TaskCoalescer<BatchEngine>()
         private var nativeMTPWarmModels: Set<String> = []
         private var lastEffectiveGenerationSettings: [String: EffectiveGenerationSettings] = [:]
+        /// Counters from engines and cache coordinators that have left the
+        /// live resident set. Before this accumulator, switching model A to B
+        /// made process-level diagnostics decrease because A simply vanished
+        /// from the aggregate. Eval and `spawn_batch` before/after subtraction
+        /// then emitted impossible negative cache deltas.
+        private var processLifetimeCounters = ProcessLifetimeBatchCounters()
+        private var hasRetiredDiagnostics = false
 
         /// Returns the cached engine for `modelName`, creating it on first
         /// use from the supplied `ModelContainer`. The container's existing
@@ -398,8 +419,11 @@ struct MLXBatchAdapter {
                     batchAdapterLog.notice(
                         "registry: cached BatchEngine for \(modelName, privacy: .public) is shut down; evicting and rebuilding at maxBatchSize=\(maxBatchSize, privacy: .public)"
                     )
-                    await coalescer.remove(modelName) { engine in
+                    let removed = await coalescer.remove(modelName) { engine in
                         await engine.shutdown()
+                    }
+                    if let removed {
+                        await recordRetiredEngineCounters(removed)
                     }
                     // Rebuild via the same path. The new engine is
                     // constructed with `maxBatchSize` directly, so the
@@ -472,17 +496,81 @@ struct MLXBatchAdapter {
             return result
         }
 
+        /// Read one resolved engine's atomic capacity state. Registry keys are
+        /// canonical installed-model names; matching is case-insensitive only
+        /// to tolerate filesystem/product-name casing, never by a potentially
+        /// ambiguous repository tail.
+        func capacitySnapshot(
+            for requestedModelName: String,
+            reconcilingTo requestedMaximum: Int? = nil
+        ) async -> ModelBatchCapacitySnapshot? {
+            let entries = await coalescer.resolvedEntries()
+            guard
+                let entry = entries.first(where: {
+                    $0.0.caseInsensitiveCompare(requestedModelName) == .orderedSame
+                })
+            else {
+                return nil
+            }
+            if let requestedMaximum {
+                let current = await entry.1.maxBatchSize
+                if current != requestedMaximum {
+                    do {
+                        try await entry.1.updateMaxBatchSize(requestedMaximum)
+                    } catch BatchEngineConfigurationError.engineShutdown {
+                        let removed = await coalescer.remove(entry.0) { engine in
+                            await engine.shutdown()
+                        }
+                        if let removed {
+                            await recordRetiredEngineCounters(removed)
+                        }
+                        return nil
+                    } catch {
+                        let detail =
+                            "capacity reconcile: \(entry.0) could not apply "
+                            + "maxBatchSize=\(requestedMaximum): \(String(describing: error))"
+                        batchAdapterLog.error("\(detail, privacy: .public)")
+                    }
+                }
+            }
+            let snapshot = await entry.1.capacitySnapshot
+            if snapshot.isShutdown {
+                let removed = await coalescer.remove(entry.0) { engine in
+                    await engine.shutdown()
+                }
+                if let removed {
+                    await recordRetiredEngineCounters(removed)
+                }
+                return nil
+            }
+            return ModelBatchCapacitySnapshot(
+                modelName: entry.0,
+                configuredMaximum: snapshot.configuredMaximum,
+                activeCount: snapshot.activeCount,
+                pendingCount: snapshot.pendingCount,
+                nominalAvailableCount: snapshot.nominalAvailableCount,
+                activeHighWatermark: snapshot.activeCountHighWatermark,
+                isAcceptingRequests: snapshot.isAcceptingRequests,
+                isShutdown: snapshot.isShutdown
+            )
+        }
+
         /// Aggregate live BatchEngine diagnostics across every resolved
-        /// engine in the registry. Used by the Server → Settings panel
-        /// to render the "Live Diagnostics" subsection. Returns `nil`
-        /// when no engine has been created yet.
+        /// engine in the registry, folding monotonic counters from retired
+        /// engines/model residencies forward for the rest of this process.
+        /// Occupancy, capacity, and loaded-model topology remain live-only.
+        /// Used by the Server → Settings panel, APIs, delegation diagnostics,
+        /// and eval harness. Returns `nil` only before any engine has existed.
         func snapshotDiagnostics() async -> BatchDiagnosticsSnapshot? {
-            let engines = await coalescer.resolvedValues()
-            guard !engines.isEmpty else { return nil }
+            let entries = await coalescer.resolvedEntries()
+            guard !entries.isEmpty || hasRetiredDiagnostics else { return nil }
 
             var pending = 0
             var active = 0
             var highWatermark = 0
+            var configuredCapacity = 0
+            var nominalAvailableCapacity = 0
+            var capacityRows: [String] = []
             var decodeSplit = 0
             var turbo = 0
             var accepting = true
@@ -522,21 +610,30 @@ struct MLXBatchAdapter {
                 ssmMisses += stats.ssmStats.misses
                 ssmReDerives += stats.ssmStats.reDerives
             }
-            for engine in engines {
-                pending += await engine.pendingCount
-                active += await engine.activeCount
-                let watermark = await engine.activeCountHighWatermarkForDiagnostics
-                highWatermark = max(highWatermark, watermark)
+            for (modelName, engine) in entries {
+                let capacity = await engine.capacitySnapshot
+                pending += capacity.pendingCount
+                active += capacity.activeCount
+                highWatermark = max(
+                    highWatermark,
+                    capacity.activeCountHighWatermark
+                )
+                configuredCapacity += capacity.configuredMaximum
+                nominalAvailableCapacity += capacity.nominalAvailableCount
+                capacityRows.append("\(modelName): \(capacity.configuredMaximum)")
                 decodeSplit += await engine.decodeCompatibilitySplitCountForDiagnostics
                 turbo += await engine.turboQuantCompressionCountForDiagnostics
-                if !(await engine.isAcceptingRequests) {
+                if !capacity.isAcceptingRequests {
                     accepting = false
                 }
             }
-            return BatchDiagnosticsSnapshot(
+            let live = BatchDiagnosticsSnapshot(
                 pendingCount: pending,
                 activeCount: active,
                 activeHighWatermark: highWatermark,
+                configuredEngineCapacity: configuredCapacity,
+                nominalAvailableCapacity: nominalAvailableCapacity,
+                engineCapacitySummary: capacityRows.sorted().joined(separator: ", "),
                 decodeSplitCount: decodeSplit,
                 turboQuantCompressions: turbo,
                 isAcceptingRequests: accepting,
@@ -556,6 +653,29 @@ struct MLXBatchAdapter {
                 ssmCompanionMisses: ssmMisses,
                 ssmCompanionReDerives: ssmReDerives
             )
+            return processLifetimeCounters.mergingCounters(into: live)
+        }
+
+        /// Fold one container's final cache-coordinator counters into the
+        /// process lifetime after `ModelRuntime` has removed that holder from
+        /// its live dictionary. The call ordering prevents a transient double
+        /// count: until removal the counters are in the live summary; after
+        /// removal they are represented here.
+        func recordRetiredCacheCounters(_ counters: ProcessLifetimeBatchCounters) {
+            processLifetimeCounters.absorb(counters)
+            hasRetiredDiagnostics = true
+        }
+
+        private func recordRetiredEngineCounters(_ engine: BatchEngine) async {
+            let capacity = await engine.capacitySnapshot
+            let counters = ProcessLifetimeBatchCounters(
+                activeHighWatermark: capacity.activeCountHighWatermark,
+                decodeSplitCount: await engine.decodeCompatibilitySplitCountForDiagnostics,
+                turboQuantCompressions:
+                    await engine.turboQuantCompressionCountForDiagnostics
+            )
+            processLifetimeCounters.absorb(counters)
+            hasRetiredDiagnostics = true
         }
 
         /// Shut down and remove the engine for `modelName`. Safe to call
@@ -571,11 +691,14 @@ struct MLXBatchAdapter {
         /// exists to prevent).
         func shutdownEngine(for modelName: String) async {
             nativeMTPWarmModels.remove(modelName)
-            await coalescer.remove(modelName) { engine in
+            let removed = await coalescer.remove(modelName) { engine in
                 await engine.shutdown()
                 batchAdapterLog.info(
                     "registry: shutdown BatchEngine for \(modelName, privacy: .public)"
                 )
+            }
+            if let removed {
+                await recordRetiredEngineCounters(removed)
             }
         }
 
@@ -586,11 +709,14 @@ struct MLXBatchAdapter {
         /// `shutdownEngine(for:)`, applied to every cached entry.
         func shutdownAll() async {
             nativeMTPWarmModels.removeAll()
-            await coalescer.removeAll { modelName, engine in
+            let removed = await coalescer.removeAll { modelName, engine in
                 await engine.shutdown()
                 batchAdapterLog.info(
                     "registry: shutdown BatchEngine for \(modelName, privacy: .public)"
                 )
+            }
+            for (_, engine) in removed {
+                await recordRetiredEngineCounters(engine)
             }
         }
 
@@ -1183,10 +1309,18 @@ struct MLXBatchAdapter {
         let prepChat = PrepChatBox(buildRawPrompt == nil ? buildChat() : [])
         let prepIsExclusive = prepChat.hasMedia
         let prepared: PreparedInput
-        if prepIsExclusive {
-            await MetalGate.shared.enterMediaPrep(model: modelName)
-        } else {
-            await MetalGate.shared.enterGeneration(model: modelName)
+        do {
+            // Cancellation-aware: a Stop while another producer holds the GPU
+            // throws here instead of parking this request behind the gate. No
+            // gate is held on the throw path, so only the solo lease unwinds.
+            if prepIsExclusive {
+                try await MetalGate.shared.enterMediaPrep(model: modelName)
+            } else {
+                try await MetalGate.shared.enterGeneration(model: modelName)
+            }
+        } catch {
+            if let soloLease { await soloLease.release() }
+            throw error
         }
         func exitPrepGate() async {
             if prepIsExclusive {
@@ -1384,7 +1518,16 @@ struct MLXBatchAdapter {
         // keep batching; only embedding is exclusive. Released by the producer
         // task once the upstream stream has fully drained, which (per the note
         // above) is AFTER vmlx's post-`.info` cache-store eval.
-        await MetalGate.shared.enterGeneration(model: modelName)
+        //
+        // Cancellation-aware: a Stop while a foreign producer holds the GPU
+        // throws instead of parking this request. No gate is held on the
+        // throw path — only the solo lease needs unwinding.
+        do {
+            try await MetalGate.shared.enterGeneration(model: modelName)
+        } catch {
+            if let soloLease { await soloLease.release() }
+            throw error
+        }
         let upstream = await engine.generate(
             input: prepared.input,
             parameters: mlxParams
@@ -1563,6 +1706,7 @@ struct MLXBatchAdapter {
             cacheScopeSalt: scopeSalt,
             cachePrefixTokenCounts: cacheBoundaries.all,
             cacheStablePrefixTokenCounts: cacheBoundaries.stable,
+            cachePromptIntent: .reusablePrefixWarmup,
             toolSchemas: toolsSpec
         )
     }
@@ -1685,6 +1829,7 @@ struct MLXBatchAdapter {
             tokenIds: prefix,
             cacheScopeSalt: input.cacheScopeSalt,
             cachePrefixTokenCounts: [],
+            cachePromptIntent: .reusablePrefixWarmup,
             toolSchemas: input.toolSchemas
         )
     }
@@ -1893,6 +2038,10 @@ struct MLXBatchAdapter {
                 }
                 box.processorDoneAt = CFAbsoluteTimeGetCurrent()
                 trace?.mark("batch_tokenization_done")
+            }
+
+            if toolChoiceRequiresLocalCall(toolChoice) {
+                lmInput = lmInput.withCacheRestorePolicy(.freshRequiredToolSelection)
             }
 
             let tokens =

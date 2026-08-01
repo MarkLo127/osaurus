@@ -295,7 +295,10 @@ final class ModelManager: NSObject, ObservableObject {
         // stays main-actor isolated so `self` never crosses actor boundaries.
         Task { [weak self] in
             let localModels = await Self.discoverLocalModelsOffMain()
-            self?.mergeAvailable(with: localModels)
+            self?.mergeAvailable(
+                with: localModels,
+                refreshLocalInstallationMetadata: true
+            )
         }
 
         isLoadingModels = false
@@ -339,7 +342,10 @@ final class ModelManager: NSObject, ObservableObject {
             }.value
             guard let self else { return }
             self.downloadService.syncStates(for: models)
-            self.mergeAvailable(with: localModels)
+            self.mergeAvailable(
+                with: localModels,
+                refreshLocalInstallationMetadata: true
+            )
             self.checkForDeprecatedModels()
         }
     }
@@ -1401,25 +1407,30 @@ extension ModelManager {
     private static nonisolated(unsafe) var matchMemoLocalGen: UInt64 = .max
     private static nonisolated(unsafe) var matchMemoExternalGen: UInt64 = .max
 
-    private nonisolated static func matchInstalledMLXModel(
+    nonisolated static func matchInstalledMLXModel(
         named name: String,
         in models: [MLXModel]
     ) -> MLXModel? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let key = trimmed.lowercased()
 
-        // Try repo component first
-        if let match = models.first(where: { m in
-            m.id.split(separator: "/").last.map(String.init)?.lowercased() == trimmed.lowercased()
-        }) {
+        // A full installed id is the stable identity and must win even when a
+        // different organization has a bundle with the same final component.
+        if let match = models.first(where: { $0.id.lowercased() == key }) {
             return match
         }
 
-        // Try full id match
-        if let match = models.first(where: { m in m.id.lowercased() == trimmed.lowercased() }) {
-            return match
+        // Short bundle aliases remain convenient only when they identify one
+        // stable installed id. Silently choosing the first of two
+        // `Org-A/Shared` / `Org-B/Shared` bundles can load or batch the wrong
+        // model, so ambiguous aliases fail resolution instead.
+        let shortMatches = models.filter { model in
+            model.id.split(separator: "/").last.map(String.init)?.lowercased() == key
         }
-        return nil
+        let stableIds = Set(shortMatches.map { $0.id.lowercased() })
+        guard stableIds.count == 1 else { return nil }
+        return shortMatches.first
     }
 
     /// Find an installed model by user-provided name, returning the canonical
@@ -1543,7 +1554,10 @@ extension ModelManager {
         return nil
     }
 
-    fileprivate func mergeAvailable(with newModels: [MLXModel]) {
+    fileprivate func mergeAvailable(
+        with newModels: [MLXModel],
+        refreshLocalInstallationMetadata: Bool = false
+    ) {
         // Repo tail (everything after the last "/") is the basename a user actually
         // recognises; when two ids share a tail, treat them as the same model — this
         // collapses cases like flat-layout `Nemotron-3-...` colliding with curated
@@ -1562,10 +1576,38 @@ extension ModelManager {
 
         var appended: [MLXModel] = []
         var replacements: [(oldId: String, new: MLXModel)] = []
+        var refreshedExactMatch = false
 
         for m in newModels {
             let key = m.id.lowercased()
-            if existingLower.contains(key) { continue }
+            if existingLower.contains(key) {
+                // An exact local/curated id collision used to discard the
+                // local entry wholesale, including its authoritative bundle
+                // size. Refresh only installation metadata so editorial
+                // catalog fields still win. Only background local discovery
+                // may take this path; registry and Hub merges must never be
+                // mistaken for installed metadata just because a future
+                // response also carries a byte estimate.
+                if refreshLocalInstallationMetadata {
+                    if let idx = availableModels.firstIndex(where: {
+                        $0.id.caseInsensitiveCompare(m.id) == .orderedSame
+                    }) {
+                        let merged = availableModels[idx]
+                            .mergingLocalInstallationMetadata(from: m)
+                        availableModels[idx] = merged
+                        refreshedExactMatch = true
+                    }
+                    if let idx = suggestedModels.firstIndex(where: {
+                        $0.id.caseInsensitiveCompare(m.id) == .orderedSame
+                    }) {
+                        let merged = suggestedModels[idx]
+                            .mergingLocalInstallationMetadata(from: m)
+                        suggestedModels[idx] = merged
+                        refreshedExactMatch = true
+                    }
+                }
+                continue
+            }
 
             let mTail = tail(m.id)
             if let existing = existingTails[mTail], existing.id.lowercased() != key {
@@ -1600,7 +1642,7 @@ extension ModelManager {
             }
         }
 
-        guard !appended.isEmpty || !replacements.isEmpty else { return }
+        guard !appended.isEmpty || !replacements.isEmpty || refreshedExactMatch else { return }
         availableModels.append(contentsOf: appended)
         downloadService.syncStates(for: appended + replacements.map { $0.new })
     }
@@ -1611,6 +1653,9 @@ extension ModelManager {
 extension ModelManager {
     /// HF org whose entire repo listing is auto-discovered into the Recommended tab.
     fileprivate static let osaurusOrgAuthor = "OsaurusAI"
+    /// Keep this above the org's current repository count so low-download and
+    /// newly published models are not truncated from the downloads-sorted API.
+    fileprivate static let osaurusOrgFetchLimit = 200
 
     /// True if `id` is `"<osaurusOrgAuthor>/<repo>"` (case-insensitive).
     fileprivate static func isOsaurusOrgRepo(_ id: String) -> Bool {
@@ -1647,7 +1692,7 @@ extension ModelManager {
             let url = Self.makeHFModelsURL(
                 author: Self.osaurusOrgAuthor,
                 search: "",
-                limit: 100
+                limit: Self.osaurusOrgFetchLimit
             )
         else { return }
 
@@ -1931,6 +1976,16 @@ extension ModelManager {
             localModelsCacheGen &+= 1
             localModelsCacheCondition.broadcast()
             localModelsCacheCondition.unlock()
+
+            // Warm the per-model capability caches while still on the scan
+            // queue. Both are lazily computed from on-disk config files, and a
+            // cold lookup otherwise happens on the main thread the first time
+            // a model is clicked or rendered (chat-template read, config.json
+            // vision probe) — an observed hang under disk pressure.
+            for model in scanned {
+                _ = LocalReasoningCapability.capability(forModelId: model.id)
+                _ = VLMDetection.isVLM(modelId: model.id)
+            }
         }
     }
 
@@ -2149,6 +2204,7 @@ extension ModelManager {
                         name: ModelMetadataParser.friendlyName(from: id),
                         description: L("Local model (detected)"),
                         downloadURL: "https://huggingface.co/\(id)",
+                        downloadSizeBytes: MLXModel.localBundleWeightSizeBytes(at: resolved),
                         // The scan already runs off-main. Preserve the bundle's
                         // architecture tag here so hot UI paths can distinguish
                         // image-only from video-capable local VLMs without

@@ -213,8 +213,15 @@ struct FloatingInputCard: View {
 
     // Observe managers for reactive updates
     @ObservedObject private var agentManager = AgentManager.shared
-    @ObservedObject private var sandboxState = SandboxManager.State.shared
-    @ObservedObject private var clipboardService = ClipboardService.shared
+    // Deliberately NOT `@ObservedObject`: sandbox provisioning publishes
+    // per-progress-tick during runtime downloads and the clipboard service
+    // publishes on every copy, and an observing card re-ran its whole body
+    // each time. Every body-position read of these two lives inside the
+    // selector-row block, which `ChipObservationScope` wraps with its own
+    // observation — the closure re-reads this live singleton state when the
+    // scope re-renders. Everything else here calls them imperatively.
+    private let sandboxState = SandboxManager.State.shared
+    private let clipboardService = ClipboardService.shared
     @ObservedObject private var appConfig = AppConfiguration.shared
     /// Drives the composer credits chip (balance + low-balance tinting) and the
     /// wallet panel's recent-activity list.
@@ -331,8 +338,28 @@ struct FloatingInputCard: View {
         return !query.isEmpty && !query.hasSuffix("/")
     }
 
-    // Local state for text input to prevent parent re-renders on every keystroke
-    @State private var localText: String = ""
+    // The typed text lives in a reference-type model so keystrokes never
+    // invalidate the card: `@State` tracks only the reference (never
+    // replaced), and mutations publish through the model, re-rendering just
+    // the regions that observe it (`ComposerTextObservationScope` around the
+    // popups + input card, and `ChipObservationScope` for the live token
+    // count). Everything else reads the text imperatively via `localText`.
+    @State private var composerText = ComposerTextModel()
+
+    /// Compatibility accessor over `composerText` so the many existing
+    /// read/write sites keep their exact shape. Writes route through the
+    /// model — they never touch card state.
+    private var localText: String {
+        get { composerText.text }
+        nonmutating set { composerText.text = newValue }
+    }
+
+    /// Binding for `EditableTextView`, scoped to the model so per-keystroke
+    /// writes bypass the card's state storage entirely.
+    private var localTextBinding: Binding<String> {
+        let model = composerText
+        return Binding(get: { model.text }, set: { model.text = $0 })
+    }
     @State private var isFocused: Bool = false
     @State private var isComposing: Bool = false
     /// Keeps focus in the input through the send/queue state cascade.
@@ -344,29 +371,6 @@ struct FloatingInputCard: View {
     @State private var isDragOver = false
     @State private var showModelPicker = false
     @State private var showImageSizePicker = false
-    @State private var showContextBreakdown = false
-    /// True when the context panel was opened by click. Hover previews dismiss
-    /// automatically; pinned panels remain interactive until an outside click
-    /// or a second click on the trigger.
-    @State private var contextPanelPinned = false
-    @State private var contextHoverTask: Task<Void, Never>?
-    /// Delayed dismiss for the context popover. Gives the cursor a grace
-    /// period to travel from the trigger into the popover (which lives in its
-    /// own window, so hovering it doesn't keep the trigger "hovered").
-    @State private var contextDismissTask: Task<Void, Never>?
-    /// Wallet panel presentation. Hovering the credits chip opens it as a
-    /// passive preview (dismissed on hover exit); clicking pins it so its
-    /// actions (Add credits, View all) are reachable.
-    @State private var showWalletPanel = false
-    /// True when the wallet panel was opened by click; hover exit no longer
-    /// dismisses it, only outside-click / an action does.
-    @State private var walletPanelPinned = false
-    @State private var balanceHoverTask: Task<Void, Never>?
-    /// Delayed dismiss for the hover-opened wallet panel. Gives the cursor a
-    /// grace period to travel from the chip into the panel (which lives in its
-    /// own window, so hovering it doesn't keep the chip "hovered"); the panel's
-    /// own hover cancels it so its buttons stay clickable.
-    @State private var walletDismissTask: Task<Void, Never>?
     /// Width available to the toggle-chip region (the space between the model
     /// chip and the meta cluster). Measured cheaply via `onGeometryChange` and
     /// used to decide whether the chips collapse to icon-only — see
@@ -398,8 +402,14 @@ struct FloatingInputCard: View {
     /// changes or the projection escalates to a hard block.
     @State private var ramBannerDismissedForModel: String?
     // MARK: - Voice Input State
-    @ObservedObject private var speechService = SpeechService.shared
-    @ObservedObject private var speechModelManager = SpeechModelManager.shared
+    // Deliberately NOT `@ObservedObject`: `SpeechService.audioLevel` publishes
+    // per audio buffer while recording, and an observing card re-ran its whole
+    // body at that rate. Reactive reads live in the extracted children
+    // (`FloatingVoiceOverlayHost`, `FloatingVoiceButton`,
+    // `VoiceStateSyncObservers`), which observe the services themselves;
+    // everything here only calls the services imperatively.
+    private let speechService = SpeechService.shared
+    private let speechModelManager = SpeechModelManager.shared
     @State private var voiceConfig = SpeechConfiguration.default
 
     // Pause detection state
@@ -674,28 +684,35 @@ struct FloatingInputCard: View {
             // selector row, right-aligned so it stacks directly over the
             // context-token count, rendered as quiet muted text (not a chip)
             // so it reads as passive status rather than a control.
-            if !showVoiceOverlay && (screenContextMayShow || showSelectorRow) {
-                VStack(alignment: .trailing, spacing: 7) {
-                    if screenContextMayShow {
-                        ScreenContextIndicator()
-                    }
-                    if showSelectorRow {
-                        selectorRow
+            if !showVoiceOverlay {
+                // The scope owns the sandbox/clipboard observation, so
+                // provisioning progress ticks and clipboard arrivals re-render
+                // only this row (including its visibility gate) — never the
+                // whole card body. The closure re-reads the live singleton
+                // state on every scope render.
+                ChipObservationScope(textModel: composerText) {
+                    if screenContextMayShow || showSelectorRow {
+                        VStack(alignment: .trailing, spacing: 7) {
+                            if screenContextMayShow {
+                                ScreenContextIndicator()
+                            }
+                            if showSelectorRow {
+                                selectorRow
+                            }
+                        }
+                        .padding(.top, 8)
+                        .padding(.horizontal, 20)
+                        // Ease the row out while connecting and back in once
+                        // connected, so the composer height changes smoothly
+                        // instead of snapping.
+                        .transition(.opacity)
                     }
                 }
-                .padding(.top, 8)
-                .padding(.horizontal, 20)
-                // Ease the row out while connecting and back in once connected,
-                // so the composer height changes smoothly instead of snapping.
-                .transition(.opacity)
             }
 
             if showVoiceOverlay {
-                VoiceInputOverlay(
+                FloatingVoiceOverlayHost(
                     state: $voiceInputState,
-                    audioLevel: speechService.audioLevel,
-                    transcription: speechService.currentTranscription,
-                    confirmedText: speechService.confirmedTranscription,
                     pauseDuration: voiceConfig.pauseDuration,
                     confirmationDelay: voiceConfig.confirmationDelay,
                     silenceDuration: currentSilenceDuration,
@@ -715,6 +732,21 @@ struct FloatingInputCard: View {
                     )
                 )
             } else {
+                // The scope observes the text model, so keystrokes re-render
+                // only this subtree (popups, input area, send gating) — never
+                // the whole card body.
+                ComposerTextObservationScope(model: composerText) {
+                    composerContent
+                }
+            }
+        }
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: showVoiceOverlay)
+        // Smoothly collapse/reveal the selector row (model chip + balance) as
+        // the remote-agent connection resolves, so the composer doesn't snap.
+        .animation(theme.springAnimation(), value: remoteConnectionPending)
+    }
+
+    private var composerContent: some View {
                 VStack(spacing: 4) {
                     // Slash command popup — appears above the input card
                     if showSlashPopup {
@@ -748,12 +780,22 @@ struct FloatingInputCard: View {
                         removal: .opacity.combined(with: .scale(scale: 0.98))
                     )
                 )
-            }
-        }
-        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: showVoiceOverlay)
-        // Smoothly collapse/reveal the selector row (model chip + balance) as
-        // the remote-agent connection resolves, so the composer doesn't snap.
-        .animation(theme.springAnimation(), value: remoteConnectionPending)
+                .onChange(of: composerText.text) { _, _ in
+                    // Reset popup selection whenever the typed query changes.
+                    // Attached here (inside the text observation scope) so the
+                    // change is detected on scope re-renders — the card itself
+                    // no longer re-renders per keystroke.
+                    slashSelectedIndex = 0
+                    atSelectedIndex = 0
+                    // Typing after an Escape-dismissal re-arms the slash popup
+                    if dismissedSlashQuery != nil, activeSlashQuery != dismissedSlashQuery {
+                        dismissedSlashQuery = nil
+                    }
+                    // Re-list the "@" menu off the main actor for the new query.
+                    // (folds in the registry sync so it costs no extra body chain
+                    // link — the whole chain is at the type-checker's limit.)
+                    refreshAtMenu()
+                }
     }
 
     var body: some View {
@@ -785,6 +827,12 @@ struct FloatingInputCard: View {
                 )
             )
             .onAppear {
+                // Execution choices are mutually exclusive in both behavior
+                // and presentation. Clear a restored folder if this agent
+                // already has Sandbox enabled when the chat appears.
+                if isSandboxEnabled {
+                    folderState.clearFolder()
+                }
                 refreshLoadFeasibility()
                 let isReappear = !localText.isEmpty || voiceInputState != .idle
                 localText = text
@@ -819,6 +867,13 @@ struct FloatingInputCard: View {
                     if !showVoiceOverlay {
                         showVoiceOverlay = true
                     }
+                }
+            }
+            .onChange(of: isSandboxEnabled) { _, enabled in
+                // The setting is agent-scoped, so this also clears folders in
+                // other visible chats when Sandbox is enabled elsewhere.
+                if enabled {
+                    folderState.clearFolder()
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .startVoiceInputInChat)) { notification in
@@ -898,19 +953,6 @@ struct FloatingInputCard: View {
                     localText = newValue
                 }
             }
-            .onChange(of: localText) { _, _ in
-                // Reset popup selection whenever the typed query changes
-                slashSelectedIndex = 0
-                atSelectedIndex = 0
-                // Typing after an Escape-dismissal re-arms the slash popup
-                if dismissedSlashQuery != nil, activeSlashQuery != dismissedSlashQuery {
-                    dismissedSlashQuery = nil
-                }
-                // Re-list the "@" menu off the main actor for the new query.
-                // (folds in the registry sync so it costs no extra body chain
-                // link — the whole chain is at the type-checker's limit.)
-                refreshAtMenu()
-            }
             .onChange(of: showSlashPopup) { _, _ in
                 // Keep registry in sync so the global key monitor can suppress
                 // Escape from closing the window while either popup is open.
@@ -923,57 +965,16 @@ struct FloatingInputCard: View {
             .onChange(of: focusTrigger) { _, _ in
                 isFocused = true
             }
-            .onChange(of: speechService.isRecording) { _, isRecording in
-                print(
-                    "[FloatingInputCard] isRecording changed to: \(isRecording). voiceInputState: \(voiceInputState), showVoiceOverlay: \(showVoiceOverlay)"
+            .modifier(
+                VoiceStateSyncObservers(
+                    voiceInputState: $voiceInputState,
+                    showVoiceOverlay: $showVoiceOverlay,
+                    lastVoiceActivityTime: $lastVoiceActivityTime,
+                    lastSpeechTime: $lastSpeechTime,
+                    hasDetectedSpeechThisTurn: $hasDetectedSpeechThisTurn,
+                    resetPauseDetectionForRecording: resetPauseDetectionForRecording
                 )
-                // Sync voice state with service
-                if isRecording {
-                    if voiceInputState == .idle && showVoiceOverlay {
-                        voiceInputState = .recording
-                        lastVoiceActivityTime = Date()
-                        resetPauseDetectionForRecording()
-                        print("[FloatingInputCard] Recording confirmed - voice input ready")
-                    } else if voiceInputState == .idle {
-                        print("[FloatingInputCard] External recording detected. Overlay: \(showVoiceOverlay)")
-                        voiceInputState = .recording
-                        lastVoiceActivityTime = Date()
-                        resetPauseDetectionForRecording()
-                    }
-                } else {
-                    // If service stopped recording (e.g. via Esc key in ChatView), sync local state.
-                    // Preserve `.sending` so the overlay stays up during LLM cleanup.
-                    if voiceInputState != .idle && voiceInputState != .sending {
-                        voiceInputState = .idle
-                        showVoiceOverlay = false
-                    }
-                }
-            }
-            .onChange(of: speechService.isSpeechDetected) { _, detected in
-                if detected && voiceInputState == .recording {
-                    hasDetectedSpeechThisTurn = true
-                    lastSpeechTime = Date()
-                }
-            }
-            .onChange(of: speechService.currentTranscription) { _, newValue in
-                // When new transcription arrives, user is speaking
-                // Only reset silence timer if there is also active audio detection or meaningful level
-                if voiceInputState == .recording && TranscriptionTextNormalizer.hasVisibleText(newValue) {
-                    if speechService.isSpeechDetected || speechService.audioLevel > 0.05 {
-                        hasDetectedSpeechThisTurn = true
-                        lastSpeechTime = Date()
-                    }
-                }
-            }
-            .onChange(of: speechService.confirmedTranscription) { _, newValue in
-                // When confirmed transcription changes, user was speaking
-                if voiceInputState == .recording && TranscriptionTextNormalizer.hasVisibleText(newValue) {
-                    if speechService.isSpeechDetected || speechService.audioLevel > 0.05 {
-                        hasDetectedSpeechThisTurn = true
-                        lastSpeechTime = Date()
-                    }
-                }
-            }
+            )
             .onChange(of: voiceInputState) { _, newState in
                 if newState == .recording {
                     resetPauseDetectionForRecording()
@@ -2449,7 +2450,13 @@ extension FloatingInputCard {
         if showCredits || showTokens {
             HStack(alignment: .center, spacing: 8) {
                 if showCredits {
-                    creditsChip
+                    FloatingCreditsChip(
+                        isRouterBilledSession: isRouterBilledSession,
+                        sessionSpendMicro: sessionSpendMicro,
+                        metaCompact: metaCompact,
+                        metaUltraCompact: metaUltraCompact,
+                        onAddCredits: onAddCredits
+                    )
                 }
                 if showCredits && showTokens {
                     Rectangle()
@@ -2457,377 +2464,20 @@ extension FloatingInputCard {
                         .frame(width: 1, height: 12)
                 }
                 if showTokens {
-                    contextIndicatorChip
-                }
-            }
-        }
-    }
-
-    // MARK: - Credits Indicator
-
-    /// Urgency tiers for the balance indicator. Healthy stays quiet (plain muted
-    /// text that blends into the meta cluster); low and empty escalate to an
-    /// amber pill so a top-up is easy to notice. Empty/frozen reads as an "Add
-    /// credits" call to action — deliberately amber, never error-red, so it
-    /// invites action instead of looking like a failure. The escalation only
-    /// applies to router-billed sessions; see `creditsStyle(for:)`.
-    private enum BalanceLevel {
-        case healthy
-        case low
-        case empty
-    }
-
-    private var balanceLevel: BalanceLevel {
-        let micro = accountService.balanceMicroValue
-        if micro <= 0 || accountService.isFrozen {
-            return .empty
-        }
-        if micro < 1_000_000 {  // < $1.00
-            return .low
-        }
-        return .healthy
-    }
-
-    /// Resolved visual tokens for one `BalanceLevel` so `creditsChip` can render
-    /// declaratively instead of re-deriving each property from the level inline.
-    private struct CreditsChipStyle {
-        let iconName: String
-        let iconColor: Color
-        let textColor: Color
-        let weight: Font.Weight
-        /// Pill fill/stroke; `nil` keeps the chip chrome-free (healthy state).
-        let pill: (fill: Color, stroke: Color)?
-        let glow: Color
-        /// When false, the chip shows the "Add credits" CTA instead of an amount.
-        let showsAmount: Bool
-    }
-
-    private func creditsStyle(for level: BalanceLevel) -> CreditsChipStyle {
-        let amber = theme.warningColor
-        // Outside router-billed sessions the chip never escalates: the balance
-        // doesn't block the current session, so a $0/unknown wallet reads as
-        // quiet muted "Add credits" text instead of an amber call to action.
-        guard isRouterBilledSession else {
-            return CreditsChipStyle(
-                iconName: "creditcard",
-                iconColor: theme.tertiaryText,
-                textColor: theme.secondaryText,
-                weight: .medium,
-                pill: nil,
-                glow: .clear,
-                showsAmount: level != .empty
-            )
-        }
-        switch level {
-        case .healthy:
-            return CreditsChipStyle(
-                iconName: "creditcard",
-                iconColor: theme.tertiaryText,
-                textColor: theme.secondaryText,
-                weight: .medium,
-                pill: nil,
-                glow: .clear,
-                showsAmount: true
-            )
-        case .low:
-            // The chip shows the router balance, so a low balance escalates the
-            // chip itself to amber text (no pill) — a gentle nudge that stops
-            // short of the empty-state "Add credits" call to action.
-            return CreditsChipStyle(
-                iconName: "creditcard",
-                iconColor: amber,
-                textColor: amber,
-                weight: .semibold,
-                pill: nil,
-                glow: .clear,
-                showsAmount: true
-            )
-        case .empty:
-            return CreditsChipStyle(
-                iconName: "plus.circle.fill",
-                iconColor: amber,
-                textColor: amber,
-                weight: .semibold,
-                pill: (amber.opacity(0.22), amber.opacity(0.5)),
-                glow: amber.opacity(0.25),
-                showsAmount: false
-            )
-        }
-    }
-
-    /// This session's Router spend, formatted for the hover popover. The chip
-    /// surfaces the account balance; spend is shown only in the popover.
-    private var sessionSpendDisplay: String {
-        OsaurusRouter.formatMicroUSDPrecise(String(sessionSpendMicro))
-    }
-
-    /// Accessibility text for the credits chip. Describes the router balance the
-    /// chip shows and the tap action; session spend lives in the wallet panel.
-    private var creditsHelpText: Text {
-        if accountService.isFrozen {
-            return Text("Account paused - add credits to resume.", bundle: .module)
-        }
-        return Text("\(accountService.formattedBalance) router balance. Click to open the wallet.", bundle: .module)
-    }
-
-    /// Balance indicator shown in every session where the router is usable.
-    /// Hovering previews the wallet panel; clicking pins it so its actions
-    /// (Add credits → top-up sheet, View all → Credits tab) are reachable.
-    /// Quiet plain text normally, escalating to an amber pill / "Add credits"
-    /// CTA as the balance runs low or hits zero — router-billed sessions only
-    /// (see `BalanceLevel` / `creditsStyle(for:)`).
-    @ViewBuilder
-    private var creditsChip: some View {
-        let level = balanceLevel
-        let style = creditsStyle(for: level)
-        let caption = CGFloat(theme.captionSize)
-        // Hide the icon in compact mode to save width, except the empty-state
-        // plus glyph, which signals the chip is actionable. In the ultra-compact
-        // tier we always keep the icon, since it becomes the whole chip.
-        let showIcon = !metaCompact || level == .empty || metaUltraCompact
-        // At the tightest width the chip is icon-only (glyph carries the state,
-        // hover/tap opens the wallet) so the row's toggle chips aren't clipped.
-        let showLabel = !metaUltraCompact
-
-        Button {
-            // Click pins the wallet panel (rather than jumping straight to the
-            // top-up sheet) so its actions stay reachable; a second click while
-            // pinned closes it.
-            balanceHoverTask?.cancel()
-            walletDismissTask?.cancel()
-            if showWalletPanel && walletPanelPinned {
-                showWalletPanel = false
-                walletPanelPinned = false
-            } else {
-                walletPanelPinned = true
-                showWalletPanel = true
-            }
-        } label: {
-            HStack(spacing: 4) {
-                if showIcon {
-                    Image(systemName: style.iconName)
-                        .font(.system(size: caption - 2))
-                        .foregroundColor(style.iconColor)
-                        .contentTransition(.symbolEffect(.replace))
-                }
-
-                if showLabel {
-                    if style.showsAmount {
-                        // Composer shows the overall router balance; this session's
-                        // spend is surfaced only in the hover popover.
-                        Text(verbatim: accountService.formattedBalance)
-                            .font(.system(size: caption - 1, weight: style.weight, design: .monospaced))
-                            .foregroundColor(style.textColor)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    } else {
-                        Text("Add credits", bundle: .module)
-                            .font(theme.font(size: caption - 1, weight: style.weight))
-                            .foregroundColor(style.textColor)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                }
-            }
-            // Chrome only appears in the low/empty attention states; the healthy
-            // chip stays plain text to match the token indicator's weight.
-            .padding(.horizontal, style.pill == nil ? 0 : 10)
-            .padding(.vertical, style.pill == nil ? 0 : 4)
-            .background {
-                if let pill = style.pill {
-                    Capsule()
-                        .fill(pill.fill)
-                        .overlay(Capsule().strokeBorder(pill.stroke, lineWidth: 1))
-                }
-            }
-            // Soft glow on the empty CTA draws the eye without a repeating animation.
-            .shadow(color: style.glow, radius: 5, x: 0, y: 1)
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .pointingHandCursor()
-        .accessibilityLabel(creditsHelpText)
-        .onHover { hovering in
-            balanceHoverTask?.cancel()
-            if hovering {
-                walletDismissTask?.cancel()
-                balanceHoverTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 300_000_000)
-                    guard !Task.isCancelled else { return }
-                    showWalletPanel = true
-                }
-            } else if !walletPanelPinned {
-                scheduleWalletDismiss()
-            }
-        }
-        .popover(isPresented: $showWalletPanel, arrowEdge: .top) {
-            WalletPopover(
-                sessionSpend: isRouterBilledSession ? sessionSpendDisplay : nil,
-                isAttention: isRouterBilledSession && level != .healthy,
-                onAddCredits: {
-                    closeWalletPanel()
-                    onAddCredits?()
-                },
-                onViewAll: {
-                    closeWalletPanel()
-                    AppDelegate.shared?.showManagementWindow(initialTab: .credits)
-                }
-            )
-            // Keep the panel alive while the cursor is over it, so the user
-            // can travel from the chip and click Add credits / View all.
-            .onHover { hovering in
-                if hovering {
-                    walletDismissTask?.cancel()
-                } else if !walletPanelPinned {
-                    scheduleWalletDismiss()
-                }
-            }
-        }
-        .onChange(of: showWalletPanel) { _, isShown in
-            // Outside-click dismissal flips the binding directly; unpin so the
-            // next hover preview behaves normally.
-            if !isShown { walletPanelPinned = false }
-        }
-    }
-
-    /// Dismiss the hover-opened wallet panel after a grace period, giving the
-    /// cursor time to cross the gap into the panel window.
-    private func scheduleWalletDismiss() {
-        balanceHoverTask?.cancel()
-        walletDismissTask?.cancel()
-        walletDismissTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            guard !Task.isCancelled else { return }
-            showWalletPanel = false
-        }
-    }
-
-    private func closeWalletPanel() {
-        walletDismissTask?.cancel()
-        balanceHoverTask?.cancel()
-        showWalletPanel = false
-        walletPanelPinned = false
-    }
-
-    // MARK: - Context Indicator
-
-    @ViewBuilder
-    private var contextIndicatorChip: some View {
-        let warningColor: Color? =
-            isContextHardOverflow ? .red : (isContextNearLimit ? .orange : nil)
-        let prefix = isStreaming ? "" : "~"
-        let tokenText =
-            if let maxCtx = usableContextTokens {
-                "\(prefix)\(formatTokenCount(displayContextTokens)) / \(formatTokenCount(maxCtx))"
-            } else {
-                "\(prefix)\(formatTokenCount(displayContextTokens))"
-            }
-
-        Button {
-            contextHoverTask?.cancel()
-            contextDismissTask?.cancel()
-            if showContextBreakdown && contextPanelPinned {
-                showContextBreakdown = false
-                contextPanelPinned = false
-            } else {
-                contextPanelPinned = true
-                showContextBreakdown = true
-            }
-        } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                // Budget-state tinting: amber at ≥85% of the window (soft
-                // warning — compaction will engage), red when the
-                // non-compactable prefix alone can't fit (send is gated).
-                if let warningColor {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: CGFloat(theme.captionSize) - 2))
-                        .foregroundColor(warningColor)
-                        .localizedHelp(
-                            isContextHardOverflow
-                                ? "Context is full: the system prompt, tools, and input alone exceed this model's window. Shorten the input, disable tools, or pick a larger-context model."
-                                : "Context is nearly full (≥85% of the model window). Older messages will be compacted; consider starting a fresh chat for best quality."
-                        )
-                }
-
-                Text(tokenText)
-                    .font(.system(size: CGFloat(theme.captionSize) - 1, weight: .medium, design: .monospaced))
-                    .foregroundColor(
-                        warningColor ?? (isStreaming ? theme.secondaryText : theme.tertiaryText)
+                    FloatingContextChip(
+                        displayTokens: displayContextTokens,
+                        usableTokens: usableContextTokens,
+                        modelMaxTokens: maxContextTokens,
+                        windowResolution: contextWindowResolution,
+                        isStreaming: isStreaming,
+                        isNearLimit: isContextNearLimit,
+                        isHardOverflow: isContextHardOverflow,
+                        metaCompact: metaCompact,
+                        formatTokenCount: formatTokenCount,
+                        breakdown: { displayContextBreakdown }
                     )
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-
-                if !metaCompact {
-                    Text("tokens", bundle: .module)
-                        .font(theme.font(size: CGFloat(theme.captionSize) - 1, weight: .regular))
-                        .foregroundColor(theme.tertiaryText.opacity(0.7))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
                 }
             }
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .pointingHandCursor()
-        .accessibilityLabel(
-            Text("Context budget: \(tokenText) tokens", bundle: .module)
-        )
-        .onHover { hovering in
-            if hovering {
-                openContextBreakdown()
-            } else if !contextPanelPinned {
-                scheduleContextDismiss()
-            }
-        }
-        .popover(isPresented: $showContextBreakdown, arrowEdge: .top) {
-            ContextBreakdownPopover(
-                breakdown: displayContextBreakdown,
-                maxTokens: usableContextTokens,
-                modelMaxTokens: maxContextTokens,
-                modelLimitSource: contextWindowResolution?.source,
-                isStreaming: isStreaming,
-                isNearLimit: isContextNearLimit,
-                isHardOverflow: isContextHardOverflow,
-                formatTokenCount: formatTokenCount
-            )
-            // Keep the popover alive while the cursor is over it, so the user
-            // can travel from the trigger and click the disclosure headers.
-            .onPopoverHover { hovering in
-                if hovering {
-                    contextDismissTask?.cancel()
-                } else if !contextPanelPinned {
-                    scheduleContextDismiss()
-                }
-            }
-        }
-        .onChange(of: showContextBreakdown) { _, isShown in
-            // Outside-click dismissal flips the binding directly. Clear the
-            // pinned state so the next hover behaves as a passive preview.
-            if !isShown { contextPanelPinned = false }
-        }
-    }
-
-    /// Open the context popover after a short hover dwell, cancelling any
-    /// pending dismiss so a quick re-entry doesn't flicker it closed.
-    private func openContextBreakdown() {
-        contextDismissTask?.cancel()
-        contextHoverTask?.cancel()
-        contextHoverTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            guard !Task.isCancelled else { return }
-            showContextBreakdown = true
-        }
-    }
-
-    /// Dismiss the context popover after a grace period, giving the cursor
-    /// time to cross the gap into the popover window.
-    private func scheduleContextDismiss() {
-        contextHoverTask?.cancel()
-        contextDismissTask?.cancel()
-        contextDismissTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            guard !Task.isCancelled else { return }
-            showContextBreakdown = false
         }
     }
 
@@ -2879,14 +2529,20 @@ extension FloatingInputCard {
     }
 
     private var modelWarmupDotColor: Color {
-        if warmModelsOnLoadEnabled, isSelectedModelLocal, !isRemoteAgentRun {
+        // Remote models and remote agent runs execute elsewhere — there is
+        // no local load/warm state to report.
+        guard isSelectedModelLocal, !isRemoteAgentRun else { return .green }
+        if warmModelsOnLoadEnabled {
             switch warmupController.state {
             case .cold: return .gray
             case .warming: return .yellow
             case .warm: return .green
             }
         }
-        return .green
+        // Warm-on-load off: no warm-up pass exists, so readiness is
+        // residency. Green only while the model is actually loaded — never a
+        // hardcoded green that survives an idle unload.
+        return warmupController.selectedModelResident ? .green : .gray
     }
 
     /// Warm-up tooltip for the model chip, applied as a modifier so the
@@ -2896,6 +2552,9 @@ extension FloatingInputCard {
         let isDeprecated: Bool
         /// `warmModelsOnLoadEnabled && isSelectedModelLocal && !isRemoteAgentRun`
         let warmupApplies: Bool
+        /// `isSelectedModelLocal && !isRemoteAgentRun` — a local model whose
+        /// load state is knowable even when warm-on-load is off.
+        let isLocalModelRun: Bool
         let selectedModel: String?
         @ObservedObject var warmupController: ChatWarmupController
         @ObservedObject private var warmupProgressHub = WarmupProgressHub.shared
@@ -2912,17 +2571,29 @@ extension FloatingInputCard {
 
         private var helpText: String {
             guard warmupApplies else {
-                return String(localized: "Model ready", bundle: .module)
+                guard isLocalModelRun else {
+                    return String(localized: "Model ready", bundle: .module)
+                }
+                return warmupController.selectedModelResident
+                    ? String(localized: "Model loaded — ready to respond", bundle: .module)
+                    : String(
+                        localized: "Model not loaded — your next message loads it first",
+                        bundle: .module)
             }
             switch warmupController.state {
             case .warm:
                 return String(
                     localized: "Chat prefix warm — ready for a fast next response", bundle: .module)
             case .cold:
-                return String(
-                    localized:
-                        "Chat prefix not pre-warmed — the next response may restore cache or prefill",
-                    bundle: .module)
+                return warmupController.selectedModelResident
+                    ? String(
+                        localized:
+                            "Chat prefix not pre-warmed — the next response may restore cache or prefill",
+                        bundle: .module)
+                    : String(
+                        localized:
+                            "Model not loaded — the next response loads the model first",
+                        bundle: .module)
             case .warming:
                 guard let model = selectedModel, let phase = warmupProgressHub.phases[model] else {
                     return String(localized: "Warming up…", bundle: .module)
@@ -3070,6 +2741,7 @@ extension FloatingInputCard {
             ModelWarmupHelp(
                 isDeprecated: isSelectedModelDeprecated,
                 warmupApplies: warmModelsOnLoadEnabled && isSelectedModelLocal && !isRemoteAgentRun,
+                isLocalModelRun: isSelectedModelLocal && !isRemoteAgentRun,
                 selectedModel: selectedModel,
                 warmupController: warmupController
             )
@@ -3414,13 +3086,14 @@ extension FloatingInputCard {
         let agentId = effectiveAgentId
         let manager = agentManager
         Task {
-            // Sandbox and folder backends now compose: enabling sandbox
-            // while a folder is selected yields combined mode (read-only
-            // host workspace + sandbox exec), so we keep the folder
-            // instead of clearing it. On a provision failure we roll the
-            // sandbox flag back below.
             do {
                 try await manager.updateAutonomousExec(newConfig, for: agentId)
+                // Do not leave two selected-looking execution contexts in the
+                // composer. The onChange above applies the same invariant to
+                // every other visible chat using this agent.
+                if newConfig.enabled {
+                    folderState.clearFolder()
+                }
             } catch {
                 // Don't silently swallow provision failures — log loudly and
                 // roll the persisted toggle back so the chip flips back to
@@ -3436,56 +3109,35 @@ extension FloatingInputCard {
         }
     }
 
-    /// Open the system folder picker. Sandbox and folder now compose
-    /// (combined mode), so selecting a folder no longer disables the
-    /// sandbox — picking a folder while sandbox is on yields a read-only
-    /// host workspace alongside sandbox exec. Presented as a sheet on this
-    /// chat's window (folder ownership is per chat) so the picker can't
-    /// flicker against the floating chat panel and it's obvious which chat
-    /// the folder attaches to.
+    /// Selecting a trusted folder makes native execution authoritative and
+    /// disables the VM for this agent. The folder picker is presented as a
+    /// sheet on this chat's window so ownership remains unambiguous.
     private func selectFolder() {
         let window = windowId.flatMap { ChatWindowManager.shared.getNSWindow(id: $0) }
+        let agentId = effectiveAgentId
+        let manager = agentManager
         Task {
-            _ = await folderState.selectFolder(from: window)
+            guard await folderState.selectFolder(from: window) != nil else { return }
+            var config = manager.effectiveAutonomousExec(for: agentId) ?? .default
+            guard config.enabled else { return }
+            config.enabled = false
+            config.allowHostFolderWrites = false
+            do {
+                try await manager.updateAutonomousExec(config, for: agentId)
+            } catch {
+                // Fail closed: do not leave a UI state that appears trusted
+                // while the VM boundary is still authoritative.
+                folderState.clearFolder()
+                debugLog(
+                    "[Workspace] Could not disable sandbox after folder selection: "
+                        + error.localizedDescription
+                )
+            }
         }
     }
 
-    /// True when sandbox is on AND a folder is selected — combined mode,
-    /// where exec runs in the VM and the host workspace is read-only
-    /// unless the agent's folder-writes opt-in is on.
-    private var isCombinedMode: Bool {
-        isSandboxEnabled && folderState.hasActiveFolder
-    }
-
-    /// The `allowHostFolderWrites` opt-in for the current agent: in
-    /// combined mode, `file_write` / `file_edit` may mutate the selected
-    /// folder (tracked + undoable). Drives the chip's lock badge and the
-    /// context-menu toggle.
-    private var allowsFolderWritesInSandboxMode: Bool {
-        agentManager.effectiveAutonomousExec(for: effectiveAgentId)?
-            .allowHostFolderWrites == true
-    }
-
-    /// Combined mode with the folder still read-only — the state the
-    /// chip's lock badge makes visible.
-    private var isFolderReadOnly: Bool {
-        isCombinedMode && !allowsFolderWritesInSandboxMode
-    }
-
-    /// Folder chip tooltip. In combined mode it spells out the read-only
-    /// (or tracked-writes) contract so users know what to expect.
+    /// Folder chip tooltip makes the active execution boundary explicit.
     private func folderChipHelp(hasFolder: Bool) -> Text {
-        if hasFolder && isSandboxEnabled {
-            return allowsFolderWritesInSandboxMode
-                ? Text(
-                    localized:
-                        "Sandbox mode: folder edits are allowed, tracked, and undoable — code runs in the sandbox"
-                )
-                : Text(
-                    localized:
-                        "Working folder is read-only in sandbox mode — code runs in the sandbox. Right-click to allow writes."
-                )
-        }
         // Lead with the full path when a folder is active — the chip label
         // middle-truncates long names, so the tooltip is where the complete
         // name stays readable.
@@ -3499,16 +3151,6 @@ extension FloatingInputCard {
         return Text(localized: "Select a working folder")
     }
 
-    /// Flip the agent's `allowHostFolderWrites` opt-in from the chip's
-    /// context menu — recovery is one click at the point of confusion.
-    private func toggleFolderWritesInSandboxMode() {
-        let agentId = effectiveAgentId
-        let manager = agentManager
-        var config = manager.effectiveAutonomousExec(for: agentId) ?? .default
-        config.allowHostFolderWrites.toggle()
-        Task { try? await manager.updateAutonomousExec(config, for: agentId) }
-    }
-
     private var sandboxHelpText: String {
         let base: String
         if let failure = sandboxFailure, isSandboxEnabled {
@@ -3519,11 +3161,6 @@ extension FloatingInputCard {
                 return "\(phase) — click to view progress."
             }
             return "Sandbox is starting up — click to view progress."
-        } else if isCombinedMode {
-            base =
-                allowsFolderWritesInSandboxMode
-                ? "Combined mode: folder edits are tracked and undoable; all code runs in the sandbox. Click to disable."
-                : "Combined mode: the selected folder is read-only and all code runs in the sandbox. Click to disable."
         } else if isSandboxEnabled && isSandboxRunning {
             base = "Sandbox is active — click to disable. Right-click for settings."
         } else if isSandboxEnabled {
@@ -4248,19 +3885,6 @@ extension FloatingInputCard {
                             Image(systemName: "arrow.clockwise")
                         }
                     }
-                    // Combined mode only: the read-only default is the
-                    // confusing state, so the opt-out lives right on the
-                    // chip. Plain folder mode is always writable — no
-                    // toggle to show.
-                    if isCombinedMode {
-                        Divider()
-                        Toggle(isOn: Binding(
-                            get: { allowsFolderWritesInSandboxMode },
-                            set: { _ in toggleFolderWritesInSandboxMode() }
-                        )) {
-                            Text("Allow Writes in Sandbox Mode", bundle: .module)
-                        }
-                    }
                     Divider()
                     Button(role: .destructive) {
                         folderState.clearFolder()
@@ -4317,15 +3941,6 @@ extension FloatingInputCard {
                     // bites (middle-truncating) past this width. The full name
                     // stays available via the chip's help tooltip.
                     .frame(maxWidth: 150)
-
-                // Visible read-only state for combined mode — the tooltip
-                // alone wasn't discoverable. No badge when writes are
-                // allowed (writable is the unmarked, expected state).
-                if isFolderReadOnly {
-                    Image(systemName: "lock.fill")
-                        .font(theme.font(size: CGFloat(theme.captionSize) - 3, weight: .semibold))
-                        .foregroundColor(theme.tertiaryText)
-                }
             } else if canEdit && !compact {
                 Text("Folder", bundle: .module)
                     .font(theme.font(size: CGFloat(theme.captionSize), weight: .medium))
@@ -4414,43 +4029,6 @@ extension FloatingInputCard {
     }
 
     // MARK: - Voice Input Button
-
-    private var voiceInputButton: some View {
-        // Only render the disabled "loading…" state when mic access has
-        // actually been granted. For `.notDetermined`/`.denied` the model
-        // can't be used yet, and a background autoload (e.g.
-        // `SpeechService.autoLoadIfNeeded` at launch) would otherwise
-        // freeze the button and swallow the tap that needs to surface
-        // either the system mic prompt or the denied alert.
-        let micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-        return Group {
-            if speechService.isLoadingModel && micAuthorized {
-                // Original disabled-spinner state — only when mic is
-                // already authorized, since otherwise no model load is
-                // running and the tap must remain free to surface either
-                // the system prompt or the denied alert.
-                InputActionButton(
-                    icon: "mic.fill",
-                    help: "Loading voice model…",
-                    action: {}
-                )
-                .overlay(
-                    ProgressView()
-                        .scaleEffect(0.5)
-                        .allowsHitTesting(false)
-                )
-                .disabled(true)
-                .opacity(0.5)
-            } else {
-                InputActionButton(
-                    icon: "mic.fill",
-                    help: "Voice input (speak to type)",
-                    action: { startVoiceInput() }
-                )
-            }
-        }
-        .transition(.opacity.combined(with: .scale(scale: 0.96)))
-    }
 
     private func appendAttachment(_ attachment: Attachment) {
         withAnimation(theme.springAnimation()) {
@@ -5153,7 +4731,7 @@ extension FloatingInputCard {
 
     private var textInputArea: some View {
         EditableTextView(
-            text: $localText,
+            text: localTextBinding,
             fontSize: inputFontSize,
             textColor: theme.primaryText,
             cursorColor: theme.cursorColor,
@@ -5211,11 +4789,11 @@ extension FloatingInputCard {
             HStack(spacing: 6) {
                 mediaButton
                 slashCommandButton
-                if isVoiceConfigured {
-                    voiceInputButton
-                        .disabled(isStreaming)
-                        .opacity(isStreaming ? 0.4 : 1.0)
-                }
+                FloatingVoiceButton(
+                    voiceInputEnabled: voiceConfig.voiceInputEnabled,
+                    isStreaming: isStreaming,
+                    startVoiceInput: startVoiceInput
+                )
             }
 
             Spacer()
@@ -7375,3 +6953,648 @@ private struct SendNowButton: View {
         }
     }
 #endif
+
+// MARK: - Meta Cluster Chips
+
+/// Balance indicator shown in every session where the router is usable.
+/// Extracted from `FloatingInputCard` so wallet-panel hover/pin state and
+/// account-service updates re-render only this chip, never the whole card.
+/// Hovering previews the wallet panel; clicking pins it so its actions
+/// (Add credits → top-up sheet, View all → Credits tab) are reachable.
+/// Quiet plain text normally, escalating to an amber pill / "Add credits"
+/// CTA as the balance runs low or hits zero — router-billed sessions only.
+private struct FloatingCreditsChip: View {
+    let isRouterBilledSession: Bool
+    /// Total micro-USD spent on the Osaurus Router this session (popover row).
+    let sessionSpendMicro: Int
+    let metaCompact: Bool
+    let metaUltraCompact: Bool
+    let onAddCredits: (() -> Void)?
+
+    @ObservedObject private var accountService = OsaurusRouterAccountService.shared
+    @Environment(\.theme) private var theme
+
+    /// Wallet panel presentation. Hovering the chip opens it as a passive
+    /// preview (dismissed on hover exit); clicking pins it so its actions
+    /// (Add credits, View all) are reachable.
+    @State private var showWalletPanel = false
+    /// True when the wallet panel was opened by click; hover exit no longer
+    /// dismisses it, only outside-click / an action does.
+    @State private var walletPanelPinned = false
+    @State private var balanceHoverTask: Task<Void, Never>?
+    /// Delayed dismiss for the hover-opened wallet panel. Gives the cursor a
+    /// grace period to travel from the chip into the panel (which lives in its
+    /// own window, so hovering it doesn't keep the chip "hovered"); the panel's
+    /// own hover cancels it so its buttons stay clickable.
+    @State private var walletDismissTask: Task<Void, Never>?
+
+    /// Urgency tiers for the balance indicator. Healthy stays quiet (plain muted
+    /// text that blends into the meta cluster); low and empty escalate to an
+    /// amber pill so a top-up is easy to notice. Empty/frozen reads as an "Add
+    /// credits" call to action — deliberately amber, never error-red, so it
+    /// invites action instead of looking like a failure. The escalation only
+    /// applies to router-billed sessions; see `creditsStyle(for:)`.
+    private enum BalanceLevel {
+        case healthy
+        case low
+        case empty
+    }
+
+    private var balanceLevel: BalanceLevel {
+        let micro = accountService.balanceMicroValue
+        if micro <= 0 || accountService.isFrozen {
+            return .empty
+        }
+        if micro < 1_000_000 {  // < $1.00
+            return .low
+        }
+        return .healthy
+    }
+
+    /// Resolved visual tokens for one `BalanceLevel` so the body can render
+    /// declaratively instead of re-deriving each property from the level inline.
+    private struct CreditsChipStyle {
+        let iconName: String
+        let iconColor: Color
+        let textColor: Color
+        let weight: Font.Weight
+        /// Pill fill/stroke; `nil` keeps the chip chrome-free (healthy state).
+        let pill: (fill: Color, stroke: Color)?
+        let glow: Color
+        /// When false, the chip shows the "Add credits" CTA instead of an amount.
+        let showsAmount: Bool
+    }
+
+    private func creditsStyle(for level: BalanceLevel) -> CreditsChipStyle {
+        let amber = theme.warningColor
+        // Outside router-billed sessions the chip never escalates: the balance
+        // doesn't block the current session, so a $0/unknown wallet reads as
+        // quiet muted "Add credits" text instead of an amber call to action.
+        guard isRouterBilledSession else {
+            return CreditsChipStyle(
+                iconName: "creditcard",
+                iconColor: theme.tertiaryText,
+                textColor: theme.secondaryText,
+                weight: .medium,
+                pill: nil,
+                glow: .clear,
+                showsAmount: level != .empty
+            )
+        }
+        switch level {
+        case .healthy:
+            return CreditsChipStyle(
+                iconName: "creditcard",
+                iconColor: theme.tertiaryText,
+                textColor: theme.secondaryText,
+                weight: .medium,
+                pill: nil,
+                glow: .clear,
+                showsAmount: true
+            )
+        case .low:
+            // The chip shows the router balance, so a low balance escalates the
+            // chip itself to amber text (no pill) — a gentle nudge that stops
+            // short of the empty-state "Add credits" call to action.
+            return CreditsChipStyle(
+                iconName: "creditcard",
+                iconColor: amber,
+                textColor: amber,
+                weight: .semibold,
+                pill: nil,
+                glow: .clear,
+                showsAmount: true
+            )
+        case .empty:
+            return CreditsChipStyle(
+                iconName: "plus.circle.fill",
+                iconColor: amber,
+                textColor: amber,
+                weight: .semibold,
+                pill: (amber.opacity(0.22), amber.opacity(0.5)),
+                glow: amber.opacity(0.25),
+                showsAmount: false
+            )
+        }
+    }
+
+    /// This session's Router spend, formatted for the hover popover. The chip
+    /// surfaces the account balance; spend is shown only in the popover.
+    private var sessionSpendDisplay: String {
+        OsaurusRouter.formatMicroUSDPrecise(String(sessionSpendMicro))
+    }
+
+    /// Accessibility text for the credits chip. Describes the router balance the
+    /// chip shows and the tap action; session spend lives in the wallet panel.
+    private var creditsHelpText: Text {
+        if accountService.isFrozen {
+            return Text("Account paused - add credits to resume.", bundle: .module)
+        }
+        return Text("\(accountService.formattedBalance) router balance. Click to open the wallet.", bundle: .module)
+    }
+
+    var body: some View {
+        let level = balanceLevel
+        let style = creditsStyle(for: level)
+        let caption = CGFloat(theme.captionSize)
+        // Hide the icon in compact mode to save width, except the empty-state
+        // plus glyph, which signals the chip is actionable. In the ultra-compact
+        // tier we always keep the icon, since it becomes the whole chip.
+        let showIcon = !metaCompact || level == .empty || metaUltraCompact
+        // At the tightest width the chip is icon-only (glyph carries the state,
+        // hover/tap opens the wallet) so the row's toggle chips aren't clipped.
+        let showLabel = !metaUltraCompact
+
+        Button {
+            // Click pins the wallet panel (rather than jumping straight to the
+            // top-up sheet) so its actions stay reachable; a second click while
+            // pinned closes it.
+            balanceHoverTask?.cancel()
+            walletDismissTask?.cancel()
+            if showWalletPanel && walletPanelPinned {
+                showWalletPanel = false
+                walletPanelPinned = false
+            } else {
+                walletPanelPinned = true
+                showWalletPanel = true
+            }
+        } label: {
+            HStack(spacing: 4) {
+                if showIcon {
+                    Image(systemName: style.iconName)
+                        .font(.system(size: caption - 2))
+                        .foregroundColor(style.iconColor)
+                        .contentTransition(.symbolEffect(.replace))
+                }
+
+                if showLabel {
+                    if style.showsAmount {
+                        // Composer shows the overall router balance; this session's
+                        // spend is surfaced only in the hover popover.
+                        Text(verbatim: accountService.formattedBalance)
+                            .font(.system(size: caption - 1, weight: style.weight, design: .monospaced))
+                            .foregroundColor(style.textColor)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    } else {
+                        Text("Add credits", bundle: .module)
+                            .font(theme.font(size: caption - 1, weight: style.weight))
+                            .foregroundColor(style.textColor)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
+            }
+            // Chrome only appears in the low/empty attention states; the healthy
+            // chip stays plain text to match the token indicator's weight.
+            .padding(.horizontal, style.pill == nil ? 0 : 10)
+            .padding(.vertical, style.pill == nil ? 0 : 4)
+            .background {
+                if let pill = style.pill {
+                    Capsule()
+                        .fill(pill.fill)
+                        .overlay(Capsule().strokeBorder(pill.stroke, lineWidth: 1))
+                }
+            }
+            // Soft glow on the empty CTA draws the eye without a repeating animation.
+            .shadow(color: style.glow, radius: 5, x: 0, y: 1)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .accessibilityLabel(creditsHelpText)
+        .onHover { hovering in
+            balanceHoverTask?.cancel()
+            if hovering {
+                walletDismissTask?.cancel()
+                balanceHoverTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    guard !Task.isCancelled else { return }
+                    showWalletPanel = true
+                }
+            } else if !walletPanelPinned {
+                scheduleWalletDismiss()
+            }
+        }
+        .popover(isPresented: $showWalletPanel, arrowEdge: .top) {
+            WalletPopover(
+                sessionSpend: isRouterBilledSession ? sessionSpendDisplay : nil,
+                isAttention: isRouterBilledSession && balanceLevel != .healthy,
+                onAddCredits: {
+                    closeWalletPanel()
+                    onAddCredits?()
+                },
+                onViewAll: {
+                    closeWalletPanel()
+                    AppDelegate.shared?.showManagementWindow(initialTab: .credits)
+                }
+            )
+            // Keep the panel alive while the cursor is over it, so the user
+            // can travel from the chip and click Add credits / View all.
+            .onHover { hovering in
+                if hovering {
+                    walletDismissTask?.cancel()
+                } else if !walletPanelPinned {
+                    scheduleWalletDismiss()
+                }
+            }
+        }
+        .onChange(of: showWalletPanel) { _, isShown in
+            // Outside-click dismissal flips the binding directly; unpin so the
+            // next hover preview behaves normally.
+            if !isShown { walletPanelPinned = false }
+        }
+    }
+
+    /// Dismiss the hover-opened wallet panel after a grace period, giving the
+    /// cursor time to cross the gap into the panel window.
+    private func scheduleWalletDismiss() {
+        balanceHoverTask?.cancel()
+        walletDismissTask?.cancel()
+        walletDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            showWalletPanel = false
+        }
+    }
+
+    private func closeWalletPanel() {
+        walletDismissTask?.cancel()
+        balanceHoverTask?.cancel()
+        showWalletPanel = false
+        walletPanelPinned = false
+    }
+}
+
+/// Context/token indicator on the right edge of the selector row. Extracted
+/// from `FloatingInputCard` so popover hover/pin state re-renders only this
+/// chip. All budget math stays in the parent (it also gates sending); this
+/// view just renders the passed values. `breakdown` is a closure so the
+/// popover's content is computed only when it actually opens, matching the
+/// lazy evaluation the inline `.popover` closure had before extraction.
+private struct FloatingContextChip: View {
+    let displayTokens: Int
+    let usableTokens: Int?
+    let modelMaxTokens: Int?
+    let windowResolution: AgentLoopBudget.ContextWindowResolution?
+    let isStreaming: Bool
+    let isNearLimit: Bool
+    let isHardOverflow: Bool
+    let metaCompact: Bool
+    let formatTokenCount: (Int) -> String
+    let breakdown: () -> ContextBreakdown
+
+    @Environment(\.theme) private var theme
+
+    @State private var showContextBreakdown = false
+    /// True when the context panel was opened by click. Hover previews dismiss
+    /// automatically; pinned panels remain interactive until an outside click
+    /// or a second click on the trigger.
+    @State private var contextPanelPinned = false
+    @State private var contextHoverTask: Task<Void, Never>?
+    /// Delayed dismiss for the context popover. Gives the cursor a grace
+    /// period to travel from the trigger into the popover (which lives in its
+    /// own window, so hovering it doesn't keep the trigger "hovered").
+    @State private var contextDismissTask: Task<Void, Never>?
+
+    var body: some View {
+        let warningColor: Color? =
+            isHardOverflow ? .red : (isNearLimit ? .orange : nil)
+        let prefix = isStreaming ? "" : "~"
+        let tokenText =
+            if let maxCtx = usableTokens {
+                "\(prefix)\(formatTokenCount(displayTokens)) / \(formatTokenCount(maxCtx))"
+            } else {
+                "\(prefix)\(formatTokenCount(displayTokens))"
+            }
+
+        Button {
+            contextHoverTask?.cancel()
+            contextDismissTask?.cancel()
+            if showContextBreakdown && contextPanelPinned {
+                showContextBreakdown = false
+                contextPanelPinned = false
+            } else {
+                contextPanelPinned = true
+                showContextBreakdown = true
+            }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                // Budget-state tinting: amber at ≥85% of the window (soft
+                // warning — compaction will engage), red when the
+                // non-compactable prefix alone can't fit (send is gated).
+                if let warningColor {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: CGFloat(theme.captionSize) - 2))
+                        .foregroundColor(warningColor)
+                        .localizedHelp(
+                            isHardOverflow
+                                ? "Context is full: the system prompt, tools, and input alone exceed this model's window. Shorten the input, disable tools, or pick a larger-context model."
+                                : "Context is nearly full (≥85% of the model window). Older messages will be compacted; consider starting a fresh chat for best quality."
+                        )
+                }
+
+                Text(tokenText)
+                    .font(.system(size: CGFloat(theme.captionSize) - 1, weight: .medium, design: .monospaced))
+                    .foregroundColor(
+                        warningColor ?? (isStreaming ? theme.secondaryText : theme.tertiaryText)
+                    )
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+
+                if !metaCompact {
+                    Text("tokens", bundle: .module)
+                        .font(theme.font(size: CGFloat(theme.captionSize) - 1, weight: .regular))
+                        .foregroundColor(theme.tertiaryText.opacity(0.7))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .accessibilityLabel(
+            Text("Context budget: \(tokenText) tokens", bundle: .module)
+        )
+        .onHover { hovering in
+            if hovering {
+                openContextBreakdown()
+            } else if !contextPanelPinned {
+                scheduleContextDismiss()
+            }
+        }
+        .popover(isPresented: $showContextBreakdown, arrowEdge: .top) {
+            ContextBreakdownPopover(
+                breakdown: breakdown(),
+                maxTokens: usableTokens,
+                modelMaxTokens: modelMaxTokens,
+                modelLimitSource: windowResolution?.source,
+                isStreaming: isStreaming,
+                isNearLimit: isNearLimit,
+                isHardOverflow: isHardOverflow,
+                formatTokenCount: formatTokenCount
+            )
+            // Keep the popover alive while the cursor is over it, so the user
+            // can travel from the trigger and click the disclosure headers.
+            .onPopoverHover { hovering in
+                if hovering {
+                    contextDismissTask?.cancel()
+                } else if !contextPanelPinned {
+                    scheduleContextDismiss()
+                }
+            }
+        }
+        .onChange(of: showContextBreakdown) { _, isShown in
+            // Outside-click dismissal flips the binding directly. Clear the
+            // pinned state so the next hover behaves as a passive preview.
+            if !isShown { contextPanelPinned = false }
+        }
+    }
+
+    /// Open the context popover after a short hover dwell, cancelling any
+    /// pending dismiss so a quick re-entry doesn't flicker it closed.
+    private func openContextBreakdown() {
+        contextDismissTask?.cancel()
+        contextHoverTask?.cancel()
+        contextHoverTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            showContextBreakdown = true
+        }
+    }
+
+    /// Dismiss the context popover after a grace period, giving the cursor
+    /// time to cross the gap into the popover window.
+    private func scheduleContextDismiss() {
+        contextHoverTask?.cancel()
+        contextDismissTask?.cancel()
+        contextDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            showContextBreakdown = false
+        }
+    }
+}
+
+// MARK: - Voice Children
+
+/// Hosts `VoiceInputOverlay` and feeds it the live speech fields
+/// (`audioLevel` publishes per audio buffer while recording) from its own
+/// observation, so those high-frequency updates re-render only the overlay —
+/// never the whole card. All non-speech parameters pass through from the
+/// parent unchanged.
+private struct FloatingVoiceOverlayHost: View {
+    @Binding var state: VoiceInputState
+    let pauseDuration: Double
+    let confirmationDelay: Double
+    let silenceDuration: Double
+    let silenceTimeoutDuration: Double
+    let silenceTimeoutProgress: Double
+    let isContinuousMode: Bool
+    let isStreaming: Bool
+    let transcriptionStopMode: TranscriptionStopMode
+    let onCancel: () -> Void
+    let onSend: (String) -> Void
+    let onEdit: () -> Void
+
+    @ObservedObject private var speechService = SpeechService.shared
+
+    var body: some View {
+        VoiceInputOverlay(
+            state: $state,
+            audioLevel: speechService.audioLevel,
+            transcription: speechService.currentTranscription,
+            confirmedText: speechService.confirmedTranscription,
+            pauseDuration: pauseDuration,
+            confirmationDelay: confirmationDelay,
+            silenceDuration: silenceDuration,
+            silenceTimeoutDuration: silenceTimeoutDuration,
+            silenceTimeoutProgress: silenceTimeoutProgress,
+            isContinuousMode: isContinuousMode,
+            isStreaming: isStreaming,
+            transcriptionStopMode: transcriptionStopMode,
+            onCancel: onCancel,
+            onSend: onSend,
+            onEdit: onEdit
+        )
+    }
+}
+
+/// Mic button for the composer button bar. Owns the reactive reads that
+/// gate and style it (`downloadedModelsCount`, `isLoadingModel`) so speech
+/// service updates re-render only this button. Renders nothing when voice
+/// is not configured — the same visibility the parent's inline
+/// `if isVoiceConfigured` gate produced.
+private struct FloatingVoiceButton: View {
+    /// `voiceConfig.voiceInputEnabled` from the parent's loaded configuration.
+    let voiceInputEnabled: Bool
+    let isStreaming: Bool
+    let startVoiceInput: () -> Void
+
+    @ObservedObject private var speechService = SpeechService.shared
+    @ObservedObject private var speechModelManager = SpeechModelManager.shared
+
+    private var isVoiceConfigured: Bool {
+        voiceInputEnabled && speechModelManager.downloadedModelsCount > 0
+    }
+
+    var body: some View {
+        if isVoiceConfigured {
+            button
+                .disabled(isStreaming)
+                .opacity(isStreaming ? 0.4 : 1.0)
+        }
+    }
+
+    private var button: some View {
+        // Only render the disabled "loading…" state when mic access has
+        // actually been granted. For `.notDetermined`/`.denied` the model
+        // can't be used yet, and a background autoload (e.g.
+        // `SpeechService.autoLoadIfNeeded` at launch) would otherwise
+        // freeze the button and swallow the tap that needs to surface
+        // either the system mic prompt or the denied alert.
+        let micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        return Group {
+            if speechService.isLoadingModel && micAuthorized {
+                // Original disabled-spinner state — only when mic is
+                // already authorized, since otherwise no model load is
+                // running and the tap must remain free to surface either
+                // the system prompt or the denied alert.
+                InputActionButton(
+                    icon: "mic.fill",
+                    help: "Loading voice model…",
+                    action: {}
+                )
+                .overlay(
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .allowsHitTesting(false)
+                )
+                .disabled(true)
+                .opacity(0.5)
+            } else {
+                InputActionButton(
+                    icon: "mic.fill",
+                    help: "Voice input (speak to type)",
+                    action: { startVoiceInput() }
+                )
+            }
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+    }
+}
+
+/// Syncs the card's voice state with `SpeechService` transitions. Lives in
+/// its own modifier node (like `VoiceDebugObservers`) so observing the
+/// service — whose `audioLevel` publishes per audio buffer while recording —
+/// re-runs only this modifier's lightweight body, not the card's. The
+/// side effects write back through bindings, which invalidate the card only
+/// when a watched transition actually fires.
+private struct VoiceStateSyncObservers: ViewModifier {
+    @Binding var voiceInputState: VoiceInputState
+    @Binding var showVoiceOverlay: Bool
+    @Binding var lastVoiceActivityTime: Date
+    @Binding var lastSpeechTime: Date
+    @Binding var hasDetectedSpeechThisTurn: Bool
+    let resetPauseDetectionForRecording: () -> Void
+
+    @ObservedObject private var speechService = SpeechService.shared
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: speechService.isRecording) { _, isRecording in
+                print(
+                    "[FloatingInputCard] isRecording changed to: \(isRecording). voiceInputState: \(voiceInputState), showVoiceOverlay: \(showVoiceOverlay)"
+                )
+                // Sync voice state with service
+                if isRecording {
+                    if voiceInputState == .idle && showVoiceOverlay {
+                        voiceInputState = .recording
+                        lastVoiceActivityTime = Date()
+                        resetPauseDetectionForRecording()
+                        print("[FloatingInputCard] Recording confirmed - voice input ready")
+                    } else if voiceInputState == .idle {
+                        print("[FloatingInputCard] External recording detected. Overlay: \(showVoiceOverlay)")
+                        voiceInputState = .recording
+                        lastVoiceActivityTime = Date()
+                        resetPauseDetectionForRecording()
+                    }
+                } else {
+                    // If service stopped recording (e.g. via Esc key in ChatView), sync local state.
+                    // Preserve `.sending` so the overlay stays up during LLM cleanup.
+                    if voiceInputState != .idle && voiceInputState != .sending {
+                        voiceInputState = .idle
+                        showVoiceOverlay = false
+                    }
+                }
+            }
+            .onChange(of: speechService.isSpeechDetected) { _, detected in
+                if detected && voiceInputState == .recording {
+                    hasDetectedSpeechThisTurn = true
+                    lastSpeechTime = Date()
+                }
+            }
+            .onChange(of: speechService.currentTranscription) { _, newValue in
+                // When new transcription arrives, user is speaking
+                // Only reset silence timer if there is also active audio detection or meaningful level
+                if voiceInputState == .recording && TranscriptionTextNormalizer.hasVisibleText(newValue) {
+                    if speechService.isSpeechDetected || speechService.audioLevel > 0.05 {
+                        hasDetectedSpeechThisTurn = true
+                        lastSpeechTime = Date()
+                    }
+                }
+            }
+            .onChange(of: speechService.confirmedTranscription) { _, newValue in
+                // When confirmed transcription changes, user was speaking
+                if voiceInputState == .recording && TranscriptionTextNormalizer.hasVisibleText(newValue) {
+                    if speechService.isSpeechDetected || speechService.audioLevel > 0.05 {
+                        hasDetectedSpeechThisTurn = true
+                        lastSpeechTime = Date()
+                    }
+                }
+            }
+    }
+}
+
+/// Observation firewall for the selector row. Sandbox provisioning publishes
+/// per-progress-tick during runtime downloads and the clipboard service
+/// publishes on every copy; hosting those subscriptions here means their
+/// updates re-render only this subtree. The wrapped closure captures the
+/// card value and re-reads the live singleton state (via the card's derived
+/// properties) each time this scope's body runs, so the chips always render
+/// current sandbox/clipboard state without the card observing either object.
+private struct ChipObservationScope<Content: View>: View {
+    @ObservedObject private var sandboxState = SandboxManager.State.shared
+    @ObservedObject private var clipboardService = ClipboardService.shared
+    /// The card's composer text model: the row's context chip shows a live
+    /// token count that includes what's being typed, so the row re-renders
+    /// per keystroke here instead of the whole card observing the text.
+    @ObservedObject var textModel: ComposerTextModel
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        content()
+    }
+}
+
+/// Observation firewall for the popups + input card subtree. Keystrokes
+/// publish through `ComposerTextModel`, re-rendering only this scope's
+/// content — the card holds the model as plain `@State` (the reference never
+/// changes) so typing never invalidates the card body. The closure re-reads
+/// the model's current text through the card's derived properties on every
+/// scope render.
+private struct ComposerTextObservationScope<Content: View>: View {
+    @ObservedObject var model: ComposerTextModel
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        content()
+    }
+}
+
+/// Reference-type home for the composer's typed text. See
+/// `FloatingInputCard.composerText` for the invalidation contract.
+final class ComposerTextModel: ObservableObject {
+    @Published var text: String = ""
+}

@@ -15,6 +15,37 @@ import Foundation
 
 enum SeatbeltExecutor {
 
+    /// Populate xcrun's Python lookup before entering deny-default Seatbelt.
+    /// xcrun keys its shared database by `HOME`, so warming it once with the
+    /// host environment is insufficient when the confined command uses an
+    /// agent workspace as home. Resolve (but never execute) the tool with the
+    /// exact sanitized environment for this request. That lets xcrun perform
+    /// any atomic cache refresh before confinement without running caller code
+    /// or granting sandboxed work write access to the host's temp directory.
+    private static func preparePythonShimCache(home: String) {
+        guard let developerDirectory = SeatbeltSandbox.activeDeveloperDirectory,
+              FileManager.default.isExecutableFile(atPath: "/usr/bin/xcrun")
+        else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["--find", "python3"]
+        process.environment = [
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "DEVELOPER_DIR": developerDirectory,
+            "HOME": home,
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            // The confined launch will surface the real tool error. Cache
+            // preparation is best effort and must not execute a retry loop.
+        }
+    }
+
     struct Request {
         /// Shell command, already host-path-mapped by the caller.
         let command: String
@@ -92,8 +123,28 @@ enum SeatbeltExecutor {
         let scratch = SeatbeltSandbox.scratchDir
         try? FileManager.default.createDirectory(
             atPath: scratch, withIntermediateDirectories: true)
-        if env["TMPDIR"] == nil { env["TMPDIR"] = scratch }
-        if env["HOME"] == nil { env["HOME"] = request.cwd ?? scratch }
+        // This is a confinement boundary, not a caller preference. An
+        // inherited or tool-supplied TMPDIR points outside the profile's
+        // writable scratch grant and breaks xcrun-backed shims such as
+        // `/usr/bin/python3`; always replace it with the allowed path.
+        env["TMPDIR"] = scratch
+        // Use the same validated developer directory as the exact shim
+        // preparation above. A caller override could select an ungranted tree
+        // and force xcrun to refresh its host cache from inside confinement.
+        if let developerDirectory = SeatbeltSandbox.activeDeveloperDirectory {
+            env["DEVELOPER_DIR"] = developerDirectory
+        } else {
+            env.removeValue(forKey: "DEVELOPER_DIR")
+        }
+        // HOME participates in xcrun's cache key. It is also a confinement
+        // boundary: never let a caller redirect the host-side preparation to
+        // an arbitrary directory. Seatbelt requests already carry a mapped,
+        // path-sanitized cwd; fall back to the writable scratch directory.
+        let confinedHome = request.cwd ?? scratch
+        env["HOME"] = confinedHome
+        if request.command.contains("python3") {
+            preparePythonShimCache(home: confinedHome)
+        }
         process.environment = env
 
         if let cwd = request.cwd {
@@ -168,4 +219,3 @@ enum SeatbeltExecutor {
         )
     }
 }
-

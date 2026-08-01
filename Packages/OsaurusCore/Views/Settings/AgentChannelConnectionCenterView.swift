@@ -16,6 +16,7 @@ import SwiftUI
 private enum AgentChannelsPage {
     case connections
     case activity
+    case outbox
 }
 
 /// Which channel's configuration sheet is open.
@@ -23,18 +24,23 @@ private enum AgentChannelSheetTarget: Identifiable {
     case addChannel
     case native(AgentChannelKind)
     case editCustom(AgentChannelConnection)
+    case addDestination
+    case editDestination(AgentChannelBinding)
 
     var id: String {
         switch self {
         case .addChannel: return "add-channel"
         case .native(let kind): return "native-\(kind.rawValue)"
         case .editCustom(let connection): return "custom-\(connection.id)"
+        case .addDestination: return "destination-new"
+        case .editDestination(let binding): return "destination-\(binding.id)"
         }
     }
 }
 
 struct AgentChannelConnectionCenterView: View {
     @ObservedObject private var themeManager = ThemeManager.shared
+    @Environment(\.settingsLandingPending) private var landingPending
 
     @State private var hasAppeared = false
     @State private var page: AgentChannelsPage = .connections
@@ -44,6 +50,13 @@ struct AgentChannelConnectionCenterView: View {
     @State private var nativeConfigured: [AgentChannelKind: Bool] = [:]
     @State private var anyNativeConfigured = false
     @State private var connections: [AgentChannelConnection] = []
+    /// Effective posting rooms: stored bindings plus automatic ones derived
+    /// from the channel setup (writable rooms × assigned agents).
+    @State private var destinationBindings: [AgentChannelBinding] = []
+    @State private var storedDestinationIds: Set<String> = []
+    /// Rows needing operator attention (pending approvals + unconfirmed
+    /// deliveries), surfaced as a count on the Outbox header button.
+    @State private var pendingOutboxCount = 0
 
     @State private var auditScopeId: String?
     @State private var auditSnapshot: AgentChannelAuditWorkbenchSnapshot?
@@ -70,6 +83,8 @@ struct AgentChannelConnectionCenterView: View {
                     connectionsPage
                 case .activity:
                     activityTab
+                case .outbox:
+                    AgentChannelOutboxView()
                 }
             }
             .opacity(hasAppeared ? 1 : 0)
@@ -89,9 +104,22 @@ struct AgentChannelConnectionCenterView: View {
         .onChange(of: page) {
             if page == .connections {
                 refreshNativeBadges()
-            } else {
+            } else if page == .activity {
                 reloadAuditWorkbench()
             }
+        }
+        .onChange(of: landingPending) { _, pending in
+            routeForLandingTarget(pending)
+        }
+        .onReceive(
+            NotificationCenter.default
+                .publisher(for: .agentChannelOutboundIntentsChanged)
+                .receive(on: DispatchQueue.main)
+        ) { _ in
+            reloadPendingOutboxCount()
+        }
+        .task {
+            routeForLandingTarget(landingPending)
         }
         .sheet(item: $activeSheet, onDismiss: handleSheetDismiss) { target in
             switch target {
@@ -105,11 +133,21 @@ struct AgentChannelConnectionCenterView: View {
                 SlackSettingsView()
             case .native(.telegram):
                 TelegramSettingsView()
+            case .native(.imessage):
+                IMessageSettingsView()
             case .native(.customHTTP):
                 // Custom HTTP is never presented as a native channel.
                 EmptyView()
             case .editCustom(let connection):
                 AgentChannelCustomConnectionSheet(connection: connection) {
+                    reloadConnections()
+                }
+            case .addDestination:
+                AgentChannelDestinationEditorSheet(binding: nil) {
+                    reloadConnections()
+                }
+            case .editDestination(let binding):
+                AgentChannelDestinationEditorSheet(binding: binding) {
                     reloadConnections()
                 }
             }
@@ -136,6 +174,8 @@ struct AgentChannelConnectionCenterView: View {
         switch page {
         case .activity:
             return L("Incoming messages and receive decisions across your channels")
+        case .outbox:
+            return L("Posts agents want to send, plus what already went out")
         case .connections:
             if !globalWritesEnabled {
                 return L("Sending is paused — every channel is read-only")
@@ -152,6 +192,14 @@ struct AgentChannelConnectionCenterView: View {
         ) {
             switch page {
             case .connections:
+                HeaderSecondaryButton(
+                    pendingOutboxCount > 0 ? L("Outbox (\(pendingOutboxCount))") : L("Outbox"),
+                    icon: "paperplane"
+                ) {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        page = .outbox
+                    }
+                }
                 HeaderSecondaryButton(L("Activity"), icon: "clock.arrow.circlepath") {
                     withAnimation(.easeOut(duration: 0.2)) {
                         page = .activity
@@ -160,7 +208,7 @@ struct AgentChannelConnectionCenterView: View {
                 HeaderPrimaryButton(L("Add Channel"), icon: "plus") {
                     activeSheet = .addChannel
                 }
-            case .activity:
+            case .activity, .outbox:
                 HeaderSecondaryButton(L("Back to Channels"), icon: "chevron.left") {
                     withAnimation(.easeOut(duration: 0.2)) {
                         page = .connections
@@ -193,11 +241,32 @@ struct AgentChannelConnectionCenterView: View {
                     availableSection
                 }
 
-                writeGateRow
+                if !isFirstRun || !destinationBindings.isEmpty {
+                    AgentChannelDestinationsSection(
+                        bindings: destinationBindings,
+                        storedBindingIds: storedDestinationIds,
+                        sendingPaused: !globalWritesEnabled,
+                        onAdd: { activeSheet = .addDestination },
+                        onEdit: { activeSheet = .editDestination($0) },
+                        onChanged: { reloadConnections() }
+                    )
+                }
+
+                sendingSection
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 24)
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// The master send control gets its own labeled section so it reads as
+    /// the top of the sending hierarchy (replies AND new messages), not as
+    /// a stray toggle after the destination list.
+    private var sendingSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionLabel(L("Sending"))
+            writeGateRow
         }
     }
 
@@ -335,7 +404,7 @@ struct AgentChannelConnectionCenterView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
-                    Text("Channel Writes", bundle: .module)
+                    Text("Allow Agents to Send Messages", bundle: .module)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(theme.primaryText)
 
@@ -350,8 +419,8 @@ struct AgentChannelConnectionCenterView: View {
                 }
                 Text(
                     globalWritesEnabled
-                        ? L("Agents may send messages to write-allowlisted destinations.")
-                        : L("Sending is paused everywhere. Agents can still read allowlisted channels.")
+                        ? L("Master switch for replies and new messages. Agents may send to write-allowlisted destinations.")
+                        : L("Sending is paused everywhere — replies and new messages. Agents can still read allowlisted channels.")
                 )
                 .font(.system(size: 11))
                 .foregroundColor(theme.tertiaryText)
@@ -391,7 +460,7 @@ struct AgentChannelConnectionCenterView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text(
-                    "Authorized incoming messages are stored in a local inbox that agent read tools consult. Channels only answer automatically when their dispatch and auto-reply settings are turned on.",
+                    "Authorized incoming messages are stored in a local inbox that agent read tools consult. A channel only replies automatically when an agent is chosen to reply there and automatic replies are turned on.",
                     bundle: .module
                 )
                 .font(.system(size: 12))
@@ -583,13 +652,14 @@ struct AgentChannelConnectionCenterView: View {
 
     // MARK: - Channel Data
 
-    private static let nativeProviderKinds: [AgentChannelKind] = [.discord, .slack, .telegram]
+    private static let nativeProviderKinds: [AgentChannelKind] = [.discord, .slack, .telegram, .imessage]
 
     private static func nativeSubtitle(for kind: AgentChannelKind) -> String {
         switch kind {
         case .discord: return L("Bot access to allowlisted servers and channels")
-        case .slack: return L("Bot access to allowlisted workspace channels")
+        case .slack: return L("Bot access to allowlisted channels and DMs")
         case .telegram: return L("Bot access to allowlisted chats and groups")
+        case .imessage: return L("This Mac's Messages app, allowlisted chats only")
         case .customHTTP: return L("JSON-defined HTTP channel")
         }
     }
@@ -597,30 +667,68 @@ struct AgentChannelConnectionCenterView: View {
     private func handleSheetDismiss() {
         reloadConnections()
         refreshNativeBadges()
+        // Allowlists or credentials may have changed; re-resolve room names.
+        AgentChannelRoomDirectory.shared.invalidate()
     }
 
     /// Derive channel badges for native providers from saved-credential
     /// presence plus live receive-transport health.
     private func refreshNativeBadges() {
+        // Credential presence lives in the keychain; read it off the main
+        // thread so a slow securityd never stalls the connection list.
+        Task {
+            let discordConfigured = await DiscordConnectionService.shared.hasBotTokenOffMain()
+            let slackPresence = await SlackConnectionService.shared.credentialPresenceOffMain()
+            let telegramConfigured = await TelegramConnectionService.shared.hasBotTokenOffMain()
+            applyNativeBadges(
+                discordConfigured: discordConfigured,
+                slackConfigured: slackPresence.botToken,
+                slackReceiveExpected: slackPresence.appToken,
+                telegramConfigured: telegramConfigured
+            )
+        }
+    }
+
+    private func applyNativeBadges(
+        discordConfigured: Bool,
+        slackConfigured: Bool,
+        slackReceiveExpected: Bool,
+        telegramConfigured: Bool
+    ) {
+        // iMessage has no remote credential; "configured" means a verified
+        // helper is present AND allowlisted chats exist. Without the helper
+        // check, a machine that lost its helper (failed download, tampered
+        // digest) would still show Configured/Connected while every action
+        // fails.
+        let imessageConfig = IMessageConnectionService.shared.configuration()
+        let imessageConfigured =
+            IMessageConnectionService.shared.helperAvailable()
+            && (!imessageConfig.readableChatIds.isEmpty || !imessageConfig.writableChatIds.isEmpty)
+        let imessageReceiveExpected = imessageConfig.canStartReceive()
         let discordConfig = DiscordConnectionService.shared.configuration()
-        let discordConfigured = DiscordConnectionService.shared.hasBotToken()
         let discordReceiveExpected = discordConfigured
             && !discordConfig.readableChannelIds.isEmpty
             && !discordConfig.senderAllowlist.isEmpty
-        let slackConfigured = SlackConnectionService.shared.hasBotToken()
-        let slackReceiveExpected = SlackConnectionService.shared.hasAppToken()
         let telegramConfig = TelegramConnectionService.shared.configuration()
-        let telegramConfigured = TelegramConnectionService.shared.hasBotToken()
         let telegramReceiveExpected = telegramConfig.longPollingEnabled
         let slackDispatch = SlackConnectionService.shared.configuration().inboundDispatch
 
-        anyNativeConfigured = discordConfigured || slackConfigured || telegramConfigured
+        anyNativeConfigured =
+            discordConfigured || slackConfigured || telegramConfigured || imessageConfigured
         nativeConfigured[.discord] = discordConfigured
         nativeConfigured[.slack] = slackConfigured
         nativeConfigured[.telegram] = telegramConfigured
-        nativeRoutingDetails[.discord] = Self.routingSummary(discordConfig.inboundDispatch)
-        nativeRoutingDetails[.slack] = Self.routingSummary(slackDispatch)
-        nativeRoutingDetails[.telegram] = Self.routingSummary(telegramConfig.inboundDispatch)
+        nativeConfigured[.imessage] = imessageConfigured
+        // Reply state only makes sense on configured channels; the
+        // "Available" list would otherwise show a noisy "Replies off".
+        nativeRoutingDetails[.discord] =
+            discordConfigured ? Self.routingSummary(discordConfig.inboundDispatch) : nil
+        nativeRoutingDetails[.slack] =
+            slackConfigured ? Self.routingSummary(slackDispatch) : nil
+        nativeRoutingDetails[.telegram] =
+            telegramConfigured ? Self.routingSummary(telegramConfig.inboundDispatch) : nil
+        nativeRoutingDetails[.imessage] =
+            imessageConfigured ? Self.routingSummary(imessageConfig.inboundDispatch) : nil
 
         Task {
             let discordHealth = await AgentChannelTransportHealthCenter.shared.state(
@@ -634,6 +742,10 @@ struct AgentChannelConnectionCenterView: View {
             let telegramHealth = await AgentChannelTransportHealthCenter.shared.state(
                 connectionId: AgentChannelConnection.nativeTelegramConnectionId,
                 transportId: TelegramLongPollTransportRuntime.transportId
+            )
+            let imessageHealth = await AgentChannelTransportHealthCenter.shared.state(
+                connectionId: AgentChannelConnection.nativeIMessageConnectionId,
+                transportId: IMessageWatchTransportRuntime.transportId
             )
             await MainActor.run {
                 nativeBadges[.discord] = Self.nativeBadge(
@@ -651,25 +763,32 @@ struct AgentChannelConnectionCenterView: View {
                     receiveExpected: telegramReceiveExpected,
                     health: telegramHealth
                 )
+                nativeBadges[.imessage] = Self.nativeBadge(
+                    configured: imessageConfigured,
+                    receiveExpected: imessageReceiveExpected,
+                    health: imessageHealth
+                )
             }
         }
     }
 
-    /// One-line description of who answers this channel, shown on the card.
+    /// One-line description of who replies on this channel, shown on the
+    /// card. Always explicit — a configured channel that never replies says
+    /// so instead of hiding the state.
     @MainActor
     static func routingSummary(
         _ dispatch: AgentChannelInboundDispatchConfiguration,
         agentName: (UUID) -> String? = { AgentManager.shared.agent(for: $0)?.name }
     ) -> String? {
-        guard dispatch.enabled else { return nil }
+        guard dispatch.enabled else { return L("Replies off") }
         let names = dispatch.referencedAgentIds.map { agentName($0) ?? L("Unknown agent") }
         switch names.count {
         case 0:
-            return L("No agent assigned")
+            return L("Replies on — choose an agent")
         case 1:
-            return L("Answers as \(names[0])")
+            return L("Replies: \(names[0])")
         default:
-            return L("Routes to \(names.count) agents: \(names.joined(separator: ", "))")
+            return L("Replies: \(names.count) agents — \(names.joined(separator: ", "))")
         }
     }
 
@@ -712,6 +831,36 @@ struct AgentChannelConnectionCenterView: View {
 
     private func reloadConnections() {
         connections = manager.editableConnections()
+        storedDestinationIds = Set(manager.bindings().map(\.id))
+        destinationBindings = AgentChannelAutoDestinationResolver.effectiveConfiguration()
+            .bindings
+            .sorted { lhs, rhs in
+                lhs.displayLabel.localizedCaseInsensitiveCompare(rhs.displayLabel)
+                    == .orderedAscending
+            }
+        reloadPendingOutboxCount()
+    }
+
+    private func reloadPendingOutboxCount() {
+        let store = AgentChannelMessageStore.shared
+        guard (try? store.openIfNeeded()) != nil else {
+            pendingOutboxCount = 0
+            return
+        }
+        let pending = (try? store.outboundIntentCount(status: .pending)) ?? 0
+        let unknown = (try? store.outboundIntentCount(status: .deliveryUnknown)) ?? 0
+        pendingOutboxCount = pending + unknown
+    }
+
+    /// Settings-search landing targets that live on a secondary page need the
+    /// page switched before the anchor can scroll/glow.
+    private func routeForLandingTarget(_ pending: String?) {
+        guard let pending else { return }
+        if pending == "agentChannels.outbox", page != .outbox {
+            page = .outbox
+        } else if pending == "agentChannels.destinations", page != .connections {
+            page = .connections
+        }
     }
 
     private func reloadWriteGate() {
@@ -727,7 +876,7 @@ struct AgentChannelConnectionCenterView: View {
             globalWritesEnabled = previousEnabled
             reloadWriteGate()
             _ = ToastManager.shared.error(
-                L("Couldn't update channel writes"),
+                L("Couldn't update the Sending switch"),
                 message: error.localizedDescription
             )
         }
@@ -742,6 +891,7 @@ struct AgentChannelConnectionCenterView: View {
             AgentChannelConnection.nativeDiscordConnectionId,
             AgentChannelConnection.nativeSlackConnectionId,
             AgentChannelConnection.nativeTelegramConnectionId,
+            AgentChannelConnection.nativeIMessageConnectionId,
         ]
         for connection in connections where !options.contains(connection.id) {
             options.append(connection.id)
@@ -757,6 +907,8 @@ struct AgentChannelConnectionCenterView: View {
             return AgentChannelKind.slack.displayName
         case AgentChannelConnection.nativeTelegramConnectionId:
             return AgentChannelKind.telegram.displayName
+        case AgentChannelConnection.nativeIMessageConnectionId:
+            return AgentChannelKind.imessage.displayName
         default:
             if let match = connections.first(where: { $0.id == connectionId }), !match.name.isEmpty {
                 return match.name

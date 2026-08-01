@@ -143,13 +143,11 @@ remove without losing quality":
    a model run.
 3. **Combine** — survivors merge into combination candidates
    (`combo-sections`, `combo-tools`, `combo-all`) plus the named
-   architecture candidates: `arch-hot-set` (immutable hot tool set,
-   everything else defers to discovery), `arch-lean-guidance` (always-on
-   guidance prose dropped), `arch-manifest-replacement` (prompt manifest
-   replaced by the exact paginated `capabilities_discover
-   {"list": "enabled"}` mode), and `arch-compact-loaded-results`
-   (compacted `capabilities_load` results — a cumulative-token axis, so it
-   is exempt from the surface-savings floor).
+   architecture candidates such as `arch-hot-set`, `arch-lean-guidance`,
+   `arch-five-tool-only`, `arch-no-lifecycle`, `arch-no-gateway`, and
+   `arch-single-gateway`. Zero-surface candidates are no longer scheduled
+   automatically; legacy discovery/load profiles remain available for
+   explicit compatibility runs.
    Architecture and combo candidates always earn a model run;
    `--max-candidates` caps how many single-axis candidates join them
    (largest surface savers first).
@@ -310,8 +308,9 @@ make evals-pr-report-baseline \
   FRONTIER_MODEL=openai/gpt-4o-mini
 ```
 
-The default report runs `AgentLoop` and `AgentLoopFrontier` for both the local
-and frontier lanes. It writes `build/evals/pr-report/<timestamp>/` unless
+The default report runs `AgentLoop`, `AgentLoopFrontier`, and `Subagent` for
+both the local and frontier lanes. It writes
+`build/evals/pr-report/<timestamp>/` unless
 `EVALS_PR_REPORT_OUT` or `--out-dir` is set:
 
 - `manifest.json` — commit, branch, date, runner version, suites, models,
@@ -416,8 +415,9 @@ swift run --package-path Packages/OsaurusEvals osaurus-evals agent-loop-lab \
   --out-dir build/evals/lab-smoke
 ```
 
-The default run selection is `Suites/AgentLoop` plus `Suites/AgentLoopFrontier`.
-Pass `--suite <dir>` repeatedly to narrow or expand it. Artifacts land under
+The default run selection is `Suites/AgentLoop`, `Suites/AgentLoopFrontier`,
+and `Suites/Subagent`. Pass `--suite <dir>` repeatedly to narrow or expand it.
+Artifacts land under
 `build/evals/agent-loop-regression-lab/<timestamp>/` unless `--out-dir` is set:
 
 - `reports/<Suite>.json` — raw `EvalReport` output for each suite run.
@@ -638,6 +638,19 @@ The non-LLM domains are pure-data and run in single-digit ms each — safe to ke
 
 A case with empty `expect: {}` is a valid smoke test — it records what the runner observed without scoring. Useful while bootstrapping.
 
+### `tool_result_grounding` domain
+
+This model-free lane scores a frozen ordered transcript. In addition to
+per-result grounding assertions, cases can pin an exact `expectedToolSequence`,
+require one assistant final with `requireSingleFinalAssistant`, require that
+final to follow every result and remain the last event, and require a later
+tool call to follow a named result via `callMustFollowResultOf`. A `spawnBatch`
+assertion reuses the typed AgentLoop aggregate parser/scorer, so committed
+fixtures can check exact job IDs and UUID targets, settled child rows, reported
+counts, aggregate status, execution waves, and cache diagnostics without a
+model call. These fixtures prove transcript/scorer contracts; they do not
+replace a live AgentLoop or app-UI run.
+
 ### `capability_search` domain
 
 Index-only recall measurements over the tools / methods / skills lanes. No LLM, fast (~10 ms/case), deterministic. Drives `CapabilitySearchEvaluator.evaluate` and pins recall + abstain behaviour against `expect.capabilitySearch`. The CLI initializes only the selected index lanes for this domain and does not load installed native plugins by default; pass `--bootstrap-plugins` when you intentionally want local plugin tools included.
@@ -777,6 +790,12 @@ The runner seeds a fresh temp workspace from `fixtures.workspaceFiles`, drives `
 Field notes:
 
 - `fixtures.workspaceFiles` — `{ path, contents }` entries written into the per-case temp workspace (intermediate directories created). `path` is workspace-relative.
+- `fixtures.runtimeConcurrency` — optional, `agent_loop`-only process-local
+  mirror of Server → Concurrency (`continuousBatching`,
+  `maxConcurrentSequences`). The runner applies it before parent/worker
+  generation and restores the prior runtime snapshot on every exit; it never
+  writes the contributor's saved settings. Use it when a batching assertion
+  must prove exact effective slots instead of inheriting host state.
 - `expect.agentLoop.files` — `{ path, exists?, contains?, equals? }` assertions on the workspace after the loop ends. `exists` defaults to true; set `false` to pin that a file was NOT created.
 - `expect.agentLoop.commands` — `{ command, expectExitCode }` verification commands run in the workspace after the loop ends (e.g. `grep`, a test runner).
 - `expect.agentLoop.mustCallTools` / `mustNotCallTools` / `maxToolCalls` — deterministic transcript assertions. `maxToolCalls` counts processed calls (executed + deduped) and pins navigation discipline.
@@ -790,6 +809,14 @@ Field notes:
 - `expect.agentLoop.contextWindowOverride` — build the loop's budget manager against this window instead of the model's real one. The compaction-stress lever: long tool outputs on a tight override force the sticky-watermark trimming path mid-run. Size it so the protected tail still fits the history budget — an override that can't even fit the tail ends the run with the `overBudget` exit before compaction fires (which is its own case).
 - `expect.agentLoop.stopOnToolRejection` — loop policy: `true` runs the chat surface's policy (first error envelope ends the run with `toolRejected`); default `false` keeps the headless policy (the model gets the error and keeps looping). Lets cases pin BOTH behaviours.
 - `expect.agentLoop.todoUpdatedBeforeComplete` — todo discipline: some `todo` call with at least one checked (`[x]`) box must appear before the first `complete` call (or before the run ends). A single list creation with all boxes unchecked does not pass.
+- `expect.agentLoop.todoCompletedBeforeFinal` — stronger opt-in Todo outcome: the last successful parseable checklist before `complete`/run end must be non-empty and fully checked. This does **not** change runtime termination; Todo remains advisory so an incomplete list cannot reopen a final response.
+- `expect.agentLoop.enableThinking` — optional explicit mirror of the chat model dropdown's Thinking choice, copied to every model step. Omit it to exercise the production unspecified-agent default; use `true`/`false` only when the row intentionally tests that visible user choice.
+- `expect.agentLoop.spawnBatch` — structured `spawn_batch` proof over ordered
+  job ids, nested child truth, aggregate counts/status, configured
+  `max_parallel`, execution waves (`effectiveLocalSlots`, `localSubwaves`,
+  limiting factors), and cache availability. A configured parallel ceiling is
+  not concurrency proof by itself; pin an execution wave such as
+  `{ "effectiveLocalSlots": 2, "localSubwaves": [2] }`.
 - `expect.agentLoop.finalTextContains` / `rubric` — cheap substring checks vs. LLM-judge grading of the final answer (same `JUDGE_MODEL` override as `capability_claims`).
 - `expect.agentLoop.scoredMaxPromptTokens` / `scoredMaxTotalTokens` — optional context-cost ceilings for the "saving context" lane. `scoredMaxPromptTokens` **fails the case** when `promptTokensTotal` (input summed across steps, including the frozen tool schema) exceeds the budget, so a later prompt/tool regression that re-bloats context can't pass while silently burning tokens; `scoredMaxTotalTokens` gates input + output. Both are omitted by default (reported via telemetry, not scored), and only bite a live model — scripted/deterministic runs spend `0`.
 
@@ -813,6 +840,32 @@ scripts/evals/agent-loop-regression-lab.sh \
   --suite Packages/OsaurusEvals/Suites/AgentLoopFrontier \
   --model <prefix>/<model-id>
 ```
+
+### `cache_proof` domain
+
+`cache_proof` drives the real local chat stream and scores typed vMLX
+prefill-progress events plus runtime cache counters. The structured gates are
+tier-neutral: they work when paged RAM is off and disk L2 is the only prefix
+tier, while topology-specific raw RAM/SSM counters remain available for cases
+that explicitly target those tiers.
+
+- `systemPromptsPerSession` must contain one prompt per configured session and
+  enables short-prefix → extended-prefix → longest-match three-chat proofs.
+- `minStructuredCacheRestoreTurns` counts post-first turns with a nonzero typed
+  restore event; it does not infer reuse from aggregate counters or UI color.
+- `requirePrefillProgressAccounting` requires a stable prompt total, bounded and
+  monotonic completed counts, restore-to-prefill continuity, and a terminal
+  `complete == total` frame on every turn.
+- `requireFinalDiskCacheRestore` pins the final turn to the SSD tier.
+- `requireNoCacheRestoreOnTurns` pins incompatible prompt/config revisions to
+  zero restored tokens instead of accepting a stale checkpoint.
+- `requireDiskCacheRestoreOnTurns` and
+  `requirePartialCacheRestoreOnTurns` identify the exact turns that must
+  restore the newest compatible SSD state and still prefill their divergent
+  tail.
+- `minFinalRestoreGainTokens` compares the final two typed restore counts so a
+  test can prove the runtime chose a newly stored longer valid prefix instead
+  of repeatedly restoring an older shorter candidate.
 
 ### `computer_use_loop` domain
 

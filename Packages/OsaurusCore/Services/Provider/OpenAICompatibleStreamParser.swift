@@ -522,7 +522,33 @@ struct OpenAICompatibleStreamParser {
     ) throws -> RemoteProviderService.StreamEventOutcome {
         switch options.decodeMode {
         case .strict:
-            let chunk = try state.decoder.decode(ChatCompletionChunk.self, from: jsonData)
+            let chunk: ChatCompletionChunk
+            do {
+                chunk = try state.decoder.decode(ChatCompletionChunk.self, from: jsonData)
+            } catch {
+                // Mostly-compatible providers (DeepSeek among them) emit
+                // occasional frames that miss a strict-envelope field
+                // (`object`, `id`, `created`, `choices[].index`). Those frames
+                // can carry tool-argument deltas, so dropping them corrupts
+                // the accumulated call and failing on them kills the turn.
+                // Re-read well-formed JSON with the lenient schema; only
+                // genuinely corrupt payloads (real truncation) propagate the
+                // decode error.
+                guard
+                    let lenient = try? state.decoder.decode(
+                        LenientChatCompletionChunk.self,
+                        from: jsonData
+                    ),
+                    lenient.hasMeaningfulPayload
+                else { throw error }
+                return processLenientChunk(
+                    lenient,
+                    options: options,
+                    isStrictFallback: true,
+                    state: &state,
+                    yield: yield
+                )
+            }
             // OpenAI emits usage on a dedicated final chunk (empty `choices`)
             // when `stream_options.include_usage` was set; on every other chunk
             // `usage` is null. Capture whatever is present — surfaced at the
@@ -538,25 +564,50 @@ struct OpenAICompatibleStreamParser {
             )
         case .lenient:
             let chunk = try state.decoder.decode(LenientChatCompletionChunk.self, from: jsonData)
-            state.captureProviderUsage(chunk.usage)
-            let choice = chunk.choices?.first
-            if let message = choice?.message {
-                return processMessageCompletion(
-                    message,
-                    finishReason: choice?.finish_reason,
+            return processLenientChunk(chunk, options: options, state: &state, yield: yield)
+        }
+    }
+
+    private static func processLenientChunk(
+        _ chunk: LenientChatCompletionChunk,
+        options: Options,
+        isStrictFallback: Bool = false,
+        state: inout RemoteProviderService.StreamingState,
+        yield: (String) -> Void
+    ) -> RemoteProviderService.StreamEventOutcome {
+        state.captureProviderUsage(chunk.usage)
+        let choice = chunk.choices?.first
+        if let message = choice?.message {
+            // A strict streaming provider may use `message` instead of
+            // `delta` on an intermediate compatibility frame. Missing
+            // `finish_reason` is not a completion signal in that stream:
+            // consume the payload and wait for the provider's real terminal
+            // marker. Keep the long-standing lenient full-body behavior for
+            // router-compatible non-stream responses.
+            if isStrictFallback, choice?.finish_reason == nil {
+                return processChoice(
+                    delta: message,
+                    finishReason: nil,
                     deferToolCallDispatchUntilUsage: options.deferToolCallDispatchUntilUsage,
                     state: &state,
                     yield: yield
                 )
             }
-            return processChoice(
-                delta: choice?.delta,
+            return processMessageCompletion(
+                message,
                 finishReason: choice?.finish_reason,
                 deferToolCallDispatchUntilUsage: options.deferToolCallDispatchUntilUsage,
                 state: &state,
                 yield: yield
             )
         }
+        return processChoice(
+            delta: choice?.delta,
+            finishReason: choice?.finish_reason,
+            deferToolCallDispatchUntilUsage: options.deferToolCallDispatchUntilUsage,
+            state: &state,
+            yield: yield
+        )
     }
 
     private static func processMessageCompletion(
@@ -723,11 +774,43 @@ struct OpenAICompatibleStreamParser {
         let choices: [Choice]?
         let usage: Usage?
 
+        var hasMeaningfulPayload: Bool {
+            if usage != nil { return true }
+            return choices?.contains { $0.hasMeaningfulPayload } == true
+        }
+
         struct Choice: Decodable {
             let index: Int?
             let delta: DeltaContent?
             let message: DeltaContent?
             let finish_reason: String?
+
+            var hasMeaningfulPayload: Bool {
+                if let finishReason = finish_reason, !finishReason.isEmpty {
+                    return true
+                }
+                return Self.hasMeaningfulPayload(delta)
+                    || Self.hasMeaningfulPayload(message)
+            }
+
+            private static func hasMeaningfulPayload(_ content: DeltaContent?) -> Bool {
+                guard let content else { return false }
+                if content.role?.isEmpty == false
+                    || content.content?.isEmpty == false
+                    || content.refusal?.isEmpty == false
+                    || content.reasoning_content?.isEmpty == false
+                {
+                    return true
+                }
+                return content.tool_calls?.contains { call in
+                    if let id = call.id, !id.isEmpty { return true }
+                    if let name = call.function?.name, !name.isEmpty { return true }
+                    if let arguments = call.function?.arguments, !arguments.isEmpty {
+                        return true
+                    }
+                    return false
+                } == true
+            }
         }
     }
 }

@@ -894,6 +894,11 @@ private enum DetailTab: String, CaseIterable {
     /// action. Visible for every agent; the content gates itself to agents
     /// that actually have a shareable identity (`agentAddress`).
     case connections
+    /// This agent's channel messaging surface: a read-only summary of
+    /// where it replies to incoming messages (reply routing is configured
+    /// per channel, in Settings → Channels) plus the destinations where it
+    /// may start new messages of its own.
+    case channels
     case sandbox
     case automation
     case memory
@@ -932,6 +937,7 @@ private enum DetailTab: String, CaseIterable {
         case .customization: return L("Appearance")
         case .network: return L("Network")
         case .connections: return L("Remote Connections")
+        case .channels: return L("Channels")
         case .sandbox: return L("Sandbox")
         case .automation: return L("Automation")
         case .memory: return L("Memory")
@@ -948,6 +954,7 @@ private enum DetailTab: String, CaseIterable {
         case .customization: return "paintpalette.fill"
         case .network: return "network"
         case .connections: return "person.2.badge.key"
+        case .channels: return "bubble.left.and.bubble.right"
         case .sandbox: return "shippingbox"
         case .automation: return "clock.badge.checkmark"
         case .memory: return "brain.head.profile"
@@ -972,6 +979,10 @@ private enum DetailTab: String, CaseIterable {
         case .network: return L("Bonjour discovery and relay tunnel.")
         case .connections:
             return L("Peers granted access to this agent — usage and revocation.")
+        case .channels:
+            return L(
+                "Where this agent replies on Discord, Slack, Telegram, and iMessage — and where it may start messages of its own."
+            )
         case .sandbox: return L("Sandboxed code execution.")
         case .automation: return L("Schedules and file watchers for autonomous behavior.")
         case .memory: return L("Conversation history, pinned facts, and episode summaries.")
@@ -1022,7 +1033,7 @@ private enum DetailTabGroup: String, CaseIterable {
         switch self {
         case .general: return [.configure, .customization]
         case .abilities: return [.abilities, .capabilities, .subagents, .sandbox]
-        case .connections: return [.network, .connections]
+        case .connections: return [.network, .connections, .channels]
         case .automation: return [.automation]
         case .knowledge: return [.memory, .database]
         }
@@ -1159,9 +1170,9 @@ struct AgentDetailView: View {
     private var imageEnabled: Bool { subagentToggles[.image] ?? false }
     private var appleScriptEnabled: Bool { subagentToggles[.appleScript] ?? false }
     /// Per-agent `spawn_agent` allow-list (which agents this agent may spawn).
-    /// Mirrored from / into `AgentSettings.spawnableAgentNames`; empty hides the
+    /// Mirrored from / into `AgentSettings.spawnableAgentIDs`; empty hides the
     /// `spawn_agent` tool.
-    @State private var spawnableAgentNames: [String] = []
+    @State private var spawnableAgentIDs: [UUID] = []
     /// Per-agent `spawn_model` allow-list (raw model ids this agent may spawn).
     /// Mirrored from / into `AgentSettings.spawnableModelNames`; empty hides the
     /// `spawn_model` tool.
@@ -1169,16 +1180,6 @@ struct AgentDetailView: View {
     /// Per-agent "when/how to use" notes keyed by spawnable model id. Mirrored
     /// from / into `AgentSettings.spawnableModelNotes`; pruned to the pool on save.
     @State private var spawnableModelNotes: [String: String] = [:]
-    /// Drives the "Add agent" / "Add model" multi-select popovers in the spawn
-    /// config panel (UI-only; the selections persist immediately on toggle).
-    @State private var spawnAgentPickerPresented = false
-    @State private var spawnModelPickerPresented = false
-    @State private var spawnAgentSearch = ""
-    @State private var spawnModelSearch = ""
-    /// Whether the Spawn card's "Limits" budget steppers are expanded. Collapsed
-    /// by default — the normalized defaults are sensible, so these are power-user
-    /// knobs tucked behind a disclosure (a one-line summary shows when closed).
-    @State private var spawnLimitsExpanded = false
     /// Per-agent autonomy ceiling for Computer Use (PR2). `nil` means no
     /// ceiling. Mirrored from / into `AgentSettings.computerUseCeiling`.
     @State private var computerUseCeiling: AutonomyCeiling? = nil
@@ -1203,6 +1204,12 @@ struct AgentDetailView: View {
     /// Per-agent delegation permissions (spawn / image) + spawn budgets. Mirrored
     /// from / into `AgentSettings`.
     @State private var subagentPermissions: SubagentPermissionDefaults = SubagentPermissionDefaults()
+    /// Permission snapshot loaded into this editor. Live approval prompts can
+    /// update AgentManager while the view remains open; save performs a
+    /// three-way merge against this baseline so unrelated edits do not restore
+    /// stale permission values.
+    @State private var loadedSubagentPermissions: SubagentPermissionDefaults =
+        SubagentPermissionDefaults()
     @State private var subagentBudgets: SubagentBudgets = SubagentBudgets()
     @State private var spawnToolAccess: SpawnToolAccess = .none
     /// Per-agent subagent model overrides keyed by capability id (computer_use /
@@ -1210,10 +1217,49 @@ struct AgentDetailView: View {
     /// Mirrored from / into `AgentSettings.subagentModelOverrides`.
     @State private var subagentModelOverrides: [String: String] = [:]
     /// Read-only snapshot of the global `SubagentConfiguration`, loaded in
-    /// `loadAgentData`. Used only by `spawnHandoffDisabledWarning` to surface the
-    /// Local Orchestrator Handoff state while configuring an agent's spawn pool;
-    /// the handoff toggle itself lives in Settings → Subagents.
+    /// `loadAgentData`. The shared Spawn editor uses it to surface the Local
+    /// Orchestrator Handoff state while configuring an agent's spawn pool; the
+    /// handoff toggle itself lives in Settings → Subagents.
     @State private var globalSubagentConfig: SubagentConfiguration = .default
+
+    /// Custom agents keep their own token / turn / tool / elapsed budgets, but
+    /// parallel fan-out is one shared Server + Spawn setting. The binding makes
+    /// the shared value visible immediately and routes an explicit agent-editor
+    /// change through the live Server controller before the debounced agent save.
+    private var sharedSpawnBudgetsBinding: Binding<SubagentBudgets> {
+        Binding(
+            get: {
+                SpawnBatchConcurrencyContract.applyingSharedLimit(
+                    from: globalSubagentConfig,
+                    to: subagentBudgets
+                )
+            },
+            set: { newValue in
+                let normalized = newValue.normalized
+                let requested = normalized.maxParallelSpawns
+                subagentBudgets = normalized
+
+                let live = SubagentConfigurationStore.snapshot()
+                guard
+                    SpawnBatchConcurrencyContract.configuredLimit(for: live)
+                        != requested
+                else {
+                    if globalSubagentConfig != live {
+                        globalSubagentConfig = live
+                    }
+                    return
+                }
+
+                let saved = SubagentConfigurationStore.mutate { configuration in
+                    configuration.budgets.maxParallelSpawns = requested
+                }
+                globalSubagentConfig = saved
+                Task { @MainActor in
+                    await ServerController.applyAgentSpawnBatchLimit(requested)
+                }
+            }
+        )
+    }
     /// Display mirror of `Agent.hostWorkspacePath`. Drives the Host Files row
     /// so the selected folder updates immediately after the user picks/clears
     /// it (the persisted bookmark on `Agent.hostWorkspaceBookmark` is the real
@@ -1512,6 +1558,24 @@ struct AgentDetailView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .watchersChanged)) { _ in
             refreshDetailCaches()
+        }
+        // The Spawn editor reads Local Orchestrator Handoff from the shared
+        // global store. Keep an already-open custom agent in sync when the
+        // setting changes elsewhere, matching ConfigurationView's
+        // notification-driven refresh instead of requiring the user to close
+        // and reopen this detail view.
+        .onReceive(
+            NotificationCenter.default.publisher(for: .subagentConfigurationChanged)
+        ) { _ in
+            let latest = SubagentConfigurationStore.snapshot()
+            if latest != globalSubagentConfig { globalSubagentConfig = latest }
+            let synchronized = SpawnBatchConcurrencyContract.applyingSharedLimit(
+                from: latest,
+                to: subagentBudgets
+            )
+            if synchronized != subagentBudgets {
+                subagentBudgets = synchronized
+            }
         }
         .onChange(of: selfSchedulingEnabled) { _, newValue in
             // The master Self-scheduling switch owns the on/off state, so the
@@ -1874,7 +1938,7 @@ struct AgentDetailView: View {
         case .builtIn(let dt):
             switch dt {
             case .configure, .abilities, .capabilities, .subagents, .customization, .network,
-                .connections, .sandbox, .database:
+                .connections, .channels, .sandbox, .database:
                 return nil
             case .automation:
                 let count = linkedSchedules.count + linkedWatchers.count
@@ -2025,6 +2089,8 @@ struct AgentDetailView: View {
             networkTabContent
         case .builtIn(.connections):
             connectionsTabContent
+        case .builtIn(.channels):
+            channelsTabContent
         case .builtIn(.sandbox):
             sandboxTabContent
         case .builtIn(.automation):
@@ -2489,6 +2555,47 @@ struct AgentDetailView: View {
         tabHelperText(DetailTab.automation.helperText)
         schedulesSection
         watchersSection
+    }
+
+    /// The agent's channel messaging surface (Connections → Channels):
+    /// where it replies to incoming messages and where it may start new
+    /// messages. Both mirror the global Channels pane (same store, same
+    /// editor), scoped to this one agent.
+    @ViewBuilder
+    private var channelsTabContent: some View {
+        tabHelperText(DetailTab.channels.helperText)
+        channelRepliesSection
+        channelNewMessagesSection
+    }
+
+    /// Read-only summary of where this agent answers incoming messages.
+    /// Reply routing is configured per channel (Settings → Channels), so
+    /// this section reports the current state and links there.
+    private var channelRepliesSection: some View {
+        AgentDetailSection(
+            title: L("Replies"),
+            icon: "arrowshape.turn.up.left",
+            subtitle: L(
+                "Channels where this agent answers incoming messages. Configured on each connected channel, in Channels settings."
+            )
+        ) {
+            AgentChannelAgentRepliesSection(agentId: agent.id)
+        }
+    }
+
+    /// This agent's proactive destinations — automatic ones derived from
+    /// the channel setup plus any customized ones. The Channels pane shows
+    /// the same rows across all agents (same store, same editor).
+    private var channelNewMessagesSection: some View {
+        AgentDetailSection(
+            title: L("Messages It Can Start"),
+            icon: "paperplane",
+            subtitle: L(
+                "Where this agent may bring things up on its own — it asks you first unless you change a destination's setting."
+            )
+        ) {
+            AgentChannelAgentDestinationsSection(agentId: agent.id)
+        }
     }
 
     @ViewBuilder
@@ -3627,7 +3734,7 @@ struct AgentDetailView: View {
                                 // the kind-specific config follows it.
                                 if let capability = SubagentCapabilityRegistry.capability(
                                     forPerAgentFlag: feature.flag
-                                ), capability.supportsModelOverride {
+                                ), capability.supportsModelOverride, feature.flag != .spawn {
                                     subagentModelOverrideRow(capability)
                                     subagentPanelDivider
                                 }
@@ -3704,37 +3811,6 @@ struct AgentDetailView: View {
             .fixedSize(horizontal: false, vertical: true)
     }
 
-    /// Surfaced inside the Spawn config when the global Local Orchestrator
-    /// Handoff is OFF. That handoff is a reject-before-evict gate: spawning a
-    /// LOCAL target whose model differs from the resident chat model is refused
-    /// (only remote targets and the already-loaded model run). Showing it here
-    /// means the limit is visible while configuring targets, not just as a
-    /// runtime error. Reads the global store snapshot (`globalSubagentConfig`)
-    /// loaded for every agent; the toggle itself lives in Settings → Subagents.
-    @ViewBuilder
-    private var spawnHandoffDisabledWarning: some View {
-        if !globalSubagentConfig.localTextDelegationEnabled {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11))
-                    .foregroundColor(theme.warningColor)
-                Text(
-                    "Local Orchestrator Handoff is off (Settings → Subagents). Spawning a local agent or model whose model differs from the current chat model will be refused — only remote targets and the loaded model run.",
-                    bundle: .module
-                )
-                .font(.system(size: 11))
-                .foregroundColor(theme.secondaryText)
-                .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(theme.warningColor.opacity(0.12))
-            )
-        }
-    }
-
     /// Leading label (plus an optional one-line description) and a trailing
     /// control — the shared layout for every borderless row inside a
     /// `subagentConfigPanel` (permission, budget, model, autonomy ceiling).
@@ -3795,22 +3871,22 @@ struct AgentDetailView: View {
                 "Requires Accessibility permission. Grant it and review status in Settings > Computer Use."
             )
         case .spawn:
-            // The model-override row is rendered generically above (registry
-            // `supportsModelOverride`). Two allow-lists drive the two spawn tools:
-            // agents (`spawn_agent`) and bare models (`spawn_model`).
-            spawnHandoffDisabledWarning
-            spawnableAgentsPicker
-            subagentPanelDivider
-            spawnableModelsPicker
-            subagentPanelDivider
-            subagentPermissionRow(
-                for: SubagentCapabilityRegistry.spawn.id,
-                label: "Permission"
+            // This shared editor is also used for the built-in main chat's
+            // Settings surface. Keeping the controls in one component prevents
+            // its pools, notes, permission, worker tools, and limits from
+            // drifting away from custom-agent behavior.
+            SpawnConfigurationEditor(
+                excludedAgentID: agent.id,
+                localHandoffEnabled: globalSubagentConfig.localTextDelegationEnabled,
+                modelOverride: spawnModelOverrideBinding,
+                spawnableAgentIDs: $spawnableAgentIDs,
+                spawnableModelNames: $spawnableModelNames,
+                spawnableModelNotes: $spawnableModelNotes,
+                permissionDefaults: $subagentPermissions,
+                budgets: sharedSpawnBudgetsBinding,
+                toolAccess: $spawnToolAccess,
+                onChange: debouncedSave
             )
-            subagentPanelDivider
-            spawnToolAccessRow
-            subagentPanelDivider
-            subagentBudgetRows
             subagentFootnote(
                 "Local handoff and RAM-safety for spawn jobs are system settings in Settings → Subagents."
             )
@@ -3984,6 +4060,27 @@ struct AgentDetailView: View {
         )
     }
 
+    /// Optional form of the Spawn model override used by the shared
+    /// `SpawnConfigurationEditor`. The other chat-driven capability rows keep
+    /// the string picker binding above.
+    private var spawnModelOverrideBinding: Binding<String?> {
+        Binding(
+            get: { subagentModelOverrides[SubagentCapabilityRegistry.spawn.id] },
+            set: { newValue in
+                if let value = newValue,
+                    let trimmed = normalizedModelSelection(value)
+                {
+                    subagentModelOverrides[SubagentCapabilityRegistry.spawn.id] = trimmed
+                } else {
+                    subagentModelOverrides.removeValue(
+                        forKey: SubagentCapabilityRegistry.spawn.id
+                    )
+                }
+                debouncedSave()
+            }
+        )
+    }
+
     /// Segmented Ask / Deny / Always permission picker for a delegation kind,
     /// bound per-agent. Borderless — it lives inside `subagentConfigPanel`.
     private func subagentPermissionRow(for kindId: String, label: LocalizedStringKey) -> some View {
@@ -3996,96 +4093,6 @@ struct AgentDetailView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(maxWidth: 240)
-        }
-    }
-
-    /// Token / turn / wall-clock budget steppers for the Spawn card, tucked
-    /// behind a collapsed-by-default "Limits" disclosure (the normalized defaults
-    /// are sensible, so these are power-user knobs). A one-line summary of the
-    /// current budgets shows on the header when collapsed.
-    private var subagentBudgetRows: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    spawnLimitsExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(theme.tertiaryText)
-                        .rotationEffect(.degrees(spawnLimitsExpanded ? 90 : 0))
-                    AgentSheetSectionLabel("Limits")
-                    Spacer(minLength: 8)
-                    if !spawnLimitsExpanded {
-                        Text(spawnLimitsSummary)
-                            .font(.system(size: 11))
-                            .foregroundColor(theme.tertiaryText)
-                            .lineLimit(1)
-                    }
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if spawnLimitsExpanded {
-                VStack(alignment: .leading, spacing: 8) {
-                    subagentBudgetStepper(
-                        title: "Max output tokens per subagent",
-                        value: subagentBudgetBinding(\.maxDelegateTokens),
-                        range: SubagentBudgets.tokenBounds,
-                        step: 256
-                    )
-                    subagentBudgetStepper(
-                        title: "Max turns",
-                        value: subagentBudgetBinding(\.maxDelegateTurns),
-                        range: SubagentBudgets.turnBounds,
-                        step: 1
-                    )
-                    subagentBudgetStepper(
-                        title: "Max seconds",
-                        value: subagentBudgetBinding(\.maxElapsedSeconds),
-                        range: SubagentBudgets.elapsedBounds,
-                        step: 15
-                    )
-                    subagentBudgetStepper(
-                        title: "Max subagents per batch",
-                        value: subagentBudgetBinding(\.maxParallelSpawns),
-                        range: SubagentBudgets.parallelSpawnBounds,
-                        step: 1
-                    )
-                }
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-    }
-
-    /// Compact "tokens · turns · seconds" summary shown on the collapsed Limits
-    /// header so the current budgets are visible at a glance without expanding.
-    private var spawnLimitsSummary: String {
-        let tokens = subagentBudgetBinding(\.maxDelegateTokens).wrappedValue
-        let turns = subagentBudgetBinding(\.maxDelegateTurns).wrappedValue
-        let seconds = subagentBudgetBinding(\.maxElapsedSeconds).wrappedValue
-        let parallel = subagentBudgetBinding(\.maxParallelSpawns).wrappedValue
-        return
-            "\(tokens.formatted()) tok · \(turns) turn\(turns == 1 ? "" : "s") · "
-            + "\(seconds)s · \(parallel) per batch"
-    }
-
-    private func subagentBudgetStepper(
-        title: LocalizedStringKey,
-        value: Binding<Int>,
-        range: ClosedRange<Int>,
-        step: Int
-    ) -> some View {
-        subagentControlRow(title) {
-            Stepper(value: value, in: range, step: step) {
-                Text("\(value.wrappedValue)")
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(theme.primaryText)
-                    .frame(width: 64, alignment: .trailing)
-            }
-            .frame(maxWidth: 180)
         }
     }
 
@@ -4147,49 +4154,11 @@ struct AgentDetailView: View {
         )
     }
 
-    private func subagentBudgetBinding(_ keyPath: WritableKeyPath<SubagentBudgets, Int>) -> Binding<Int> {
-        Binding(
-            get: { subagentBudgets[keyPath: keyPath] },
-            set: {
-                subagentBudgets[keyPath: keyPath] = $0
-                debouncedSave()
-            }
-        )
-    }
-
-    /// Worker tool grant for spawned subagents: text-only (default) or the
-    /// curated read-only file set. What "read-only" reaches is enforced in
-    /// `TextSubagentKind.makeToolset`, not here.
-    private var spawnToolAccessRow: some View {
-        subagentControlRow(
-            "Worker tools",
-            subtitle:
-                "Let spawned workers read files themselves (file_read / file_search) so bulk reading stays out of this agent's context."
-        ) {
-            Picker("", selection: spawnToolAccessSelection) {
-                Text("Text-only", bundle: .module).tag(SpawnToolAccess.none)
-                Text("Read-only files", bundle: .module).tag(SpawnToolAccess.readOnly)
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(maxWidth: 160)
-        }
-    }
-
-    private var spawnToolAccessSelection: Binding<SpawnToolAccess> {
-        Binding(
-            get: { spawnToolAccess },
-            set: {
-                spawnToolAccess = $0
-                debouncedSave()
-            }
-        )
-    }
-
     private func normalizedModelSelection(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+
 
     // MARK: - Spawn allow-lists (agents + models)
 
@@ -4578,6 +4547,8 @@ struct AgentDetailView: View {
             }
         )
     }
+
+
 
     /// Plain toggle-row visual used by the Sandbox tab's execution
     /// permissions and the Appearance tab's greetings switch. The Abilities
@@ -5532,25 +5503,14 @@ struct AgentDetailView: View {
                 updateAutonomousExec(from: execConfig) { $0.backgroundProcessEnabled = backgroundOn }
             }
 
-            featureCard(
-                title: "Read Secret Files",
-                subtitle:
-                    "With a working folder, allow reading .env / keys / credentials. Off by default to keep secrets out of the sandbox.",
-                isOn: execConfig?.allowHostSecretReads ?? false,
-                interactive: interactive
-            ) { allow in
-                updateAutonomousExec(from: execConfig) { $0.allowHostSecretReads = allow }
-            }
-
-            featureCard(
-                title: "Edit Folder Files",
-                subtitle:
-                    "With a working folder, allow creating and editing its files (tracked and undoable in Changes). Off keeps the folder read-only.",
-                isOn: execConfig?.allowHostFolderWrites ?? false,
-                interactive: interactive
-            ) { allow in
-                updateAutonomousExec(from: execConfig) { $0.allowHostFolderWrites = allow }
-            }
+            Text(
+                "Sandbox execution cannot access a selected Mac folder. Disable Sandbox to resume the writable Trusted Folder.",
+                bundle: .module
+            )
+            .font(.system(size: 11))
+            .foregroundColor(theme.tertiaryText)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.leading, 2)
         }
     }
 
@@ -6546,6 +6506,7 @@ struct AgentDetailView: View {
     // MARK: - Data Loading
 
     private func loadAgentData() {
+        let globalSpawnConfiguration = SubagentConfigurationStore.snapshot()
         name = agent.name
         description = agent.description
         systemPrompt = agent.systemPrompt
@@ -6573,7 +6534,7 @@ struct AgentDetailView: View {
         }
         computerUseCeiling = agent.settings.computerUseCeiling
         screenContextEnabled = agent.settings.screenContextEnabled
-        spawnableAgentNames = agent.settings.spawnableAgentNames
+        spawnableAgentIDs = agent.settings.spawnableAgentIDs
         spawnableModelNames = agent.settings.spawnableModelNames
         spawnableModelNotes = agent.settings.spawnableModelNotes
         imageGenerationModelId = agent.settings.imageGenerationModelId
@@ -6581,11 +6542,15 @@ struct AgentDetailView: View {
         appleScriptModelId = agent.settings.appleScriptModelId
         appleScriptExecutionMode = agent.settings.appleScriptExecutionMode
         subagentPermissions = agent.settings.subagentPermissions
-        subagentBudgets = agent.settings.subagentBudgets
+        loadedSubagentPermissions = agent.settings.subagentPermissions
+        subagentBudgets = SpawnBatchConcurrencyContract.applyingSharedLimit(
+            from: globalSpawnConfiguration,
+            to: agent.settings.subagentBudgets
+        )
         subagentModelOverrides = agent.settings.subagentModelOverrides
         spawnToolAccess = agent.settings.spawnToolAccess
         // Snapshot the global subagent config for the spawn-handoff warning.
-        globalSubagentConfig = SubagentConfigurationStore.snapshot()
+        globalSubagentConfig = globalSpawnConfiguration
         hostWorkspacePath = agent.hostWorkspacePath
         generativeGreetingsEnabled = agent.settings.generativeGreetingsEnabled
         // Hydrate the Personality editor with the resolved default
@@ -6615,16 +6580,31 @@ struct AgentDetailView: View {
     }
 
     private func loadMemoryData() {
-        let db = MemoryDatabase.shared
-        if !db.isOpen { try? db.open() }
-        pinnedFacts = (try? db.loadPinnedFacts(agentId: agent.id.uuidString, limit: 200)) ?? []
-        episodes = (try? db.loadEpisodes(agentId: agent.id.uuidString, limit: 100)) ?? []
-        // Counts come from `sessions.turn_count` directly so the row's
-        // "N turns" label is accurate without hydrating each session's
-        // turn array (which only happens on click — the prior root cause
-        // of the persistent "0 turns" display).
-        let agentFilter: UUID? = (agent.id == Agent.defaultId) ? nil : agent.id
-        sessionTurnCounts = ChatHistoryDatabase.shared.turnCounts(forAgent: agentFilter)
+        // Every database call here dispatch-syncs onto the DB's serial queue;
+        // when that queue is busy with background writes the wait has hung
+        // the appear path. Read off the main actor and publish back — same
+        // pattern as `loadAgentSecrets`.
+        let agentId = agent.id
+        Task {
+            let (facts, loadedEpisodes, counts) = await Task.detached(priority: .userInitiated) {
+                let db = MemoryDatabase.shared
+                if !db.isOpen { try? db.open() }
+                let facts = (try? db.loadPinnedFacts(agentId: agentId.uuidString, limit: 200)) ?? []
+                let loadedEpisodes =
+                    (try? db.loadEpisodes(agentId: agentId.uuidString, limit: 100)) ?? []
+                // Counts come from `sessions.turn_count` directly so the row's
+                // "N turns" label is accurate without hydrating each session's
+                // turn array (which only happens on click — the prior root cause
+                // of the persistent "0 turns" display).
+                let agentFilter: UUID? = (agentId == Agent.defaultId) ? nil : agentId
+                let counts = ChatHistoryDatabase.shared.turnCounts(forAgent: agentFilter)
+                return (facts, loadedEpisodes, counts)
+            }.value
+            guard agentId == agent.id else { return }
+            pinnedFacts = facts
+            episodes = loadedEpisodes
+            sessionTurnCounts = counts
+        }
     }
 
     // MARK: - Agent Secrets
@@ -6718,6 +6698,12 @@ struct AgentDetailView: View {
         }()
 
         let current = currentAgent
+        let reconciledSubagentPermissions =
+            SubagentPermissionDefaults.mergingEditorSnapshot(
+                subagentPermissions,
+                loadedBaseline: loadedSubagentPermissions,
+                live: current.settings.subagentPermissions
+            )
         // The tool picker writes `manualToolNames` and
         // `toolSelectionMode` directly via `AgentManager.update*` calls (so they
         // save instantly without going through this debounced path). We therefore
@@ -6797,27 +6783,27 @@ struct AgentDetailView: View {
                 appleScriptEnabled: appleScriptEnabled,
                 appleScriptModelId: appleScriptModelId,
                 appleScriptExecutionMode: appleScriptExecutionMode,
-                // Persist the allow-lists only while spawn is on, so toggling
-                // spawn off doesn't silently retain a stale target list. The
-                // model notes are pruned to the surviving model pool so a removed
-                // model never leaves a dangling note.
-                spawnableAgentNames: spawnDelegationEnabled ? spawnableAgentNames : [],
-                spawnableModelNames: spawnDelegationEnabled
-                    ? SubagentConfiguration.normalizedSpawnableModelNames(spawnableModelNames)
-                    : [],
-                spawnableModelNotes: spawnDelegationEnabled
-                    ? SubagentConfiguration.normalizedSpawnableModelNotes(
-                        spawnableModelNotes,
-                        names: SubagentConfiguration.normalizedSpawnableModelNames(spawnableModelNames)
+                // Persist the configured pools even while Spawn is off. The
+                // capability flag still hides/refuses the tools, while a later
+                // re-enable restores the user's deliberate agents, models, and
+                // routing notes instead of silently destroying them.
+                spawnableAgentIDs: spawnableAgentIDs,
+                spawnableModelNames: SubagentConfiguration.normalizedSpawnableModelNames(
+                    spawnableModelNames
+                ),
+                spawnableModelNotes: SubagentConfiguration.normalizedSpawnableModelNotes(
+                    spawnableModelNotes,
+                    names: SubagentConfiguration.normalizedSpawnableModelNames(
+                        spawnableModelNames
                     )
-                    : [:],
+                ),
                 // Image models / permissions / budgets persist unconditionally —
                 // a stored model id is ignored while the capability is off, so a
                 // toggle round-trip keeps the user's choices (unlike the spawn
                 // allow-list, which gates tool visibility).
                 imageGenerationModelId: imageGenerationModelId,
                 imageEditModelId: imageEditModelId,
-                subagentPermissions: subagentPermissions,
+                subagentPermissions: reconciledSubagentPermissions,
                 subagentBudgets: subagentBudgets,
                 subagentModelOverrides: subagentModelOverrides,
                 // Knowledge grants persist unconditionally (like the image
@@ -6833,6 +6819,11 @@ struct AgentDetailView: View {
         )
 
         agentManager.update(updated)
+        // Advance both editor and baseline to the exact state just persisted.
+        // A later unrelated save can now distinguish new local permission edits
+        // from any future live permission-prompt update.
+        subagentPermissions = reconciledSubagentPermissions
+        loadedSubagentPermissions = reconciledSubagentPermissions
         showSaveIndicator()
     }
 

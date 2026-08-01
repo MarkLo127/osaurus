@@ -6,7 +6,13 @@ let package = Package(
     defaultLocalization: "en",
     platforms: [.macOS(.v15)],
     products: [
-        .library(name: "OsaurusCore", targets: ["OsaurusCore"])
+        .library(name: "OsaurusCore", targets: ["OsaurusCore"]),
+        // Out-of-process native plugin host: loads one plugin dylib via the
+        // frozen C ABI and executes it over stdio JSON-RPC so the app can
+        // kill/restart wedged accessibility/automation plugin code instead
+        // of hanging in-process. See `PluginHost/main.swift` and
+        // `Services/Plugin/PluginProcessHost.swift`.
+        .executable(name: "osaurus-plugin-host", targets: ["osaurus-plugin-host"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.88.0"),
@@ -94,9 +100,32 @@ let package = Package(
         // chat's warm-start checkpoint. vmlx-swift#189 makes the solo
         // TokenIterator path report an accepted disk/paged restore only after
         // path-dependent rollback checks, with exact restored/total counts.
+        // vmlx-swift#190 captures the exact prompt-minus-one SSD seed while the real
+        // prefill crosses it for standalone rotating/SWA cache topologies.
+        // This preserves the existing fail-closed post-hoc rederive guard
+        // while allowing a later compatible turn to restore the longer seed.
+        // vmlx-swift#191 preserves canonical scalar content for Gemma 4
+        // text-only system/developer turns. Real bundle templates otherwise
+        // omit prompt-affecting settings text and can accept an incompatible
+        // SSD checkpoint because distinct revisions tokenize identically.
+        // vmlx-swift#192 adds Nanbeige 4.2's looped-transformer runtime with
+        // 44 loop-layer KV slots and fail-closed runtime-contract validation.
+        // The atomic BatchEngine-capacity revision exposes one actor-consistent
+        // configured/active/pending snapshot so Osaurus can report and plan
+        // subagent waves against the engine that actually owns admission.
+        // vmlx-swift#195 keeps Qwen 3.5 / Ornith GatedDelta recurrent state
+        // in float32 across cold and restored prefix partitions, and admits
+        // linked KV + recurrent disk boundaries under one quota transaction.
+        // vmlx-swift#196 marks caller-proven reusable-prefix warmup prompts
+        // explicitly so solo, batched, and native-MTP cache writers retain
+        // exact boundaries for fully restorable topologies and recurrent-safe
+        // processor seeds for hybrid state, without persisting the warmup's
+        // throwaway decoded token. vmlx-swift#186-#188 correct FalconH1 key
+        // projection scaling, prefixed output-head loading, and gated RMSNorm
+        // group normalization without changing the shared unload/cache APIs.
         .package(
             url: "https://github.com/osaurus-ai/vmlx-swift",
-            revision: "64b6ca2433c12af2dd6955f317366f0f9626e061"
+            revision: "0d838879a7ea102eb6e034f1d33ac0dbb51c02c3"
         ),
         // FluidAudio 0.14.3 added a breaking `language:` parameter to TTS
         // calls that osaurus's `TTSService` doesn't pass. Pinning to the
@@ -264,7 +293,7 @@ let package = Package(
                 .product(name: "Sentry", package: "sentry-cocoa"),
             ],
             path: ".",
-            exclude: ["Tests", "SQLCipher", "ObjCSupport"],
+            exclude: ["Tests", "SQLCipher", "ObjCSupport", "PluginHost"],
             resources: [.process("Resources")],
             swiftSettings: [
                 // `SystemLanguageModel.contextSize` only exists in the macOS 26.4+
@@ -274,11 +303,22 @@ let package = Package(
                 // .define("HAS_FM_CONTEXT_SIZE"),
             ]
         ),
+        // Dependency-free (Foundation-only) helper executable: it must never
+        // link the app graph, so a wedged app subsystem can't wedge the
+        // helper and the binary stays small enough to respawn instantly.
+        .executableTarget(
+            name: "osaurus-plugin-host",
+            path: "PluginHost"
+        ),
         .testTarget(
             name: "OsaurusCoreTests",
             dependencies: [
                 "OsaurusCore",
                 "OsaurusSQLCipher",
+                // Ensures the helper binary is built into the products
+                // directory for every test lane (swift test AND xcodebuild),
+                // so PluginProcessHostTests can spawn the real executable.
+                "osaurus-plugin-host",
                 .product(name: "VMLXJinja", package: "vmlx-swift"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
                 .product(name: "VecturaKit", package: "VecturaKit"),

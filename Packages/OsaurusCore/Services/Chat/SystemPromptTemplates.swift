@@ -64,7 +64,7 @@ public enum SystemPromptTemplates {
         ## Agent loop
 
         - Always answer the user in plain text once the requested work is complete. Todo is advisory progress metadata and never overrides a final response.
-        - `todo(markdown)` — OPTIONAL, multi-step (3+) only: create it before starting, then re-send it only after a task or checkbox actually changes. Never repeat an unchanged checklist. Unchecked items remain visible but do not keep the turn open; if the requested work is complete, answer once and stop. Skip direct/single-step work.
+        - `todo(markdown)` — OPTIONAL, multi-step (3+) only: create it before starting, then re-send it only after a task or checkbox actually changes. Never repeat an unchanged checklist or mark verification done before running it. Before the final answer, if task status changed since the last todo call, re-send the full checklist once with every actually finished item checked through the tool, not as prose. Then answer exactly once and stop; unchecked items remain visible but never keep the turn open. Skip direct/single-step work.
         - `complete(summary)` — OPTIONAL early closure for honestly blocked `todo` work. A fully checked todo needs no complete call: answer the user normally and stop. Invoke complete only as a structured tool call; never type `complete(...)` into the answer.
         - `clarify(question)` — pause and ask exactly one concrete question only when guessing wrong would change the result. For minor preferences pick a sensible default and proceed.
         - `share_artifact(path | content+filename)` — the only way the user sees a generated image, chart, report, code blob, or any file. **The file MUST exist before this call.** Sandbox: save under your home dir (default cwd), not `/tmp`. For inline text/markdown, pass `content`+`filename` and skip the file write.
@@ -87,7 +87,7 @@ public enum SystemPromptTemplates {
         ## Agent loop
 
         - Answer the user in plain text once the requested work is complete. Todo is advisory and never overrides a final response.
-        - `todo(markdown)` — OPTIONAL for 3+ steps: create once and re-send only after an actual task or checkbox change. Never repeat it unchanged. Unchecked items stay visible but do not keep the turn open. Skip direct/single-step work.
+        - `todo(markdown)` — OPTIONAL for 3+ steps: create once and re-send only after an actual task or checkbox change. Never repeat it unchanged or check verification before running it. Before the final answer, send one last tool update if status changed; do not print the checklist as prose. Then answer once and stop. Unchecked items never keep the turn open. Skip direct/single-step work.
         - `complete(summary)` — OPTIONAL early closure for blocked `todo` work. For success, check every box, answer normally, and stop. Invoke it as a tool only; never print `complete(...)` in the answer.
         - `clarify(question)` — last resort; a fully specified task is not ambiguous, just do it. Ask ONE question only when the user asks or a required input is missing/contradictory with no sensible default.
         - `share_artifact(path | content+filename)` — the only way the user sees a file/image; it MUST exist first. Sandbox: save under home, not `/tmp`.
@@ -966,7 +966,8 @@ public enum SystemPromptTemplates {
     /// either spawn tool resolves into the schema. Unlike the static capability
     /// guidance, this enumerates the launching agent's ACTUAL spawnable targets
     /// (resolved into `SpawnAgentDescriptor` / `SpawnModelDescriptor`) so the
-    /// model sees what `spawn_agent` / `spawn_model` can reach — names, locality,
+    /// model sees what `spawn_agent` / `spawn_model` can reach — stable agent
+    /// UUIDs plus display names, locality,
     /// provider, size/quant, vision, the agent description, and the user's
     /// per-model note. Each tool's block is included only when that tool is
     /// available (its pool is non-empty), so the prompt never advertises a spawn
@@ -975,9 +976,19 @@ public enum SystemPromptTemplates {
     public static func spawnGuidance(
         agents: [SpawnAgentDescriptor],
         models: [SpawnModelDescriptor],
+        availableToolNames: Set<String>? = nil,
         toolAccess: SpawnToolAccess = .none,
         maxParallel: Int = 1
     ) -> String {
+        let agentToolAvailable =
+            availableToolNames?.contains(SubagentCapabilityRegistry.spawnAgentToolName)
+            ?? !agents.isEmpty
+        let modelToolAvailable =
+            availableToolNames?.contains(SubagentCapabilityRegistry.spawnModelToolName)
+            ?? !models.isEmpty
+        let batchToolAvailable =
+            availableToolNames?.contains(SubagentCapabilityRegistry.spawnBatchToolName)
+            ?? true
         var lines: [String] = ["## Delegating subtasks (spawn)", ""]
         lines.append(
             "- You can hand a bounded, self-contained subtask to a worker and get back ONLY a "
@@ -992,41 +1003,62 @@ public enum SystemPromptTemplates {
                 + "and the final answer to the user here."
         )
         if !agents.isEmpty {
-            lines.append(
-                "- `spawn_agent(input, agent)` runs the task on a configured agent (its own system "
-                    + "prompt + model). Available agents:"
-            )
+            if agentToolAvailable {
+                lines.append(
+                    "- `spawn_agent(input, agent)` runs the task on a configured agent (its own system "
+                        + "prompt + model). Pass the exact UUID shown first, not the display name. "
+                        + "Available agents:"
+                )
+            } else if batchToolAvailable {
+                lines.append("- Available agent targets for `spawn_batch`:")
+            }
             for agent in agents { lines.append("  - " + agentLine(agent)) }
         }
         if !models.isEmpty {
-            lines.append(
-                "- `spawn_model(input, model)` runs the task on a bare model id, no agent attached. "
-                    + "Available models:"
-            )
+            if modelToolAvailable {
+                lines.append(
+                    "- `spawn_model(input, model)` runs the task on a bare model id, no agent attached. "
+                        + "Available models:"
+                )
+            } else if batchToolAvailable {
+                lines.append("- Available model targets for `spawn_batch`:")
+            }
             for model in models { lines.append("  - " + modelLine(model)) }
         }
-        lines.append(
-            "- `spawn_batch(jobs)` fans out INDEPENDENT work across the same allowed agents/models. "
-                + "Each job needs a unique `id`, `target_type` (`agent` or `model`), exact `target`, "
-                + "and complete `input`. This agent allows at most \(maxParallel) jobs in one batch; "
-                + "at most \(maxParallel) workers run concurrently, and results "
-                + "come back in input order. Use one batch instead of emitting several separate "
-                + "spawn calls when the subtasks do not depend on each other."
-        )
+        if batchToolAvailable {
+            lines.append(
+                "- `spawn_batch(jobs)` fans out INDEPENDENT work across the same allowed agents/models. "
+                    + "Each job needs a unique `id`, `target_type` (`agent` or `model`), exact `target`, "
+                    + "and complete `input`. This agent allows at most \(maxParallel) jobs in one batch; "
+                    + "\(maxParallel) is an upper bound on concurrent workers, while engine occupancy "
+                    + "and RAM safety may queue or split local work. Results "
+                    + "come back in input order. Use one batch instead of emitting several separate "
+                    + "spawn calls when the subtasks do not depend on each other."
+            )
+        }
         switch toolAccess {
         case .readOnly:
             lines.append(
-                "- Workers CAN read files themselves (read-only: file_read / file_search, plus "
-                    + "sandbox reads when available) within a per-run call budget — so you can "
+                "- Target-agent workers receive only their enabled tools whose implementations are "
+                    + "cancellation-audited for spawned execution. Workers also CAN read files "
+                    + "through the added host file_read / file_search tools within a per-run call "
+                    + "budget — so you can "
                     + "delegate \"read these files and report X\" with exact paths in `input` "
-                    + "instead of pasting file contents."
+                    + "instead of pasting file contents. Bare-model workers receive only these "
+                    + "added read-only tools."
             )
         case .none:
             lines.append(
-                "- Workers are text-only (no tools) — paste ALL material the task needs directly "
-                    + "into `input`; the worker cannot read files or fetch anything itself."
+                "- Target-agent workers receive only their enabled tools whose implementations are "
+                    + "cancellation-audited for spawned execution; bare-model workers have no "
+                    + "tools. No extra generic read-only file tools are added, so include any "
+                    + "material not reachable through the configured target agent in `input`."
             )
         }
+        lines.append(
+            "- A direct-chat tool omitted from a worker's schema remains parent-owned. Do not "
+                + "delegate a side effect that the selected worker cannot actually call."
+        )
         lines.append(
             "- `input` must be the COMPLETE task as a self-contained prompt — the worker sees only that, "
                 + "not this conversation. Pick the target whose description or note best fits the task; "
@@ -1040,9 +1072,9 @@ public enum SystemPromptTemplates {
         return lines.joined(separator: "\n")
     }
 
-    /// One `spawn_agent` target line: `` `name` `` — description (meta).
+    /// One `spawn_agent` target line: `` `uuid` — name `` — description (meta).
     private static func agentLine(_ agent: SpawnAgentDescriptor) -> String {
-        var line = "`\(agent.name)`"
+        var line = "`\(agent.id.uuidString)` — \(agent.name)"
         if let description = agent.description, !description.isEmpty {
             line += " — \(description)"
         }
@@ -1494,6 +1526,30 @@ public enum SystemPromptTemplates {
                 """
         }
 
+        return section
+    }
+
+    /// Minimum trusted-workspace contract. Tool schemas carry operation detail;
+    /// this section only establishes cwd, confinement, and user-authored
+    /// project instructions.
+    public static func leanFolderContext(from folder: FolderContext) -> String {
+        var section = """
+            ## Working directory
+            **Path:** \(folder.rootPath.path)
+            Native execution is trusted for this workspace. Writes are confined to this folder and temporary directories. Use relative paths.
+            Use the workspace tools to complete requested work now; do not only describe or promise it.
+            After creating or changing runnable code, run an available syntax/build/test/behavior check before saying it works; a successful file mutation proves only that bytes were saved.
+            To append while preserving a file, call file_write with mode append and put only the new bytes in content.
+            Keep each file_write content under \(WorkspaceToolContract.recommendedWriteChunkCharacters) characters; for larger files use repeated calls with mode append.
+            """
+        if let contextFiles = folder.contextFiles, !contextFiles.isEmpty {
+            section += """
+
+
+                ## Project instructions
+                \(contextFiles)
+                """
+        }
         return section
     }
 

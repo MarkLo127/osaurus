@@ -153,7 +153,7 @@ enum DiscordConnectionServiceError: LocalizedError, Equatable, Sendable {
         case .sendConfirmationRequired:
             return "`confirm_send` must be true before Osaurus posts to Discord."
         case .messageTooLong:
-            return "Discord messages must be 2000 characters or fewer."
+            return "Discord content is too long, even after splitting into multiple messages."
         case .emptyMessage:
             return "Discord message content must not be empty."
         case .configurationSaveFailed(let message):
@@ -226,16 +226,46 @@ final class DiscordConnectionService: @unchecked Sendable {
                 "The token was empty or Keychain storage was unavailable."
             )
         }
+        AgentChannelCredentialAvailability.shared.invalidate(.discord)
         return saved
     }
 
     @discardableResult
     func deleteBotToken() -> Bool {
-        credentialStore.deleteBotToken()
+        defer { AgentChannelCredentialAvailability.shared.invalidate(.discord) }
+        return credentialStore.deleteBotToken()
     }
 
     func hasBotToken() -> Bool {
         credentialStore.hasBotToken()
+    }
+
+    // MARK: - Off-main credential access
+    //
+    // SecItem calls can block for seconds under securityd contention, so UI
+    // flows await these instead of the synchronous accessors above.
+
+    func saveBotTokenOffMain(_ token: String) async throws {
+        let store = credentialStore
+        let saved = await Keychain.perform { store.saveBotToken(token) }
+        AgentChannelCredentialAvailability.shared.invalidate(.discord)
+        if !saved {
+            throw DiscordConnectionServiceError.configurationSaveFailed(
+                "The token was empty or Keychain storage was unavailable."
+            )
+        }
+    }
+
+    @discardableResult
+    func deleteBotTokenOffMain() async -> Bool {
+        let store = credentialStore
+        defer { AgentChannelCredentialAvailability.shared.invalidate(.discord) }
+        return await Keychain.perform { store.deleteBotToken() }
+    }
+
+    func hasBotTokenOffMain() async -> Bool {
+        let store = credentialStore
+        return await Keychain.perform { store.hasBotToken() }
     }
 
     func discoverConfigurationOptions() async throws -> DiscordConnectionDiscovery {
@@ -771,17 +801,31 @@ final class DiscordConnectionService: @unchecked Sendable {
         let config = configuration()
         let normalizedChannelId = try requireWritableChannel(channelId, config: config)
         let trimmedContent = try validateMessageContent(content)
-        let message = try await client.sendMessage(
-            channelId: normalizedChannelId,
-            content: trimmedContent,
-            token: token
-        )
-        recordMessages([message], channelId: normalizedChannelId, direction: .outbound)
-        return [
+        let chunks = AgentChannelMessageFormatter.discordChunks(trimmedContent)
+        guard !chunks.isEmpty else { throw DiscordConnectionServiceError.emptyMessage }
+        guard chunks.count <= AgentChannelMessageFormatter.maxChunksPerSend else {
+            throw DiscordConnectionServiceError.messageTooLong
+        }
+        var messages: [DiscordMessage] = []
+        for chunk in chunks {
+            messages.append(
+                try await client.sendMessage(
+                    channelId: normalizedChannelId,
+                    content: chunk,
+                    token: token
+                )
+            )
+        }
+        recordMessages(messages, channelId: normalizedChannelId, direction: .outbound)
+        var result: [String: Any] = [
             "kind": "discord_message_sent",
             "channel_id": normalizedChannelId,
-            "message": Self.messageDictionary(message),
+            "message": Self.messageDictionary(messages[0]),
         ]
+        if messages.count > 1 {
+            result["chunk_count"] = messages.count
+        }
+        return result
     }
 
     func replyToThread(
@@ -811,10 +855,16 @@ final class DiscordConnectionService: @unchecked Sendable {
         let channelId = try requireWritableChannel(channelId, config: config)
         let messageId = try requireSnowflake(messageId, field: "message_id")
         let content = try validateMessageContent(content)
+        // Edits must stay a single native message: reject content whose
+        // rendered form would need chunking.
+        let chunks = AgentChannelMessageFormatter.discordChunks(content)
+        guard chunks.count == 1, let rendered = chunks.first else {
+            throw DiscordConnectionServiceError.messageTooLong
+        }
         let message = try await client.updateMessage(
             channelId: channelId,
             messageId: messageId,
-            content: content,
+            content: rendered,
             token: token
         )
         recordMessages([message], channelId: channelId, direction: .outbound)
@@ -857,8 +907,7 @@ final class DiscordConnectionService: @unchecked Sendable {
         let config = configuration()
         let channelId = try requireWritableChannel(channelId, config: config)
         let messageId = try requireSnowflake(messageId, field: "message_id")
-        let reaction = reaction.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !reaction.isEmpty, reaction.count <= 100 else {
+        guard let reaction = AgentChannelReactionNormalizer.discordReaction(reaction) else {
             throw DiscordConnectionServiceError.invalidId(field: "reaction")
         }
         if adding {
@@ -942,7 +991,11 @@ final class DiscordConnectionService: @unchecked Sendable {
         guard !trimmed.isEmpty else {
             throw DiscordConnectionServiceError.emptyMessage
         }
-        guard trimmed.utf16.count <= 2000 else {
+        // Long sends are split into up to `maxChunksPerSend` native messages
+        // of 2,000 UTF-16 units each; cap the raw input accordingly.
+        let maxInput = AgentChannelMessageFormatter.discordChunkLimit
+            * AgentChannelMessageFormatter.maxChunksPerSend
+        guard trimmed.utf16.count <= maxInput else {
             throw DiscordConnectionServiceError.messageTooLong
         }
         return trimmed

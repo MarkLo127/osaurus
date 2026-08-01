@@ -59,6 +59,12 @@ app: cli
 	mkdir -p "$(DERIVED)/Build/Products/$(CONFIG)/osaurus.app/Contents/Helpers"
 	cp "$(DERIVED)/Build/Products/$(CONFIG)/osaurus-cli" "$(DERIVED)/Build/Products/$(CONFIG)/osaurus.app/Contents/Helpers/osaurus"
 	chmod +x "$(DERIVED)/Build/Products/$(CONFIG)/osaurus.app/Contents/Helpers/osaurus"
+	@echo "Building plugin host helper (osaurus-plugin-host)…"
+	xcodebuild -workspace $(WORKSPACE) -scheme osaurus-plugin-host -configuration $(CONFIG) -derivedDataPath $(DERIVED) build -quiet $(XCODEBUILD_FLAGS)
+	@echo "Embedding plugin host helper into App Bundle (Helpers)…"
+	# Killable out-of-process native plugin host (see PluginProcessHost.swift).
+	cp "$(DERIVED)/Build/Products/$(CONFIG)/osaurus-plugin-host" "$(DERIVED)/Build/Products/$(CONFIG)/osaurus.app/Contents/Helpers/osaurus-plugin-host"
+	chmod +x "$(DERIVED)/Build/Products/$(CONFIG)/osaurus.app/Contents/Helpers/osaurus-plugin-host"
 	@echo "Bundling sandbox kernel (Resources/SandboxRuntime)…"
 	./scripts/build/fetch_sandbox_kernel.sh "$(DERIVED)/Build/Products/$(CONFIG)/osaurus.app/Contents/Resources/SandboxRuntime"
 
@@ -90,8 +96,9 @@ evals-test:
 	@echo "Running OsaurusEvals harness tests…"
 	OSAURUS_DISABLE_KEYCHAIN_FOR_TESTS=1 swift test --package-path Packages/OsaurusEvals
 
-# Mirrors the CI `test-core` job: same xcodebuild flags, same xcbeautify
-# pipe, same xcresult bundle. Run this locally to repro a failed CI run.
+# Mirrors the CI `test-core` execution policy: one xctest worker, the same
+# timeout allowances, xcbeautify pipe, and xcresult bundle. Run this locally
+# to reproduce a failed CI run without Xcode's parallel-worker starvation.
 # After it finishes (pass or fail) you can `open build/Tests.xcresult` to
 # get the same Test Navigator UI as Xcode.
 ci-test:
@@ -109,9 +116,12 @@ ci-test:
 		-skipPackagePluginValidation \
 		-skipMacroValidation \
 		-enableCodeCoverage NO \
+		-parallel-testing-enabled NO \
+		-parallel-testing-worker-count 1 \
+		-maximum-parallel-testing-workers 1 \
 		-test-timeouts-enabled YES \
-		-default-test-execution-time-allowance 60 \
-		-maximum-test-execution-time-allowance 120 \
+		-default-test-execution-time-allowance 180 \
+		-maximum-test-execution-time-allowance 300 \
 		COMPILER_INDEX_STORE_ENABLE=NO \
 		SWIFT_COMPILATION_MODE=incremental \
 		| xcbeautify --renderer terminal
@@ -389,9 +399,9 @@ evals-compat:
 		$(if $(VALIDATE),--validate,--out reports/COMPATIBILITY.json --markdown reports/COMPATIBILITY.md)
 
 # Review-oriented artifact bundle for PRs that affect agent-loop behavior.
-# Defaults to the required local+frontier lanes and AgentLoop +
-# AgentLoopFrontier suites. SandboxFrontier is opt-in because it needs host
-# sandbox prerequisites.
+# Defaults to the required local+frontier lanes and AgentLoop,
+# AgentLoopFrontier, and Subagent suites. SandboxFrontier is opt-in because it
+# needs host sandbox prerequisites.
 evals-pr-report: evals-prep
 	@mkdir -p "$(EVALS_PR_REPORT_OUT)"
 	swift run --package-path Packages/OsaurusEvals osaurus-evals report \

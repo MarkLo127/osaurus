@@ -60,7 +60,7 @@ display_information:
 features:
   bot_user:
     display_name: osaurus-smoke
-    always_online: false
+    always_online: true
 oauth_config:
   scopes:
     bot:
@@ -101,6 +101,12 @@ Scope notes:
 
 Do not add `chat:write.public` for release proof. Invite the bot to the
 disposable channel instead, so channel membership stays explicit.
+
+Presence note: `features.bot_user.always_online: true` is what shows the bot
+with a green presence dot. Slack has no runtime presence API for bot tokens,
+so this static manifest flag is the only supported mechanism. Existing Slack
+apps created from an older manifest must reapply the updated manifest on the
+App Manifest page for the change to take effect.
 
 Guided setup (matches the numbered steps in Settings -> Channels -> Slack):
 
@@ -258,6 +264,29 @@ the channel is ready for user testing:
 - For multiple workspaces, prove one read and one confirmed write in each and
   verify the action routes to the correct workspace.
 - Restart Osaurus and confirm transport health and configuration persist.
+
+### Proactive posting (outbound destinations)
+
+Proactive posting needs no separate setup. Once a channel has a saved
+credential, write access to at least one room (`writeEnabled` plus a
+write-allowlisted room id), and inbound dispatch enabled, Osaurus derives an
+automatic **Ask first** posting destination for each writable room × answering
+agent. They appear under Settings → Channels → Agent Posting (and per agent
+under Channel Posting) with an "Automatic" badge.
+
+Outbound spot check, after the inbound checklist above passes:
+
+- Confirm the derived destination is listed for the answering agent.
+- Ask the agent in chat to post to the room; approve the queued message from
+  the outbox (Ask first is the default — nothing sends without approval).
+- Confirm the message arrives in the room, and that the outbox row moves to
+  sent.
+- Remove the room from the write allowlist and confirm the destination
+  disappears and any still-queued approval for it is refused.
+
+Auto-send is opt-in per destination and never the derived default; see
+[AGENT_CHANNEL_SECURITY.md](AGENT_CHANNEL_SECURITY.md) for the write gates and
+[AGENT_CHANNELS.md](AGENT_CHANNELS.md) for the full outbound flow.
 
 Webhook setup is advanced/future. When it is used, set a random webhook secret
 token and verify the `X-Telegram-Bot-Api-Secret-Token` header before decoding

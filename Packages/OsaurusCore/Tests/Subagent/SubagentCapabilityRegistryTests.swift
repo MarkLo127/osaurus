@@ -39,7 +39,7 @@ struct SubagentCapabilityRegistryTests {
         agentId: UUID,
         spawn: Bool = false,
         image: Bool = false,
-        targets: [String] = [],
+        targets: [UUID] = [],
         models: [String] = []
     ) -> AgentConfigSnapshot {
         AgentConfigSnapshot(
@@ -54,7 +54,7 @@ struct SubagentCapabilityRegistryTests {
             dbEnabled: false,
             spawnDelegationEnabled: spawn,
             imageEnabled: image,
-            spawnableAgentNames: targets,
+            spawnableAgentIDs: targets,
             spawnableModelNames: models
         )
     }
@@ -62,10 +62,12 @@ struct SubagentCapabilityRegistryTests {
     @Test("the Default agent uses its own pools/image; a custom agent its own per-agent toggles + lists")
     func delegationVisibilitySemantics() {
         let custom = UUID()
+        let helper = UUID()
+        let nested = UUID()
         // There is no master switch: the Default / main chat's own AGENT pool has
         // one agent, its MODEL pool has one model, and its image switch is on.
         let config = SubagentConfiguration(
-            spawnableAgentNames: ["Helper"],
+            spawnableAgentIDs: [helper],
             imageDelegationEnabled: true,
             spawnableModelNames: ["pool-model"]
         )
@@ -88,7 +90,7 @@ struct SubagentCapabilityRegistryTests {
         #expect(
             SubagentToolVisibility.visibleDelegationToolNames(
                 agentId: custom,
-                snapshot: snapshot(agentId: custom, spawn: true, image: false, targets: ["X"]),
+                snapshot: snapshot(agentId: custom, spawn: true, image: false, targets: [nested]),
                 config: config,
                 hasReadyImageModel: true
             ) == ["spawn_agent", "spawn_batch"]
@@ -108,7 +110,7 @@ struct SubagentCapabilityRegistryTests {
         #expect(
             SubagentToolVisibility.visibleDelegationToolNames(
                 agentId: custom,
-                snapshot: snapshot(agentId: custom, spawn: true, targets: ["X"], models: ["m"]),
+                snapshot: snapshot(agentId: custom, spawn: true, targets: [nested], models: ["m"]),
                 config: config,
                 hasReadyImageModel: true
             ) == ["spawn_agent", "spawn_model", "spawn_batch"]
@@ -143,7 +145,7 @@ struct SubagentCapabilityRegistryTests {
         // must withhold `image` so the model is never offered an image
         // capability the runtime can't satisfy; spawn is unaffected.
         let config = SubagentConfiguration(
-            spawnableAgentNames: ["Helper"],
+            spawnableAgentIDs: [UUID()],
             imageDelegationEnabled: true,
             spawnableModelNames: ["pool-model"]
         )
@@ -170,13 +172,16 @@ struct SubagentCapabilityRegistryTests {
 
     @Test("spawn target validation: Default uses its own pool; custom uses its own allow-list")
     func spawnTargetValidation() {
+        let helper = UUID()
+        let coder = UUID()
+        let other = UUID()
         let config = SubagentConfiguration(
-            spawnableAgentNames: ["Helper"]
+            spawnableAgentIDs: [helper]
         )
-        // Default: the global pool decides (case-insensitive).
+        // Default: the global UUID pool decides exactly.
         #expect(
             SubagentToolVisibility.spawnTargetAllowed(
-                "helper",
+                helper,
                 isDefault: true,
                 config: config,
                 perAgentTargets: []
@@ -184,27 +189,27 @@ struct SubagentCapabilityRegistryTests {
         )
         #expect(
             !SubagentToolVisibility.spawnTargetAllowed(
-                "Other",
+                other,
                 isDefault: true,
                 config: config,
-                perAgentTargets: ["Other"]
+                perAgentTargets: [other]
             )
         )
         // Custom: only the agent's OWN list counts, not the global pool.
         #expect(
             SubagentToolVisibility.spawnTargetAllowed(
-                "Coder",
+                coder,
                 isDefault: false,
                 config: config,
-                perAgentTargets: ["Coder"]
+                perAgentTargets: [coder]
             )
         )
         #expect(
             !SubagentToolVisibility.spawnTargetAllowed(
-                "Helper",
+                helper,
                 isDefault: false,
                 config: config,
-                perAgentTargets: ["Coder"]
+                perAgentTargets: [coder]
             )
         )
     }
@@ -530,50 +535,59 @@ struct SubagentCapabilityRegistryTests {
         )
     }
 
-    @Test("effectiveBudgets: Default uses the global budgets; a custom agent its own; both normalized")
+    @Test("effectiveBudgets: every launcher shares parallel fan-out while custom agents keep other budgets")
     func effectiveBudgetsResolves() {
         let config = SubagentConfiguration(
             budgets: SubagentBudgets(
                 maxDelegateTokens: 4096,
                 maxDelegateTurns: 3,
-                maxElapsedSeconds: 240
+                maxElapsedSeconds: 240,
+                maxParallelSpawns: 7
             )
         )
         var custom = AgentSettings.defaultDisabled
         custom.subagentBudgets = SubagentBudgets(
             maxDelegateTokens: 1024,
             maxDelegateTurns: 2,
-            maxElapsedSeconds: 60
+            maxElapsedSeconds: 60,
+            maxParallelSpawns: 2
         )
+        let sharedParallelLimit = 7
 
         // Default / main chat → global budgets.
         let def = SubagentToolVisibility.effectiveBudgets(
             isDefault: true,
             config: config,
-            settings: custom
+            settings: custom,
+            sharedParallelLimit: sharedParallelLimit
         )
         #expect(def.maxDelegateTokens == 4096)
         #expect(def.maxDelegateTurns == 3)
         #expect(def.maxElapsedSeconds == 240)
+        #expect(def.maxParallelSpawns == 7)
 
-        // Custom agent → its own budgets.
+        // Custom agent → its own non-concurrency budgets plus shared fan-out.
         let cus = SubagentToolVisibility.effectiveBudgets(
             isDefault: false,
             config: config,
-            settings: custom
+            settings: custom,
+            sharedParallelLimit: sharedParallelLimit
         )
         #expect(cus.maxDelegateTokens == 1024)
         #expect(cus.maxDelegateTurns == 2)
         #expect(cus.maxElapsedSeconds == 60)
+        #expect(cus.maxParallelSpawns == 7)
 
-        // nil settings (custom) → normalized defaults.
-        #expect(
-            SubagentToolVisibility.effectiveBudgets(
-                isDefault: false,
-                config: config,
-                settings: nil
-            ) == SubagentBudgets().normalized
+        // Missing custom settings still inherit the shared fan-out while the
+        // other fields retain their normalized defaults.
+        let missing = SubagentToolVisibility.effectiveBudgets(
+            isDefault: false,
+            config: config,
+            settings: nil,
+            sharedParallelLimit: sharedParallelLimit
         )
+        #expect(missing.maxDelegateTokens == SubagentBudgets().maxDelegateTokens)
+        #expect(missing.maxParallelSpawns == 7)
     }
 
     // MARK: - BUG E parity guard

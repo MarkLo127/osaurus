@@ -4,6 +4,7 @@
     "AgentChannels" : [
       "agent_channels.external-mcp-denial",
       "agent_channels.no-unapproved-send",
+      "agent_channels.proactive-publish-policy",
       "agent_channels.unauthorized-room-read",
       "agent_channels.unauthorized-sender-denied"
     ],
@@ -15,9 +16,11 @@
       "agentdb.distinct-count",
       "agentdb.execute-sql-script",
       "agentdb.export-csv",
+      "agentdb.import-crlf-csv",
       "agentdb.import-csv-500",
       "agentdb.import-mode-canonical",
       "agentdb.pagination",
+      "agentdb.queryable-saved-view",
       "agentdb.run-saved-view-directly",
       "agentdb.sandbox-import",
       "agentdb.softdelete-restore",
@@ -49,6 +52,7 @@
       "agent_loop.edit-file-then-verify",
       "agent_loop.edit-one-key-preserve-others",
       "agent_loop.final-after-success-with-pending-todo",
+      "agent_loop.html-source-roundtrip",
       "agent_loop.idempotent-already-satisfied",
       "agent_loop.impossible-task-declines",
       "agent_loop.listing-navigation-discipline",
@@ -60,9 +64,13 @@
       "agent_loop.rejection-stops-run",
       "agent_loop.repeated-call-nudge",
       "agent_loop.search-then-multi-file-edit",
+      "agent_loop.spawn-batch-two-configured-workers",
+      "agent_loop.spawn-batch-two-different-local-workers",
+      "agent_loop.substantial-single-file-app",
       "agent_loop.targeted-read-and-report",
       "agent_loop.todo-discipline-multistep",
       "agent_loop.wrap-up-on-budget",
+      "agent_loop.workspace-escape-refused",
       "agent_loop.write-new-file",
       "agent_loop.write-then-verify-with-shell"
     ],
@@ -168,6 +176,7 @@
       "browseruse.stale-ref-recovery"
     ],
     "CacheProof" : [
+      "cache_proof.cross-session-longest-disk-prefix",
       "cache_proof.cross-session-partial-disk-restore",
       "cache_proof.disk-l2-lane-persists",
       "cache_proof.five-turn-footprint-growth",
@@ -176,6 +185,7 @@
       "cache_proof.identical-query-replay",
       "cache_proof.prefix-reuse-second-turn",
       "cache_proof.prefix-reuse-three-turns",
+      "cache_proof.settings-prompt-revision",
       "cache_proof.thinking-toggle-boundary"
     ],
     "CapabilityClaims" : [
@@ -321,6 +331,10 @@
       "judge_calibration.partial-completion",
       "judge_calibration.verbatim-quote"
     ],
+    "LegacyCapabilities" : [
+      "legacy_capabilities.compact-loaded-results-compatible",
+      "prompt_surface.manifest-replacement-saves"
+    ],
     "Memory" : [
       "memory.distractor-not-surfaced",
       "memory.episode-recall",
@@ -371,11 +385,8 @@
     "PromptSurface" : [
       "prompt_surface.baseline-census",
       "prompt_surface.compact-forced",
-      "prompt_surface.defer-tool-strips-schema",
       "prompt_surface.drop-code-style-saves",
-      "prompt_surface.manifest-replacement-saves",
       "prompt_surface.protected-section-refused",
-      "prompt_surface.protected-tool-refused",
       "prompt_surface.unknown-section-refused"
     ],
     "ReasoningChannel" : [
@@ -410,26 +421,20 @@
     "SandboxFrontier" : [
       "sandbox.artifact-from-sandbox",
       "sandbox.background-process",
-      "sandbox.binary-bridge-roundtrip",
-      "sandbox.binary-bridge-stage",
       "sandbox.code-exec-basics",
       "sandbox.exec-discipline",
       "sandbox.fix-failing-tests",
-      "sandbox.host-folder-combined",
-      "sandbox.host-folder-writable",
-      "sandbox.host-secret-refusal",
       "sandbox.install-and-use",
       "sandbox.json-sum-values",
       "sandbox.line-count",
       "sandbox.live-fetch",
-      "sandbox.path-discipline",
       "sandbox.plugin-create-and-call",
       "sandbox.reverse-string",
       "sandbox.secrets-roundtrip",
       "sandbox.sum-range-stdout",
       "sandbox.two-module-import",
-      "sandbox.writable-path-discipline",
-      "sandbox.writable-secret-write-refusal"
+      "sandbox.vm-file-export",
+      "sandbox.vm-host-isolation"
     ],
     "Schema" : [
       "schema.additional-properties-rejected",
@@ -490,12 +495,15 @@
       "subagent.residency-matrix-remote-local",
       "subagent.residency-matrix-remote-remote",
       "subagent.residency-phase-telemetry",
+      "subagent.scripted-batch-one-failure-siblings-settle",
+      "subagent.scripted-batch-user-stop-all-cancelled",
       "subagent.scripted-handoff-and-recursion",
       "subagent.scripted-handoff-passthrough",
       "subagent.scripted-handoff-wraps",
       "subagent.scripted-happy-path",
       "subagent.scripted-interrupt-mid-run",
       "subagent.scripted-invalid-args",
+      "subagent.scripted-mixed-batch-two-local-one-remote",
       "subagent.scripted-multi-phase-feed",
       "subagent.scripted-parallel-batch-exclusive",
       "subagent.scripted-parallel-batch-remote",
@@ -538,6 +546,10 @@
       "tool_result_grounding.pick-right-record-from-list",
       "tool_result_grounding.quote-exact-string-from-result",
       "tool_result_grounding.result-continuation",
+      "tool_result_grounding.spawn-batch-all-cancelled-finalizes-once",
+      "tool_result_grounding.spawn-batch-partial-failure-parent-continuation",
+      "tool_result_grounding.spawn-batch-pending-todo-finalizes-once",
+      "tool_result_grounding.spawn-batch-second-tool-then-final",
       "tool_result_grounding.stale-result-not-cited",
       "tool_result_grounding.unit-preserved-from-result"
     ]
