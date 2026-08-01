@@ -19,7 +19,7 @@ actor ChatEngine: Sendable, ChatEngineProtocol {
     private var inferenceSource: InferenceSource = .httpAPI
 
     init(
-        services: [ModelService] = [FoundationModelService(), MLXService()],
+        services: [ModelService] = [FoundationModelService(), ClaudeCodeService(), MLXService()],
         installedModelsProvider: @escaping @Sendable () -> [String] = {
             MLXService.getAvailableModels()
         },
@@ -256,7 +256,8 @@ actor ChatEngine: Sendable, ChatEngineProtocol {
             warmupPrefill: request.warmupPrefill,
             cacheStableSystemPrefix: request.cacheStableSystemPrefix,
             requestSource: inferenceSource,
-            loadIntent: request.backgroundModelLoad ? .background : .interactive
+            loadIntent: request.backgroundModelLoad ? .background : .interactive,
+            claudeCode: request.claudeCodeOptions
         )
 
         // Mode 2 (remote agent run): route to the *selected agent's provider*,

@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:osaurus}/Packages/OsaurusEvals",
+            "name": "Debug osaurus-evals (Packages/OsaurusEvals)",
+            "target": "osaurus-evals",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug osaurus-evals (Packages/OsaurusEvals)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:osaurus}/Packages/OsaurusEvals",
+            "name": "Release osaurus-evals (Packages/OsaurusEvals)",
+            "target": "osaurus-evals",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release osaurus-evals (Packages/OsaurusEvals)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:osaurus}/Packages/OsaurusCLI",
+            "name": "Debug osaurus-cli (Packages/OsaurusCLI)",
+            "target": "osaurus-cli",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug osaurus-cli (Packages/OsaurusCLI)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:osaurus}/Packages/OsaurusCLI",
+            "name": "Release osaurus-cli (Packages/OsaurusCLI)",
+            "target": "osaurus-cli",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release osaurus-cli (Packages/OsaurusCLI)"
+        }
+    ]
+}

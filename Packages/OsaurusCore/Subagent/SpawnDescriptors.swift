@@ -250,6 +250,11 @@ public enum SpawnDescriptors {
         switch item.source {
         case .remote(let providerName, _):
             return (false, providerName)
+        case .claudeCode:
+            // Not local: the CLI runs on this Mac, but inference happens on
+            // Anthropic's servers, so the locality badge must not claim
+            // on-device.
+            return (false, ModelPickerItem.Source.claudeCode.displayName)
         case .local, .foundation, .imageGeneration:
             return (true, nil)
         }

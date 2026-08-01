@@ -202,6 +202,8 @@ struct ModelPickerView: View {
         switch item.source {
         case .foundation, .local, .imageGeneration:
             return "Local"
+        case .claudeCode:
+            return item.source.displayName
         case .remote(let providerName, _):
             return providerName
         }

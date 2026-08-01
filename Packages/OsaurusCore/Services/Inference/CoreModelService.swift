@@ -74,7 +74,9 @@ public enum CoreModelStatus: Sendable, Equatable {
 public actor CoreModelService {
     public static let shared = CoreModelService()
 
-    private let localServices: [ModelService] = [FoundationModelService(), MLXService.shared]
+    private let localServices: [ModelService] = [
+        FoundationModelService(), ClaudeCodeService(), MLXService.shared,
+    ]
 
     private static let maxRetries = 3
     private static let baseRetryDelayNanoseconds: UInt64 = 1_000_000_000

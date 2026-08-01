@@ -686,6 +686,33 @@ extension AgentManager {
         return agent.autonomousExec
     }
 
+    /// Claude Code backend config for an agent, falling back to the safe
+    /// default (agent mode, read-only tools) when the agent predates the
+    /// setting or doesn't exist.
+    public func effectiveClaudeCodeConfig(for agentId: UUID) -> ClaudeCodeAgentConfig {
+        if agentId == Agent.defaultId {
+            return DefaultAgentConfigurationStore.load().claudeCode ?? .default
+        }
+        return agent(for: agentId)?.claudeCode ?? .default
+    }
+
+    /// Persist the Claude Code backend config for an agent.
+    ///
+    /// Mirrors `updateAutonomousExec`'s split between the Default agent (whose
+    /// settings live in `DefaultAgentConfigurationStore`) and stored agents.
+    public func updateClaudeCodeConfig(_ config: ClaudeCodeAgentConfig, for agentId: UUID) {
+        if agentId == Agent.defaultId {
+            var defaultConfig = DefaultAgentConfigurationStore.load()
+            defaultConfig.claudeCode = config
+            DefaultAgentConfigurationStore.save(defaultConfig)
+            NotificationCenter.default.post(name: .agentUpdated, object: agentId)
+        } else {
+            guard var agent = agent(for: agentId) else { return }
+            agent.claudeCode = config
+            update(agent)
+        }
+    }
+
     /// Update sandbox execution config for an agent.
     ///
     /// Provisioning is delegated to the notification-driven path:

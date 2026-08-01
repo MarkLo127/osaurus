@@ -96,6 +96,14 @@ struct GenerationParameters: Sendable {
     /// argument so it survives the whole ChatEngine → MLXService → ModelRuntime
     /// path without every layer having to re-plumb it.
     let loadIntent: ModelLoadIntent
+    /// Per-agent options for the Claude Code subprocess backend (mode +
+    /// tool opt-ins + working directory). Nil everywhere else; only
+    /// `ClaudeCodeService` reads it.
+    ///
+    /// Rides on `GenerationParameters` for the same reason `loadIntent` does:
+    /// it has to survive the whole ChatEngine → service path without every
+    /// layer re-plumbing an extra argument.
+    let claudeCode: ClaudeCodeRunOptions?
 
     init(
         temperature: Float?,
@@ -119,7 +127,8 @@ struct GenerationParameters: Sendable {
         warmupPrefill: Bool = false,
         cacheStableSystemPrefix: String? = nil,
         requestSource: RequestSource = .httpAPI,
-        loadIntent: ModelLoadIntent = .interactive
+        loadIntent: ModelLoadIntent = .interactive,
+        claudeCode: ClaudeCodeRunOptions? = nil
     ) {
         self.temperature = temperature
         self.maxTokens = maxTokens
@@ -143,6 +152,7 @@ struct GenerationParameters: Sendable {
         self.cacheStableSystemPrefix = cacheStableSystemPrefix
         self.requestSource = requestSource
         self.loadIntent = loadIntent
+        self.claudeCode = claudeCode
     }
 }
 

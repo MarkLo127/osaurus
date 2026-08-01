@@ -14,6 +14,11 @@ struct ModelPickerItem: Identifiable, Hashable {
         case foundation
         case local  // MLX models
         case imageGeneration  // on-device image models (vMLXFlux)
+        /// The locally-installed Claude Code CLI, driven as a subprocess.
+        /// Local in the sense that matters here — no Osaurus-held credential
+        /// and no Osaurus-managed connection — but it does reach the network
+        /// through the user's own signed-in CLI.
+        case claudeCode
         case remote(providerName: String, providerId: UUID)
 
         var displayName: String {
@@ -24,6 +29,8 @@ struct ModelPickerItem: Identifiable, Hashable {
                 return "Local Models"
             case .imageGeneration:
                 return "Image Models"
+            case .claudeCode:
+                return "Claude Code"
             case .remote(let providerName, _):
                 return providerName
             }
@@ -35,6 +42,7 @@ struct ModelPickerItem: Identifiable, Hashable {
             case .foundation: return "foundation"
             case .local: return "local"
             case .imageGeneration: return "image"
+            case .claudeCode: return "claude-code"
             case .remote(_, let providerId): return "remote-\(providerId.uuidString)"
             }
         }
@@ -47,8 +55,10 @@ struct ModelPickerItem: Identifiable, Hashable {
                 return 1
             case .imageGeneration:
                 return 2
-            case .remote:
+            case .claudeCode:
                 return 3
+            case .remote:
+                return 4
             }
         }
 
@@ -199,6 +209,17 @@ extension ModelPickerItem {
             displayName: "Foundation",
             source: .foundation,
             description: "Apple's built-in on-device model"
+        )
+    }
+
+    /// Create a picker item for one Claude Code CLI model alias.
+    static func claudeCode(_ model: ClaudeCodeModel) -> ModelPickerItem {
+        ModelPickerItem(
+            id: model.pickerId,
+            displayName: model.displayName,
+            source: .claudeCode,
+            description: L("Runs through your signed-in Claude Code CLI"),
+            supportsToolCalling: true
         )
     }
 
@@ -428,6 +449,8 @@ extension ModelPickerItem {
             // Image models produce images, not chat completions — never a
             // default chat pick (but still selectable to enter image mode).
             return false
+        case .claudeCode:
+            return true
         case .remote:
             return !Self.isLikelyEmbeddingOrRerankerID(id)
         }
@@ -480,6 +503,8 @@ extension ModelPickerItem {
             return 5
         case .foundation:
             return 10
+        case .claudeCode:
+            return 12
         case .remote:
             return isLikelyChatCapable ? 15 : 30
         }
@@ -759,6 +784,15 @@ extension Array where Element == ModelPickerItem {
             case .local, .imageGeneration:
                 // On-device image models live in the Local tab alongside LLMs.
                 localModels.append(model)
+            case .claudeCode:
+                // Its own tab rather than the Local one: these models are not
+                // on-device, and grouping them under "Local" would misrepresent
+                // where the prompt actually goes.
+                let key = model.source.uniqueKey
+                if remoteModels[key] == nil {
+                    remoteOrder.append((key: key, title: model.source.displayName))
+                }
+                remoteModels[key, default: []].append(model)
             case .remote(let providerName, _):
                 let key = model.source.uniqueKey
                 if remoteModels[key] == nil {

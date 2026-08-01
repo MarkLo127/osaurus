@@ -3155,6 +3155,22 @@ final class ChatSession: ObservableObject {
         agentId == Agent.defaultId ? nil : folderState.context
     }
 
+    /// Per-run options for the Claude Code subprocess backend.
+    ///
+    /// The working directory is the same folder root the turn's tools are
+    /// bound to, so Claude Code's own file tools can't reach outside the
+    /// folder the user picked for this chat.
+    private func claudeCodeRunOptions(for agentId: UUID) -> ClaudeCodeRunOptions {
+        let config = AgentManager.shared.effectiveClaudeCodeConfig(for: agentId)
+        let root = activeFolderContext(for: agentId)?.rootPath
+        return ClaudeCodeRunOptions(
+            mode: config.mode,
+            allowWrites: config.allowWrites,
+            allowShell: config.allowShell,
+            workingDirectory: root
+        )
+    }
+
     private func estimatedChatExecutionMode(agentId: UUID) -> ExecutionMode {
         let folder = activeFolderContext(for: agentId)
         let config = AgentManager.shared.effectiveAutonomousExec(for: agentId)
@@ -5597,6 +5613,7 @@ final class ChatSession: ObservableObject {
                             // them; the explicit marker keeps both paths on the
                             // same reasoning policy.
                             req.isAgentRequest = !toolSpecs.isEmpty || self.isRemoteAgentTarget
+                            req.claudeCodeOptions = self.claudeCodeRunOptions(for: turnAgentId)
                             turnGenerationControls.apply(to: &req)
                             req.backgroundModelLoad = (self.loadIntent == .background)
                             req.ttftTrace = ttftTrace
@@ -6014,6 +6031,7 @@ final class ChatSession: ObservableObject {
                                 isRemoteAgentTarget
                                 ? windowState?.pinnedRemoteAgentEffectiveModel : nil
                             finalReq.isAgentRequest = !toolSpecs.isEmpty || isRemoteAgentTarget
+                            finalReq.claudeCodeOptions = claudeCodeRunOptions(for: turnAgentId)
                             turnGenerationControls.apply(to: &finalReq)
                             finalReq.backgroundModelLoad = (loadIntent == .background)
                             finalReq.turnId = assistantTurn.id

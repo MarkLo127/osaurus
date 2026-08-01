@@ -31,6 +31,9 @@ struct RemoteProvidersView: View {
     @State private var credentialPresence: [UUID: RemoteProviderCredentialPresence] = [:]
     @State private var reconnectingAll = false
     @State private var reconnectingProviderIds: Set<UUID> = []
+    /// Whether the `claude` binary is on this app's PATH. A filesystem probe,
+    /// not a process spawn, so it's cheap enough to resolve on appear.
+    @State private var claudeCodeInstalled = false
 
     private struct AddSheetConfig: Identifiable {
         let id = UUID()
@@ -38,6 +41,10 @@ struct RemoteProvidersView: View {
         /// Open the add sheet directly on the grouped "Use an API key" sub-list
         /// (only meaningful when `preset` is nil).
         var startAtAPIKeyPicker: Bool = false
+        /// Open the add sheet directly on the Claude Code setup step (only
+        /// meaningful when `preset` is nil). Claude Code has no `ProviderPreset`
+        /// because it isn't a `RemoteProvider`, so it needs its own entry point.
+        var startAtClaudeCode: Bool = false
     }
 
     var body: some View {
@@ -68,12 +75,14 @@ struct RemoteProvidersView: View {
                 hasAppeared = true
             }
             refreshCredentialPresence()
+            claudeCodeInstalled = ClaudeCodeConfiguration.isAvailable()
         }
         .sheet(item: $addSheetConfig) { config in
             RemoteProviderEditSheet(
                 provider: nil,
                 initialPreset: config.preset,
-                startAtAPIKeyPicker: config.startAtAPIKeyPicker
+                startAtAPIKeyPicker: config.startAtAPIKeyPicker,
+                startAtClaudeCode: config.startAtClaudeCode
             ) { provider, apiKey, oauthTokens in
                 manager.addProvider(provider, apiKey: apiKey, oauthTokens: oauthTokens)
                 refreshCredentialPresence()
@@ -192,6 +201,10 @@ struct RemoteProvidersView: View {
         addSheetConfig = AddSheetConfig(preset: nil, startAtAPIKeyPicker: true)
     }
 
+    private func presentClaudeCodeSetup() {
+        addSheetConfig = AddSheetConfig(preset: nil, startAtClaudeCode: true)
+    }
+
     private var emptyStateView: some View {
         VStack(spacing: 24) {
             Spacer().frame(height: 20)
@@ -220,9 +233,29 @@ struct RemoteProvidersView: View {
             // Quick-add: OAuth providers first-class, everything else behind
             // a single "Use an API key" entry (mirrors the add-sheet picker).
             VStack(spacing: 10) {
-                ForEach(ProviderCatalog.topLevel) { entry in
+                // Claude Code drives the user's local `claude` binary rather
+                // than an HTTP endpoint, so it has no catalog entry and gets an
+                // explicit row. Hidden when the CLI isn't installed — a row that
+                // can only ever say "not installed" is noise.
+                //
+                // Placed second, after OpenAI, so it sits with the other
+                // subscription-backed sign-ins rather than below them.
+                ForEach(Array(ProviderCatalog.topLevel.enumerated()), id: \.element.id) {
+                    index,
+                    entry in
                     ProviderRowCard(entry: entry) {
                         presentAddSheet(for: entry.preset)
+                    }
+
+                    if index == 0, claudeCodeInstalled {
+                        ProviderRowCard(
+                            icon: "terminal.fill",
+                            title: "Claude Code",
+                            subtitle: "Use your Claude Pro or Max subscription",
+                            gradient: ClaudeCodeConfiguration.brandGradient
+                        ) {
+                            presentClaudeCodeSetup()
+                        }
                     }
                 }
 
@@ -693,7 +726,8 @@ private struct ProviderCardView: View {
 
                         if let primaryIssueKind = report.primaryIssueKind,
                             provider.enabled,
-                            report.hasAttention {
+                            report.hasAttention
+                        {
                             issueBadge(primaryIssueKind)
                         }
 
