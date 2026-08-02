@@ -257,7 +257,7 @@ actor ChatEngine: Sendable, ChatEngineProtocol {
             cacheStableSystemPrefix: request.cacheStableSystemPrefix,
             requestSource: inferenceSource,
             loadIntent: request.backgroundModelLoad ? .background : .interactive,
-            claudeCode: request.claudeCodeOptions
+            claudeCode: request.claudeCodeOptions,
             preserveExistingResidencyOwner: request.preserveExistingResidencyOwner
         )
 
