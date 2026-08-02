@@ -970,7 +970,9 @@ private enum DetailTab: String, CaseIterable {
                 "Everything this agent can do — flip an ability and watch the startup context respond."
             )
         case .capabilities:
-            return L("Pick which tools this agent can use. Skills come from the shared library and are always available.")
+            return L(
+                "Pick which tools this agent can use. Skills come from the shared library and are always available."
+            )
         case .subagents:
             return L(
                 "Let this agent delegate work — control your Mac, hand tasks to other agents, or generate images."
@@ -2059,6 +2061,7 @@ struct AgentDetailView: View {
         voiceSection
         systemPromptSection
         defaultModelSection
+        claudeCodeSection
         // The schedule-mode picker is configuration for the self-scheduling
         // feature, so it only appears once that capability is switched on
         // (the master toggle lives in Abilities → Overview). With it off
@@ -5241,6 +5244,66 @@ struct AgentDetailView: View {
         }
     }
 
+    /// Claude Code backend settings. Only meaningful when the agent is on a
+    /// `claude-code/…` model, and only shown when the CLI is actually
+    /// installed — otherwise the whole section is noise.
+    @ViewBuilder
+    private var claudeCodeSection: some View {
+        if ClaudeCodeConfiguration.isAvailable() {
+            let config = agentManager.effectiveClaudeCodeConfig(for: agent.id)
+
+            AgentDetailSection(title: L("Claude Code"), icon: "terminal.fill") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(
+                        "Applies when this agent runs a Claude Code model. Requests go through your signed-in Claude Code CLI and use your Claude subscription — Osaurus stores no Anthropic key.",
+                        bundle: .module
+                    )
+                    .font(.system(size: 11))
+                    .foregroundColor(theme.tertiaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                    featureCard(
+                        title: "Let Claude Code Use Its Own Tools",
+                        subtitle:
+                            "On: Claude Code runs its own agent loop and tools, and Osaurus shows a read-only trace. Off: it becomes a plain text generator with no tools at all (Osaurus's tools can't be given to it).",
+                        isOn: config.mode == .agent
+                    ) { agentMode in
+                        updateClaudeCode(from: config) { $0.mode = agentMode ? .agent : .textOnly }
+                    }
+
+                    if config.mode == .agent {
+                        featureCard(
+                            title: "Edit Files",
+                            subtitle:
+                                "Allow Claude Code to create and edit files in the working folder. Off keeps its run read-only.",
+                            isOn: config.allowWrites
+                        ) { allow in
+                            updateClaudeCode(from: config) { $0.allowWrites = allow }
+                        }
+
+                        featureCard(
+                            title: "Run Shell Commands",
+                            subtitle:
+                                "Allow Claude Code's Bash tool. This runs on your Mac under your own account — it is not confined by the Osaurus sandbox.",
+                            isOn: config.allowShell
+                        ) { allow in
+                            updateClaudeCode(from: config) { $0.allowShell = allow }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func updateClaudeCode(
+        from current: ClaudeCodeAgentConfig,
+        _ mutate: (inout ClaudeCodeAgentConfig) -> Void
+    ) {
+        var config = current
+        mutate(&config)
+        agentManager.updateClaudeCodeConfig(config, for: agent.id)
+    }
+
     /// Sandbox execution rows for the Sandbox tab's Execution section.
     /// Shows the toggles in every sandbox state: dimmed + disabled (with an
     /// explanatory hint) when the sandbox is unavailable or not running,
@@ -5302,7 +5365,8 @@ struct AgentDetailView: View {
     }
 
     private func commitSandboxAllowedDomains(execConfig: AutonomousExecConfig?) {
-        let raw = sandboxAllowedDomainsText
+        let raw =
+            sandboxAllowedDomainsText
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }

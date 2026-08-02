@@ -30,6 +30,14 @@ struct ChatSettingsView: View {
     private var theme: ThemeProtocol { themeManager.currentTheme }
 
     // Chat settings state
+    /// Local mirror of the Default agent's Claude Code config.
+    ///
+    /// The rest of this view uses a temp-state + explicit-save flow, but these
+    /// are toggles: they persist on change (like the Agents tab's equivalents)
+    /// so the same switch doesn't mean "saved" in one place and "pending" in
+    /// another. The mirror exists only so SwiftUI re-renders — the store is the
+    /// source of truth and is written through immediately.
+    @State private var claudeCodeConfig: ClaudeCodeAgentConfig = .default
     @State private var tempSystemPrompt: String = ""
     @State private var tempChatTemperature: String = ""
     @State private var tempChatMaxTokens: String = ""
@@ -129,6 +137,8 @@ struct ChatSettingsView: View {
                             chatSection
 
                             generationSection
+
+                            claudeCodeSection
 
                             ToolPermissionsSection()
                                 .settingsLandingAnchor("settings.toolPermissions")
@@ -560,6 +570,89 @@ struct ChatSettingsView: View {
         }
     }
 
+    // MARK: - Claude Code
+
+    /// Claude Code backend settings for the **Default agent**.
+    ///
+    /// Custom agents configure this in Agents → (agent) → Configure, but the
+    /// built-in agent is deliberately not editable there (`AgentsView` filters
+    /// `isBuiltIn` out of both the grid and `detailAgent`), so without this
+    /// section a Default-agent user has no way to widen Claude Code past the
+    /// read-only default. The store already keys the Default agent separately
+    /// — only the UI was missing.
+    ///
+    /// Hidden entirely when the CLI isn't installed: the toggles would apply to
+    /// a backend that can't run.
+    @ViewBuilder private var claudeCodeSection: some View {
+        if ClaudeCodeConfiguration.isAvailable() {
+            SettingsSection(title: L("Claude Code"), icon: "terminal.fill") {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text(
+                        "Applies when the Default agent runs a Claude Code model. Requests go through your signed-in Claude Code CLI and use your Claude subscription — Osaurus stores no Anthropic key.",
+                        bundle: .module
+                    )
+                    .font(.system(size: 11))
+                    .foregroundColor(theme.tertiaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                    SettingsToggle(
+                        title: L("Let Claude Code Use Its Own Tools"),
+                        description: L(
+                            "On: Claude Code runs its own agent loop and tools, and Osaurus shows a read-only trace. Off: it becomes a plain text generator with no tools at all (Osaurus's tools can't be given to it)."
+                        ),
+                        isOn: claudeCodeBinding(
+                            get: { $0.mode == .agent },
+                            set: { $0.mode = $1 ? .agent : .textOnly }
+                        )
+                    )
+
+                    if claudeCodeConfig.mode == .agent {
+                        SettingsToggle(
+                            title: L("Edit Files"),
+                            description: L(
+                                "Allow Claude Code to create and edit files in the working folder. Off keeps its run read-only."
+                            ),
+                            isOn: claudeCodeBinding(
+                                get: { $0.allowWrites },
+                                set: { $0.allowWrites = $1 }
+                            )
+                        )
+
+                        SettingsToggle(
+                            title: L("Run Shell Commands"),
+                            description: L(
+                                "Allow Claude Code to run shell commands. These run on your Mac outside Osaurus's sandbox, so leave this off unless you need it."
+                            ),
+                            isOn: claudeCodeBinding(
+                                get: { $0.allowShell },
+                                set: { $0.allowShell = $1 }
+                            )
+                        )
+                    }
+                }
+            }
+            .settingsLandingAnchor("settings.chat.claudeCode")
+        }
+    }
+
+    /// Binding over one field of the Default agent's Claude Code config that
+    /// persists on write. `get`/`set` operate on the config so each toggle
+    /// declares only the field it owns.
+    private func claudeCodeBinding(
+        get: @escaping (ClaudeCodeAgentConfig) -> Bool,
+        set: @escaping (inout ClaudeCodeAgentConfig, Bool) -> Void
+    ) -> Binding<Bool> {
+        Binding(
+            get: { get(claudeCodeConfig) },
+            set: { newValue in
+                var updated = claudeCodeConfig
+                set(&updated, newValue)
+                claudeCodeConfig = updated
+                AgentManager.shared.updateClaudeCodeConfig(updated, for: Agent.defaultId)
+            }
+        )
+    }
+
     // MARK: - Configuration Loading
 
     private func loadConfiguration() {
@@ -582,6 +675,9 @@ struct ChatSettingsView: View {
         // Tools and memory are intentionally NOT surfaced here: the default
         // agent's tools toggle lives in the Agents tab and the global memory
         // switch lives in the Memory tab.
+        // Read through the manager rather than `defaultAgent.claudeCode`
+        // directly so the nil-to-`.default` fallback stays in one place.
+        claudeCodeConfig = AgentManager.shared.effectiveClaudeCodeConfig(for: Agent.defaultId)
         tempSystemPrompt = defaultAgent.systemPrompt
         tempChatTemperature = defaultAgent.temperature.map { String($0) } ?? ""
         tempChatMaxTokens = defaultAgent.maxTokens.map(String.init) ?? ""
