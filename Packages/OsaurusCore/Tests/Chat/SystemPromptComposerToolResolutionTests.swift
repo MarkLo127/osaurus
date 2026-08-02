@@ -243,7 +243,7 @@ struct SystemPromptComposerToolResolutionTests {
             let names = Set(tools.map { $0.function.name })
             #expect(!names.contains("capabilities_discover"))
             #expect(!names.contains("capabilities_load"))
-            #expect(!names.contains("todo"))
+            #expect(names.isSuperset(of: SystemPromptComposer.agentLoopToolNames))
             #expect(names.contains("render_chart"))
         }
     }
@@ -684,6 +684,33 @@ struct SystemPromptComposerToolResolutionTests {
         #expect(ToolRegistry.nonDiscoverableBuiltInToolNames.contains(BrowserUseTool.toolName))
         let dynamicNames = Set(ToolRegistry.shared.listDynamicTools().map(\.name))
         #expect(!dynamicNames.contains(BrowserUseTool.toolName))
+        let manifestNames = Set(
+            SystemPromptComposer.deriveEnabledManifest(agentId: UUID())
+                .flatMap(\.tools)
+                .map(\.name)
+        )
+        #expect(!manifestNames.contains(BrowserUseTool.toolName))
+        #expect(!manifestNames.contains("image"))
+    }
+
+    @Test
+    func httpClientToolsCannotReintroduceAWithheldRegisteredCapability() async throws {
+        func spec(_ name: String) -> Tool {
+            Tool(
+                type: "function",
+                function: ToolFunction(name: name, description: "test", parameters: nil)
+            )
+        }
+
+        let externalName = "client_callback_\(UUID().uuidString)"
+        let resolved = await HTTPHandler.mergeAgentContextTools(
+            [],
+            clientTools: [spec(BrowserUseTool.toolName), spec(externalName)]
+        )
+        let merged = try #require(resolved)
+        let names = Set(merged.map(\.function.name))
+        #expect(!names.contains(BrowserUseTool.toolName))
+        #expect(names.contains(externalName))
     }
 
     /// Like `computer_use`, Browser Use is a custom-agent capability: the
@@ -907,10 +934,10 @@ struct SystemPromptComposerToolResolutionTests {
         }
     }
 
-    // MARK: - Lifecycle tool retirement
+    // MARK: - Lifecycle tool contract
 
     @Test
-    func lifecycleToolsAreAbsentFromDefaultCustomAgentContract() async {
+    func autoModeKeepsCompleteLifecycleContract() async {
         let modes: [ExecutionMode] = [.none]
         for mode in modes {
             await withSandboxAgent(autonomous: false) { agentId in
@@ -918,10 +945,8 @@ struct SystemPromptComposerToolResolutionTests {
                     SystemPromptComposer.resolveTools(agentId: agentId, executionMode: mode)
                         .map { $0.function.name }
                 )
-                #expect(!names.contains("todo"))
-                #expect(!names.contains("complete"))
-                #expect(!names.contains("clarify"))
-                #expect(!names.contains("share_artifact"))
+                #expect(names.isSuperset(of: SystemPromptComposer.agentLoopToolNames))
+                #expect(names.contains("get_current_time"))
             }
         }
 
@@ -931,12 +956,23 @@ struct SystemPromptComposerToolResolutionTests {
                     SystemPromptComposer.resolveTools(agentId: agentId, executionMode: .sandbox(hostRead: nil))
                         .map { $0.function.name }
                 )
-                #expect(!names.contains("todo"))
-                #expect(!names.contains("complete"))
-                #expect(!names.contains("clarify"))
-                #expect(!names.contains("share_artifact"))
+                #expect(names.isSuperset(of: SystemPromptComposer.agentLoopToolNames))
+                #expect(names.contains("get_current_time"))
             }
         }
+    }
+
+    @Test
+    func defaultAgentKeepsTodoAndCurrentTimeTogether() {
+        let tools = SystemPromptComposer.resolveTools(
+            snapshot: makeSnapshotForDefaultAgent(),
+            executionMode: .none
+        )
+        let names = Set(tools.map { $0.function.name })
+        #expect(names.contains("todo"))
+        #expect(names.contains("complete"))
+        #expect(names.contains("clarify"))
+        #expect(names.contains("get_current_time"))
     }
 
     @Test

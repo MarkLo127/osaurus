@@ -781,7 +781,7 @@ struct RuntimePolicySourceTests {
         // and both xcworkspace Package.resolved files. Miss one and a release
         // surface resolves a revision nobody proved. OsaurusEvals resolves
         // this manifest transitively and its local Package.resolved is ignored.
-        let expectedRuntimeHardenedRevision = "0d838879a7ea102eb6e034f1d33ac0dbb51c02c3"
+        let expectedRuntimeHardenedRevision = "0beef2031e963cfd2ba5ddd362fdd6cb072a809f"
         let manifestRevision = try Self.vmlxPinRevision(in: manifest)
         let coreResolvedRevision = try Self.vmlxPinRevision(in: coreResolved)
         let workspaceRevision = try Self.vmlxPinRevision(in: workspaceResolved)
@@ -1133,6 +1133,10 @@ struct RuntimePolicySourceTests {
         #expect(httpHandler.contains(#""requires_paged_boundary_companion""#))
         #expect(httpHandler.contains(#""block_disk_store""#))
         #expect(httpHandler.contains(#""disk_l2_hits""#))
+        #expect(httpHandler.contains(#""current_payload_bytes""#))
+        #expect(httpHandler.contains(#""current_entry_count""#))
+        #expect(httpHandler.contains(#""store_skips""#))
+        #expect(httpHandler.contains(#""evictions""#))
         #expect(httpHandler.contains(#""prefix_hits""#))
         #expect(httpHandler.contains(#""companion_cache""#))
         #expect(httpHandler.contains(#""zaya_cca_disk_payload_restore""#))
@@ -1715,6 +1719,35 @@ struct RuntimePolicySourceTests {
         #expect(!chatCompletions.contains("composeChatContext("))
         #expect(!chatCompletions.contains("injectMemoryPrefix("))
         #expect(!chatCompletions.contains("mergeAgentContextTools("))
+    }
+
+    @Test("HTTP agent context uses the native composed toolset without re-injection")
+    func httpAgentContextUsesNativeComposedToolset() throws {
+        let handler = try Self.source("Networking/HTTPHandler.swift")
+        let enrichment = try Self.functionBody(
+            "private static func enrichWithAgentContext(",
+            in: handler
+        )
+
+        #expect(enrichment.contains("SystemPromptComposer.composeChatContext("))
+        #expect(enrichment.contains("mergeAgentContextTools(\n            composed.tools,"))
+        #expect(!enrichment.contains("visibleDelegationToolNames("))
+        #expect(!enrichment.contains("specs(forTools: Array(visibleDelegation))"))
+    }
+
+    @Test("Capability controls show readiness and expose Default Image and AppleScript")
+    func capabilityControlsExposeReadiness() throws {
+        let agents = try Self.source("Views/Agent/AgentsView.swift")
+        let mainChat = try Self.source("Views/Settings/SubagentSettingsSection.swift")
+        let browser = try Self.source("Views/Settings/BrowserSettingsView.swift")
+
+        #expect(agents.contains("private func subagentReadiness("))
+        #expect(agents.contains(#"\(callableSubagentCount) \(L("callable"))"#))
+        #expect(agents.contains("readiness.statusMessage"))
+        #expect(mainChat.contains("$configuration.imageDelegationEnabled"))
+        #expect(mainChat.contains("$configuration.appleScriptDelegationEnabled"))
+        #expect(mainChat.contains("mainSpawnReadiness"))
+        #expect(browser.contains("can only be enabled per custom agent"))
     }
 
     @Test("Open Responses endpoint has v1 alias and does not inject agent context")
@@ -2729,6 +2762,7 @@ struct RuntimePolicySourceTests {
         #expect(httpHandler.contains("\"slider\": memorySafety.slider"))
         #expect(httpHandler.contains("\"allowed\": plan.blockingIssues.isEmpty"))
         #expect(httpHandler.contains("\"load_configuration\": loadConfigurationJSONObject(plan.loadConfiguration)"))
+        #expect(httpHandler.contains("\"deepseek_v4_activation_qat\""))
         #expect(httpHandler.contains("\"memory_status\": memoryStatusJSONObject(memoryStatus)"))
         #expect(httpHandler.contains("\"warnings\": plan.warnings"))
         #expect(httpHandler.contains("\"blocking_issues\": plan.blockingIssues.map(settingsIssueJSONObject)"))

@@ -990,24 +990,27 @@ struct MLXBatchAdapter {
             guard normalizedReasoningEffort != nil || disableThinking != nil else {
                 return context
             }
-            let effort: String
             if let normalizedReasoningEffort {
-                effort = DSV4ReasoningProfile.normalizedEffort(normalizedReasoningEffort)
+                if let effort = DSV4ReasoningProfile.normalizedEffort(normalizedReasoningEffort) {
+                    switch effort {
+                    case "low", "high", "max":
+                        context["enable_thinking"] = true
+                        context["reasoning_effort"] = effort
+                    default:
+                        context["enable_thinking"] = false
+                    }
+                } else {
+                    // Preserve invalid explicit values so vmlx's DSV4 policy
+                    // rejects them with its typed error. Never downgrade an
+                    // unknown effort to Off or silently coerce it to High.
+                    context["enable_thinking"] = true
+                    context["reasoning_effort"] = normalizedReasoningEffort.lowercased()
+                }
             } else if let disableThinking {
-                effort = disableThinking ? "instruct" : "high"
-            } else {
-                return context
-            }
-
-            switch effort {
-            case "max":
-                context["enable_thinking"] = true
-                context["reasoning_effort"] = "max"
-            case "high":
-                context["enable_thinking"] = true
-                context["reasoning_effort"] = "high"
-            default:
-                context["enable_thinking"] = false
+                // The legacy on/off toggle selects the mode only. When it is
+                // on, omit an effort so the bundle's declared default (low for
+                // DSV4-0731) remains authoritative.
+                context["enable_thinking"] = !disableThinking
             }
             return context
         }
@@ -1200,10 +1203,13 @@ struct MLXBatchAdapter {
 
     /// Compiled B=1 decode eligibility. Architecture-driven when the REAL
     /// cache topology is known (the loaded container's per-layer cache list):
-    /// any SSM/Arrays/ZayaCCA companion or composite `CacheList` layer means
-    /// vmlx's compile stages can't trace the slot (`CacheFamily` `.mamba` /
-    /// `.zayaCCA` / `.heterogeneous` are not compile-eligible), so requesting
-    /// it only buys a per-iterator `eval(cache)` + failed promotion. The
+    /// any SSM/Arrays/ZayaCCA companion, DSV4 hybrid-pool layer, or composite
+    /// `CacheList` layer means vmlx's generic compile stages can't trace the
+    /// slot (`CacheFamily` `.mamba` / `.zayaCCA` / `.heterogeneous` are not
+    /// compile-eligible), so requesting it only buys a per-iterator
+    /// `eval(cache)` + failed promotion. DSV4's model-native compiled gate and
+    /// SwiGLU micrographs remain automatic; this policy only rejects the
+    /// incompatible whole-forward cache trace. The
     /// name matcher remains the fallback for call sites that run before the
     /// container is loaded (`pending_preload` stage) and as a belt for
     /// families with known non-topology denials.
@@ -1213,11 +1219,14 @@ struct MLXBatchAdapter {
         cacheTopology: ModelCacheTopologySnapshot? = nil
     ) -> Bool {
         if let cacheTopology,
-            cacheTopology.requiresSSMCompanionState || cacheTopology.cacheListLayerCount > 0
+            cacheTopology.requiresSSMCompanionState
+                || cacheTopology.hybridPoolLayerCount > 0
+                || cacheTopology.cacheListLayerCount > 0
         {
             return false
         }
         return maxBatchSize == 1
+            && !ModelFamilyNames.isDSV4Family(modelName)
             && !Hy3ReasoningProfile.matches(modelId: modelName)
             && !ModelFamilyNames.isMiniMaxFamily(modelName)
             && !ModelFamilyNames.isStepFamily(modelName)

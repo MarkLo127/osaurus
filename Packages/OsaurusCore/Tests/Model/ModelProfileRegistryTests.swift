@@ -400,6 +400,10 @@ struct ModelProfileRegistryTests {
         )
         #expect(ModelOptionsStore.shared.loadOptions(for: dsv4) == nil)
 
+        ModelOptionsStore.shared.saveOptions(["reasoningEffort": .string("instruct")], for: dsv4)
+        let explicitDSV4Off = ModelOptionsStore.shared.loadOptions(for: dsv4)
+        #expect(explicitDSV4Off?["reasoningEffort"]?.stringValue == "instruct")
+
         ModelOptionsStore.shared.saveOptions(["disableThinking": .bool(true)], for: qwen)
         let explicitQwen = ModelOptionsStore.shared.loadOptions(for: qwen)
         #expect(explicitQwen?["disableThinking"]?.boolValue == true)
@@ -462,10 +466,11 @@ struct ModelProfileRegistryTests {
         }
     }
 
-    @Test("DSV4 bundles expose instruct, reasoning, and max modes")
+    @Test("DSV4 bundles expose off plus exact 0731 low/high/max modes")
     func dsv4_matchesReasoningModeProfile() {
         for id in [
             "JANGQ-AI/DeepSeek-V4-Flash-JANGTQ-K",
+            "DeepSeek-V4-Flash-0731-JANG",
             "DeepSeek-V4-Flash-JANGTQ-K",
             "deepseekv4-flash-jangtq",
             "dsv4-flash-jangtq-k",
@@ -474,6 +479,7 @@ struct ModelProfileRegistryTests {
             #expect(profile?.displayName == DSV4ReasoningProfile.displayName)
             let normalized = ModelProfileRegistry.normalizedOptions(for: id, persisted: nil)
             #expect(normalized["reasoningEffort"] == nil)
+            #expect(ModelProfileRegistry.defaults(for: id)["reasoningEffort"] == .string("low"))
             #expect(profile?.thinkingOption?.id == nil)
 
             let definitions = ModelProfileRegistry.options(for: id)
@@ -481,7 +487,8 @@ struct ModelProfileRegistryTests {
                 Issue.record("DSV4 should expose segmented reasoning modes")
                 continue
             }
-            #expect(segments.map(\.id) == ["instruct", "high", "max"])
+            #expect(segments.map(\.id) == ["instruct", "low", "high", "max"])
+            #expect(segments.map(\.label) == ["Off", "Low", "High", "Max"])
         }
 
         for id in [
@@ -827,7 +834,7 @@ struct ModelProfileRegistryTests {
             let dsv4 = "dsv4-flash-jangtq-k"
             #expect(
                 ModelProfileRegistry.inlineReasoningSuffixLabel(for: dsv4, values: [:])
-                    == "Instruct"
+                    == "Low"
             )
             #expect(
                 ModelProfileRegistry.inlineReasoningSuffixLabel(

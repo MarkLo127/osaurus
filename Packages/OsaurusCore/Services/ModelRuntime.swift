@@ -283,10 +283,16 @@ public actor ModelRuntime {
         let draftStrategy: MLXLMCommon.DraftStrategy?
         let nativeMTPStatus: String?
         let nativeMTPReason: String?
-        /// Allocator-cache cap resolved from the user-visible memory-safety
-        /// plan used for this exact load. `nil` preserves performance mode's
-        /// explicit unlimited policy.
+        /// Numeric allocator-cache cap resolved from the user-visible
+        /// memory-safety plan used for this exact load. `nil` means no numeric
+        /// cap; the family-specific uncapped requirement is tracked separately
+        /// so ordinary models still use Osaurus's dynamic reuse heuristic.
         let allocatorCacheLimitBytes: Int?
+        /// Plain affine DSV4 requires MLX's admitted allocator ceiling rather
+        /// than Osaurus's generic weight-scaled reuse heuristic. Its routed
+        /// decode intermediates otherwise churn out of the allocator cache on
+        /// every token even though RAM admission already accepted the model.
+        let requiresUncappedMLXAllocatorCache: Bool
         var cacheTopology: ModelCacheTopologySnapshot?
         init(
             name: String,
@@ -297,7 +303,8 @@ public actor ModelRuntime {
             draftStrategy: MLXLMCommon.DraftStrategy? = nil,
             nativeMTPStatus: String? = nil,
             nativeMTPReason: String? = nil,
-            allocatorCacheLimitBytes: Int? = nil
+            allocatorCacheLimitBytes: Int? = nil,
+            requiresUncappedMLXAllocatorCache: Bool = false
         ) {
             self.name = name
             self.container = container
@@ -308,6 +315,7 @@ public actor ModelRuntime {
             self.nativeMTPStatus = nativeMTPStatus
             self.nativeMTPReason = nativeMTPReason
             self.allocatorCacheLimitBytes = allocatorCacheLimitBytes
+            self.requiresUncappedMLXAllocatorCache = requiresUncappedMLXAllocatorCache
         }
     }
 
@@ -2312,9 +2320,13 @@ public actor ModelRuntime {
         let byModel = max(totalWeights / 4, 1 * 1024 * 1024 * 1024)
         let bySystem = min(systemRAM / 8, 8 * 1024 * 1024 * 1024)
         let dynamicLimit = min(byModel, bySystem)
+        let uncappedLimit = modelCache.values.contains {
+            $0.requiresUncappedMLXAllocatorCache
+        } ? max(dynamicLimit, Memory.memoryLimit) : nil
         return Self.effectiveMLXCacheLimit(
             dynamicLimit: dynamicLimit,
-            configuredLimits: modelCache.values.map(\.allocatorCacheLimitBytes)
+            configuredLimits: modelCache.values.map(\.allocatorCacheLimitBytes),
+            uncappedLimit: uncappedLimit
         )
     }
 
@@ -2324,9 +2336,13 @@ public actor ModelRuntime {
     /// silently replaced it with at least 1 GiB.
     nonisolated static func effectiveMLXCacheLimit(
         dynamicLimit: Int,
-        configuredLimits: [Int?]
+        configuredLimits: [Int?],
+        uncappedLimit: Int? = nil
     ) -> Int {
         guard dynamicLimit > 0 else { return 0 }
+        if let uncappedLimit {
+            return max(dynamicLimit, uncappedLimit)
+        }
         guard let configuredLimit = configuredLimits.compactMap({ $0 }).min() else {
             return dynamicLimit
         }
@@ -3597,6 +3613,7 @@ public actor ModelRuntime {
         genLog.info(
             "loadContainer: local directory model=\(name, privacy: .public) path=\(localURL.path, privacy: .public)"
         )
+        let loadBundleFacts = LoadBundleFacts.inspect(bundleURL: localURL)
 
         // One-time, idempotent bundle-metadata repair for the Laguna XS 2.1
         // release that shipped an incorrect/missing top_k in some artifacts.
@@ -3679,7 +3696,6 @@ public actor ModelRuntime {
         // pass, hits a precondition in TurboQuantSwitchLinear, and abort()s
         // the whole process — taking osaurus with it. Caught here so the user
         // gets a clear error and the server stays up.
-        try Self.validateUnsupportedPlainDSV4AffineJANG(at: localURL, name: name)
         try await Self.ensureJANGTQSidecar(at: localURL, modelId: id, name: name)
         // One-time, idempotent: Gemma-4 JANG (affine) audio bundles shipped
         // without the `quantization.multimodal` fp16-passthrough flag that the
@@ -3837,7 +3853,7 @@ public actor ModelRuntime {
                 settings: serverSettings
             )
             genLog.info(
-                "loadContainer: native MTP plan model=\(name, privacy: .public) nativeMTP=\(mtpPlan.loadConfiguration.nativeMTP, privacy: .public) draftStrategy=\(Self.describeDraftStrategy(mtpPlan.draftStrategy), privacy: .public) reason=\(mtpPlan.reason, privacy: .public) status=\(mtpPlan.statusLine ?? "none", privacy: .public) memorySafety=\(mtpPlan.memorySafetySummary, privacy: .public)"
+                "loadContainer: resolved load plan model=\(name, privacy: .public) nativeMTP=\(mtpPlan.loadConfiguration.nativeMTP, privacy: .public) dsv4ActivationQAT=\(mtpPlan.loadConfiguration.deepseekV4ActivationQAT ?? false, privacy: .public) draftStrategy=\(Self.describeDraftStrategy(mtpPlan.draftStrategy), privacy: .public) reason=\(mtpPlan.reason, privacy: .public) status=\(mtpPlan.statusLine ?? "none", privacy: .public) memorySafety=\(mtpPlan.memorySafetySummary, privacy: .public)"
             )
             // Weight dequantization + kernel compilation drive the Metal
             // command queue. Hold the GPU gate as an exclusive producer so a
@@ -3901,7 +3917,9 @@ public actor ModelRuntime {
                 allocatorCacheLimitBytes: mtpPlan.loadConfiguration.maxResidentBytes
                     .applyAsCacheLimitInt(
                         physicalMemory: ProcessInfo.processInfo.physicalMemory
-                    )
+                    ),
+                requiresUncappedMLXAllocatorCache:
+                    loadBundleFacts.isPlainDeepseekV4AffineJANG
             )
 
             // Install the cache coordinator before the coalesced load task
@@ -4074,7 +4092,9 @@ public actor ModelRuntime {
             modelName: modelName,
             kvModeTag: kvModeTag,
             weightsFingerprint: weightsFingerprint,
-            cacheTopology: cacheTopology
+            cacheTopology: cacheTopology,
+            deepseekV4ActivationQAT:
+                resolvedSettings.effectivePerformance.deepseekV4ActivationQAT
         )
 
         // Delegate the full coordinator config to vmlx's spec'd builder
@@ -4379,7 +4399,8 @@ public actor ModelRuntime {
         modelName: String,
         kvModeTag: String,
         weightsFingerprint: String,
-        cacheTopology: ModelCacheTopologySnapshot? = nil
+        cacheTopology: ModelCacheTopologySnapshot? = nil,
+        deepseekV4ActivationQAT: Bool = false
     ) -> String {
         var tags = [
             modelName,
@@ -4408,10 +4429,18 @@ public actor ModelRuntime {
             tags.append(contentsOf: cacheTopology.topologyTags)
         }
 
-        if ModelFamilyNames.isDSV4Family(modelName) {
+        let isDSV4CacheTopology =
+            ModelFamilyNames.isDSV4Family(modelName)
+            || (cacheTopology?.hybridPoolLayerCount ?? 0) > 0
+        if isDSV4CacheTopology {
             tags.append("layers=deepseekV4")
             tags.append("prefix=hybrid-pool-disk")
             tags.append("decode=max-rp110")
+            // Activation-QAT changes every attention/cache activation from
+            // token zero. Its stored SWA/CSA/HSA state is therefore not valid
+            // under the other graph, even when prompt, weights, and KV codec
+            // are identical.
+            tags.append("activation-qat=\(deepseekV4ActivationQAT ? "on" : "off")")
         } else if ModelFamilyNames.isZayaFamily(modelName) {
             tags.append("layers=zayaCCA")
             tags.append("prefix=path-dependent-disk")
@@ -5468,16 +5497,16 @@ public actor ModelRuntime {
                     )
                 )
             case "assistant":
-                let content = (m.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let reasoningContent = m.reasoning_content?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let content = m.content ?? ""
+                let reasoningContent = m.reasoning_content
                 let toolCalls = preserveStructuredToolHistory ? toMLXToolCalls(m.tool_calls) : nil
                 // Skip fully-empty assistant turns. Reasoning-only assistant
                 // turns are NOT empty for local MLX templates: ZAYA,
                 // Nemotron-H/Omni, MiniMax and DSV4 read
                 // `message.reasoning_content` to reconstruct prior
                 // `<think>...</think>` history on follow-ups.
-                if content.isEmpty
-                    && (reasoningContent?.isEmpty ?? true)
+                if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && (reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
                     && (toolCalls?.isEmpty ?? true)
                 {
                     continue
@@ -5559,7 +5588,11 @@ public actor ModelRuntime {
                 )) ?? [:]
             return MLXLMCommon.ToolCall(
                 id: tc.id,
-                function: .init(name: tc.function.name, arguments: args)
+                function: .init(
+                    name: tc.function.name,
+                    arguments: args,
+                    rawArgumentsJSON: tc.function.arguments
+                )
             )
         }
     }
@@ -6380,84 +6413,6 @@ public actor ModelRuntime {
                 "failed to patch Gemma-4 JANG audio config model=\(name, privacy: .public): \(String(describing: error), privacy: .public)"
             )
         }
-    }
-
-    /// Blocks the known-bad plain affine DeepSeek V4 Flash JANG bundle before
-    /// vmlx starts loading hundreds of GB of shards. The production DSV4 path
-    /// is JANGTQ (`weight_format == "mxtq"` + `jangtq_runtime.safetensors`),
-    /// which dispatches to TurboQuantSwitchGLU. Plain affine DSV4 JANG falls
-    /// through to the generic SwitchGLU route; current engine evidence shows
-    /// unusable decode speed and high memory pressure, not a shippable row.
-    ///
-    /// Engine developers can still opt in for diagnostics with
-    /// `OSAURUS_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG=1` or
-    /// `VMLINUX_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG=1`.
-    static func validateUnsupportedPlainDSV4AffineJANG(at directory: URL, name: String) throws {
-        guard !Self.experimentalDSV4AffineJANGAllowed else { return }
-
-        let fm = FileManager.default
-        let jangConfigURL = directory.appendingPathComponent("jang_config.json")
-        let configURL = directory.appendingPathComponent("config.json")
-        guard fm.fileExists(atPath: jangConfigURL.path),
-            fm.fileExists(atPath: configURL.path)
-        else { return }
-
-        let sidecarURL = directory.appendingPathComponent("jangtq_runtime.safetensors")
-        guard !fm.fileExists(atPath: sidecarURL.path) else { return }
-
-        let jang = Self.readJSONObject(at: jangConfigURL)
-        let config = Self.readJSONObject(at: configURL)
-        let modelType = Self.stringValue(config["model_type"])?.lowercased()
-        guard modelType == "deepseek_v4" else { return }
-
-        let weightFormat = Self.stringValue(jang["weight_format"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let codec = ((jang["quantization"] as? [String: Any])?["routed_experts"] as? [String: Any])
-            .flatMap { Self.stringValue($0["codec"]) }?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let isAffine =
-            weightFormat == nil
-            || weightFormat == "affine"
-            || weightFormat == "jang"
-            || weightFormat == "jang_v2"
-            || codec == "affine"
-
-        let routedExperts =
-            Self.intValue(config["n_routed_experts"])
-            ?? Self.intValue(config["num_experts"])
-            ?? Self.intValue(config["num_routed_experts"])
-
-        guard isAffine, (routedExperts ?? 0) >= 128 else { return }
-
-        throw MLXService.RuntimePolicyError(
-            modelName: name,
-            issues: [
-                "Model '\(name)' is a plain affine DeepSeek V4 Flash JANG bundle. "
-                    + "That path is not production-supported in this Osaurus build because "
-                    + "it loads through the generic SwitchGLU route and can consume very high "
-                    + "memory while decoding at unusable speed. Use the JANGTQ2 or JANGTQ-K "
-                    + "DeepSeek V4 Flash bundle instead. For engine diagnostics only, set "
-                    + "OSAURUS_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG=1."
-            ]
-        )
-    }
-
-    private static var experimentalDSV4AffineJANGAllowed: Bool {
-        let env = ProcessInfo.processInfo.environment
-        for key in [
-            "OSAURUS_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG",
-            "VMLINUX_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG",
-        ] {
-            guard let raw = env[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
-                continue
-            }
-            if ["1", "true", "yes", "on"].contains(raw) {
-                return true
-            }
-        }
-        return false
     }
 
     private static func readJSONObject(at url: URL) -> [String: Any] {

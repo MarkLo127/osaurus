@@ -864,7 +864,37 @@ struct MLXBatchAdapterTests {
         #expect(dsv4.contains("layers=deepseekV4"))
         #expect(dsv4.contains("prefix=hybrid-pool-disk"))
         #expect(dsv4.contains("decode=max-rp110"))
+        #expect(dsv4.contains("activation-qat=off"))
         #expect(!dsv4.contains("layers=hybrid-ssm"))
+
+        let dsv4QATOn = ModelRuntime.cacheCoordinatorModelKey(
+            modelName: "DeepSeek-V4-Flash-JANGTQ2",
+            kvModeTag: "fp16",
+            weightsFingerprint: "testfp",
+            deepseekV4ActivationQAT: true
+        )
+        #expect(dsv4QATOn.contains("activation-qat=on"))
+        #expect(dsv4QATOn != dsv4)
+
+        let renamedDSV4Topology = ModelCacheTopologySnapshot(
+            layerCount: 43,
+            rotatingKVLayerCount: 2,
+            hybridPoolLayerCount: 41)
+        let renamedDSV4Off = ModelRuntime.cacheCoordinatorModelKey(
+            modelName: "my-renamed-local-model",
+            kvModeTag: "fp16",
+            weightsFingerprint: "testfp",
+            cacheTopology: renamedDSV4Topology,
+            deepseekV4ActivationQAT: false)
+        let renamedDSV4On = ModelRuntime.cacheCoordinatorModelKey(
+            modelName: "my-renamed-local-model",
+            kvModeTag: "fp16",
+            weightsFingerprint: "testfp",
+            cacheTopology: renamedDSV4Topology,
+            deepseekV4ActivationQAT: true)
+        #expect(renamedDSV4Off.contains("activation-qat=off"))
+        #expect(renamedDSV4On.contains("activation-qat=on"))
+        #expect(renamedDSV4Off != renamedDSV4On)
 
         #expect(zaya.contains("layers=zayaCCA"))
         #expect(zaya.contains("prefix=path-dependent-disk"))
@@ -876,6 +906,13 @@ struct MLXBatchAdapterTests {
         #expect(!generic.contains("layers=zayaCCA"))
         #expect(!generic.contains("layers=hybrid-ssm"))
         #expect(!generic.contains("media=omni-audio-video"))
+
+        let genericQATOn = ModelRuntime.cacheCoordinatorModelKey(
+            modelName: "Mistral-Medium-3.5-128B-MXFP4",
+            kvModeTag: "fp16",
+            weightsFingerprint: "testfp",
+            deepseekV4ActivationQAT: true)
+        #expect(genericQATOn == generic)
 
         #expect(Set([dsv4, zaya, ling, omni, generic]).count == 5)
     }
@@ -1247,6 +1284,13 @@ struct MLXBatchAdapterTests {
     @Test func compiledBatchDecodeDisabledForKnownUnsafeSoloModels() {
         #expect(
             !MLXBatchAdapter.shouldEnableCompiledBatchDecode(
+                modelName: "DeepSeek-V4-Flash-0731-JANG",
+                maxBatchSize: 1
+            ),
+            "DSV4 automatically uses its model-native compiled gate/SwiGLU path; Osaurus must not request the incompatible generic whole-cache compiler"
+        )
+        #expect(
+            !MLXBatchAdapter.shouldEnableCompiledBatchDecode(
                 modelName: "JANGQ-AI/Hy3-preview-JANGTQ",
                 maxBatchSize: 1
             ),
@@ -1360,6 +1404,19 @@ struct MLXBatchAdapterTests {
                 maxBatchSize: 1,
                 cacheTopology: cacheListShape
             )
+        )
+        let dsv4HybridPoolShape = ModelCacheTopologySnapshot(
+            layerCount: 43,
+            rotatingKVLayerCount: 43,
+            hybridPoolLayerCount: 41
+        )
+        #expect(
+            !MLXBatchAdapter.shouldEnableCompiledBatchDecode(
+                modelName: "some-org/unrecognized-dsv4-bundle",
+                maxBatchSize: 1,
+                cacheTopology: dsv4HybridPoolShape
+            ),
+            "a DSV4-style hybrid-pool cache must keep its native compiled micrographs and skip the generic whole-cache trace even when the bundle name is unknown"
         )
         // A plain full-attention shape keeps the name-based rules in force:
         // eligible for a dense model, still denied for a known-unsafe family.
@@ -1642,6 +1699,31 @@ struct MLXBatchAdapterTests {
         #expect(instruct["enable_thinking"] as? Bool == false)
         #expect(instruct["reasoning_effort"] == nil)
 
+        let low = MLXBatchAdapter.additionalContext(
+            for: GenerationParameters(
+                temperature: nil,
+                maxTokens: 16,
+                modelOptions: ["reasoningEffort": .string("low")]
+            ),
+            modelName: modelName
+        )
+        #expect(low["enable_thinking"] as? Bool == true)
+        #expect(low["reasoning_effort"] as? String == "low")
+
+        let invalid = MLXBatchAdapter.additionalContext(
+            for: GenerationParameters(
+                temperature: nil,
+                maxTokens: 16,
+                modelOptions: ["reasoningEffort": .string("medium")]
+            ),
+            modelName: modelName
+        )
+        #expect(invalid["enable_thinking"] as? Bool == true)
+        #expect(
+            invalid["reasoning_effort"] as? String == "medium",
+            "Invalid explicit efforts must reach vmlx's typed validation instead of being coerced"
+        )
+
         let reasoning = MLXBatchAdapter.additionalContext(
             for: GenerationParameters(
                 temperature: nil,
@@ -1676,7 +1758,10 @@ struct MLXBatchAdapterTests {
             modelName: modelName
         )
         #expect(legacyToggle["enable_thinking"] as? Bool == true)
-        #expect(legacyToggle["reasoning_effort"] as? String == "high")
+        #expect(
+            legacyToggle["reasoning_effort"] == nil,
+            "A legacy thinking-on toggle must preserve the bundle's default effort"
+        )
     }
 
     @Test func additionalContext_threadsRequiredToolChoiceToLocalTemplates() {
