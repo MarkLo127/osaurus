@@ -39,6 +39,26 @@
             "target": "osaurus-cli",
             "configuration": "release",
             "preLaunchTask": "swift: Build Release osaurus-cli (Packages/OsaurusCLI)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:osaurus}/Packages/OsaurusCore",
+            "name": "Debug osaurus-plugin-host (Packages/OsaurusCore)",
+            "target": "osaurus-plugin-host",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug osaurus-plugin-host (Packages/OsaurusCore)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:osaurus}/Packages/OsaurusCore",
+            "name": "Release osaurus-plugin-host (Packages/OsaurusCore)",
+            "target": "osaurus-plugin-host",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release osaurus-plugin-host (Packages/OsaurusCore)"
         }
     ]
 }
