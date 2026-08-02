@@ -21,6 +21,15 @@ public struct ClaudeCodeRunOptions: Sendable, Equatable {
     public var allowWrites: Bool
     /// Agent mode only: auto-approve `Bash`.
     public var allowShell: Bool
+    /// Agent mode only: attach Osaurus's config tools over MCP.
+    public var allowOsaurusTools: Bool
+    /// Nested under `allowOsaurusTools`: include the mutating ones.
+    public var allowOsaurusConfigWrites: Bool
+    /// Absolute path to the `osaurus` CLI that backs the MCP bridge. Resolved
+    /// by the caller (the app knows its own bundle); nil disables the bridge
+    /// even when `allowOsaurusTools` is set, so a source build without an
+    /// embedded CLI degrades instead of spawning a bad command.
+    public var osaurusCLIPath: String?
     /// The chat's working folder. Nil falls back to a scratch directory, so a
     /// run without a folder can't wander into the app bundle or the user's home.
     public var workingDirectory: URL?
@@ -29,12 +38,26 @@ public struct ClaudeCodeRunOptions: Sendable, Equatable {
         mode: ClaudeCodeMode = .agent,
         allowWrites: Bool = false,
         allowShell: Bool = false,
+        allowOsaurusTools: Bool = false,
+        allowOsaurusConfigWrites: Bool = false,
+        osaurusCLIPath: String? = nil,
         workingDirectory: URL? = nil
     ) {
         self.mode = mode
         self.allowWrites = allowWrites
         self.allowShell = allowShell
+        self.allowOsaurusTools = allowOsaurusTools
+        self.allowOsaurusConfigWrites = allowOsaurusConfigWrites
+        self.osaurusCLIPath = osaurusCLIPath
         self.workingDirectory = workingDirectory
+    }
+
+    /// Whether this run should actually attach the MCP bridge.
+    ///
+    /// Text-only mode disables every tool, and the bridge is useless without a
+    /// CLI to launch, so both are hard preconditions rather than caller duties.
+    public var attachesOsaurusMCP: Bool {
+        mode == .agent && allowOsaurusTools && osaurusCLIPath != nil
     }
 
     public static let `default` = ClaudeCodeRunOptions()
@@ -86,14 +109,41 @@ actor ClaudeCodeService: ToolCapableService {
         }
 
         let rendered = Self.renderPrompt(messages: messages)
+
+        // The MCP bridge proxies to the local HTTP server, so a config written
+        // while the server is down would hand the model tools whose every call
+        // fails. Resolving it here (rather than at settings time) also means
+        // starting the server mid-session makes the tools work on the next turn.
+        let mcpConfigURL = await Self.makeOsaurusMCPConfig(options: options)
+
+        // Tell the model what it actually has. Osaurus agent prompts routinely
+        // instruct "read state with osaurus_status"; that text arrives here
+        // regardless, so an un-bridged run must be told the tools are absent or
+        // it burns the turn guessing at permission errors.
+        let toolNote = ClaudeCodeConfiguration.osaurusToolsSystemNote(
+            available: mcpConfigURL != nil,
+            allowConfigWrites: options.allowOsaurusConfigWrites,
+            reason: Self.osaurusToolsUnavailableReason(
+                options: options,
+                bridgeAttached: mcpConfigURL != nil
+            )
+        )
+        let systemPrompt = [rendered.systemPrompt, toolNote]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+
         let arguments = ClaudeCodeConfiguration.arguments(
             model: model,
             mode: options.mode,
             allowedTools: ClaudeCodeConfiguration.allowedTools(
                 allowWrites: options.allowWrites,
-                allowShell: options.allowShell
+                allowShell: options.allowShell,
+                allowOsaurusTools: mcpConfigURL != nil,
+                allowOsaurusConfigWrites: options.allowOsaurusConfigWrites
             ),
-            systemPrompt: rendered.systemPrompt
+            systemPrompt: systemPrompt,
+            mcpConfigPath: mcpConfigURL?.path
         )
 
         let events = ClaudeCodeProcessRunner.stream(
@@ -298,5 +348,87 @@ actor ClaudeCodeService: ToolCapableService {
         let dir = OsaurusPaths.root().appendingPathComponent("claude-code", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    /// Why the bridge isn't attached, so the system note can be specific.
+    ///
+    /// Nil when it *is* attached. The distinction matters to the user: "switch
+    /// it on in settings" and "start the Osaurus server" are different fixes,
+    /// and a model that can name the right one saves a round trip.
+    private static func osaurusToolsUnavailableReason(
+        options: ClaudeCodeRunOptions,
+        bridgeAttached: Bool
+    ) -> ClaudeCodeConfiguration.OsaurusToolsUnavailableReason? {
+        if bridgeAttached { return nil }
+        if options.mode == .textOnly { return .textOnlyMode }
+        if !options.allowOsaurusTools { return .notEnabled }
+        // Opted in, agent mode, but no config was produced. A missing CLI is
+        // reported as "not enabled" — it isn't actionable by the user and a
+        // packaged build always has one; the live case is a stopped server.
+        return options.osaurusCLIPath == nil ? .notEnabled : .serverNotRunning
+    }
+
+    /// Write the `--mcp-config` file for this run, or nil when the bridge
+    /// shouldn't be attached.
+    ///
+    /// Returns nil — rather than an empty config — when the run doesn't want
+    /// the bridge, when there's no CLI to launch, or when the Osaurus server
+    /// isn't listening. That last check is what stops the model from being
+    /// handed tools it can't actually use: `osaurus mcp` is a proxy, so with
+    /// the server down every call would fail at the transport layer with an
+    /// error the model can't act on.
+    ///
+    /// The file is rewritten each turn (fixed path, not a temp file) so a
+    /// setting change takes effect on the next message without cleanup
+    /// bookkeeping, and a crashed run leaves nothing to reap.
+    private static func makeOsaurusMCPConfig(options: ClaudeCodeRunOptions) async -> URL? {
+        guard options.attachesOsaurusMCP, let cliPath = options.osaurusCLIPath else { return nil }
+        let port = await MainActor.run { ServerConfigurationStore.load()?.port ?? 1337 }
+        guard isOsaurusServerReachable(port: port) else { return nil }
+        guard
+            let json = ClaudeCodeConfiguration.mcpConfigJSON(
+                cliPath: cliPath,
+                allowConfigWrites: options.allowOsaurusConfigWrites
+            )
+        else { return nil }
+
+        let url = scratchDirectory().appendingPathComponent("mcp-config.json", isDirectory: false)
+        do {
+            try Data(json.utf8).write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    /// Cheap liveness probe for the local HTTP server.
+    ///
+    /// A TCP connect, not an HTTP round trip: this runs on the send path and
+    /// only needs to answer "is anything listening", which is exactly what a
+    /// refused connect tells us.
+    private static func isOsaurusServerReachable(port configured: Int, timeout: TimeInterval = 0.5)
+        -> Bool
+    {
+        guard configured > 0, configured <= Int(UInt16.max) else { return false }
+        let port = UInt16(configured)
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: Int32((timeout - floor(timeout)) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+        let connected = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockAddr in
+                connect(fd, sockAddr, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        return connected
     }
 }

@@ -628,6 +628,30 @@ struct ChatSettingsView: View {
                                 set: { $0.allowShell = $1 }
                             )
                         )
+
+                        SettingsToggle(
+                            title: L("Give It Osaurus's Own Tools"),
+                            description: L(
+                                "Expose Osaurus's configuration tools so it can read this app's agents, models, and providers. Requires the Osaurus server to be running."
+                            ),
+                            isOn: claudeCodeBinding(
+                                get: { $0.allowOsaurusTools },
+                                set: { $0.allowOsaurusTools = $1 }
+                            )
+                        )
+
+                        if claudeCodeConfig.allowOsaurusTools {
+                            SettingsToggle(
+                                title: L("Let It Change Osaurus Settings"),
+                                description: L(
+                                    "Also expose the tools that modify agents, providers, models, and plugins. Off keeps its view of Osaurus read-only."
+                                ),
+                                isOn: claudeCodeBinding(
+                                    get: { $0.allowOsaurusConfigWrites },
+                                    set: { $0.allowOsaurusConfigWrites = $1 }
+                                )
+                            )
+                        }
                     }
                 }
             }

@@ -170,6 +170,148 @@ public enum ClaudeCodeConfiguration {
     /// Tools added when the agent opts into shell access.
     public static let shellTools = ["Bash"]
 
+    // MARK: - Osaurus tools over MCP
+
+    /// The MCP server name Osaurus registers itself under. Claude Code exposes
+    /// MCP tools as `mcp__<server>__<tool>`, so this also fixes the allow-list
+    /// spelling.
+    public static let mcpServerName = "osaurus"
+
+    /// Osaurus config tools that only read. Safe to grant whenever the user
+    /// turns Osaurus tools on.
+    public static let osaurusReadOnlyTools = [
+        "osaurus_status", "osaurus_list", "osaurus_describe", "osaurus_search",
+    ]
+
+    /// Osaurus config tools that mutate app state. Behind their own opt-in:
+    /// granting these lets a run silently rewrite agents, providers, and
+    /// installed plugins.
+    public static let osaurusConfigWriteTools = [
+        "osaurus_agent", "osaurus_provider", "osaurus_model", "osaurus_plugin", "osaurus_mcp",
+    ]
+
+    /// Deliberately never exposed. `osaurus_schedule` can queue agent runs, so
+    /// a Claude Code subprocess could schedule work that starts another Claude
+    /// Code subprocess. `AGENTS.md` forbids recursive agent workers, and this
+    /// is the path that would create them.
+    public static let osaurusExcludedTools = ["osaurus_schedule"]
+
+    /// The `--tools` value handed to `osaurus mcp`, so the proxy hides
+    /// everything else at the source rather than trusting the client to skip it.
+    public static func osaurusToolPatterns(allowConfigWrites: Bool) -> [String] {
+        allowConfigWrites ? osaurusReadOnlyTools + osaurusConfigWriteTools : osaurusReadOnlyTools
+    }
+
+    /// Claude Code's namespaced spelling of the same set, for `--allowedTools`.
+    public static func osaurusAllowedToolNames(allowConfigWrites: Bool) -> [String] {
+        osaurusToolPatterns(allowConfigWrites: allowConfigWrites)
+            .map { "mcp__\(mcpServerName)__\($0)" }
+    }
+
+    /// Why Osaurus's own tools aren't reachable on this run.
+    public enum OsaurusToolsUnavailableReason: Sendable, Equatable {
+        /// The agent hasn't opted in.
+        case notEnabled
+        /// Opted in, but the local HTTP server the bridge proxies to is down.
+        case serverNotRunning
+        /// Text-only mode disables every tool.
+        case textOnlyMode
+    }
+
+    /// A note appended to the system prompt describing which Osaurus tools this
+    /// run actually has.
+    ///
+    /// Osaurus agents are prompted to "read current state with `osaurus_status`"
+    /// and similar. That prompt reaches Claude Code verbatim, but the tools only
+    /// arrive when the MCP bridge is attached — so without this note the model
+    /// is told to use tools it cannot see, and spends the turn guessing at
+    /// permission errors instead of answering. Stating the real capability is
+    /// the fix; suppressing the agent's prompt would break every other backend.
+    public static func osaurusToolsSystemNote(
+        available: Bool,
+        allowConfigWrites: Bool = false,
+        reason: OsaurusToolsUnavailableReason? = nil
+    ) -> String {
+        guard available else {
+            let cause: String
+            switch reason {
+            case .serverNotRunning:
+                cause = L(
+                    "the Osaurus server is not running — tell the user to start it from the Osaurus app"
+                )
+            case .textOnlyMode:
+                cause = L("this agent runs Claude Code in text-only mode, which disables all tools")
+            case .notEnabled, nil:
+                cause = L(
+                    "they are switched off for this agent — tell the user to enable \"Give It Osaurus's Own Tools\" in Osaurus settings"
+                )
+            }
+            return String(
+                format: L(
+                    "You do NOT have Osaurus's configuration tools (osaurus_status, osaurus_list, and similar) on this run, because %@. Do not try to call them and do not speculate about permission errors. If the user asks about Osaurus's configuration, say plainly that you can't read it right now, explain why, and offer what they can check themselves."
+                ),
+                cause
+            )
+        }
+
+        let names = osaurusToolPatterns(allowConfigWrites: allowConfigWrites)
+            .map { "`\($0)`" }
+            .joined(separator: ", ")
+        var note = String(
+            format: L(
+                "You can inspect this Osaurus install through these tools: %@. They are the only Osaurus tools available — others named in your instructions are not present on this run."
+            ),
+            names
+        )
+        if !allowConfigWrites {
+            note += " "
+            note += L(
+                "They are read-only. You cannot change Osaurus's configuration; describe the change the user should make instead."
+            )
+        }
+        return note
+    }
+
+    /// Absolute path to the `osaurus` CLI shipped inside this app bundle.
+    ///
+    /// Mirrors `ConfigurationView.resolveCLIExecutableURL`'s order: the
+    /// `Helpers` copy embedded by `make app` first, then the `MacOS` fallback.
+    /// Returns nil in a bare source build with no embedded CLI, which callers
+    /// treat as "no MCP bridge" rather than falling back to a PATH lookup — a
+    /// stray `osaurus` on PATH could belong to a different install talking to a
+    /// different data root.
+    public static func embeddedCLIPath(bundle: Bundle = .main) -> String? {
+        let fm = FileManager.default
+        for relative in ["Contents/Helpers/osaurus", "Contents/MacOS/osaurus"] {
+            let candidate = bundle.bundleURL.appendingPathComponent(relative, isDirectory: false)
+            if fm.isExecutableFile(atPath: candidate.path) { return candidate.path }
+        }
+        return nil
+    }
+
+    /// The `--mcp-config` payload pointing Claude Code back at this Osaurus.
+    ///
+    /// `osaurus mcp` proxies to `127.0.0.1:<port>` and relies on loopback trust
+    /// when network exposure is off, so no credential is embedded here.
+    public static func mcpConfigJSON(
+        cliPath: String,
+        allowConfigWrites: Bool
+    ) -> String? {
+        let patterns = osaurusToolPatterns(allowConfigWrites: allowConfigWrites)
+        guard !patterns.isEmpty else { return nil }
+        let payload: [String: Any] = [
+            "mcpServers": [
+                mcpServerName: [
+                    "command": cliPath,
+                    "args": ["mcp", "--tools", patterns.joined(separator: ",")],
+                ]
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
     // MARK: - Binary resolution
 
     /// Absolute path to the user's `claude`, or nil when it isn't installed
@@ -209,11 +351,15 @@ public enum ClaudeCodeConfiguration {
     ///     text-only mode, where all built-ins are disabled.
     ///   - systemPrompt: appended to Claude Code's own system prompt rather
     ///     than replacing it, so its tool contract stays intact.
+    /// - Parameter mcpConfigPath: when non-nil, an `--mcp-config` file exposing
+    ///   Osaurus's own tools. Only meaningful in agent mode — text-only mode
+    ///   disables every tool, MCP included.
     public static func arguments(
         model: ClaudeCodeModel,
         mode: ClaudeCodeMode,
         allowedTools: [String],
-        systemPrompt: String?
+        systemPrompt: String?,
+        mcpConfigPath: String? = nil
     ) -> [String] {
         var args = [
             "--print",
@@ -242,6 +388,11 @@ public enum ClaudeCodeConfiguration {
             if !allowedTools.isEmpty {
                 args += ["--allowedTools", allowedTools.joined(separator: ",")]
             }
+            // Ordering matters only for readability; `--strict-mcp-config`
+            // above already guarantees nothing else loads.
+            if let mcpConfigPath {
+                args += ["--mcp-config", mcpConfigPath]
+            }
         }
 
         if let systemPrompt, !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -252,10 +403,21 @@ public enum ClaudeCodeConfiguration {
     }
 
     /// Tools to auto-approve given an agent's opt-ins.
-    public static func allowedTools(allowWrites: Bool, allowShell: Bool) -> [String] {
+    ///
+    /// `allowOsaurusTools` adds the namespaced MCP names; without them the
+    /// server would be attached but every call denied by `dontAsk`.
+    public static func allowedTools(
+        allowWrites: Bool,
+        allowShell: Bool,
+        allowOsaurusTools: Bool = false,
+        allowOsaurusConfigWrites: Bool = false
+    ) -> [String] {
         var tools = defaultAllowedTools
         if allowWrites { tools += writeTools }
         if allowShell { tools += shellTools }
+        if allowOsaurusTools {
+            tools += osaurusAllowedToolNames(allowConfigWrites: allowOsaurusConfigWrites)
+        }
         return tools
     }
 

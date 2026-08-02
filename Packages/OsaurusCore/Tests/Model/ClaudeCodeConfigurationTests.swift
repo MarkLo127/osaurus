@@ -337,6 +337,196 @@ struct ClaudeCodeConfigurationTests {
         #expect(ClaudeCodeConfiguration.decodeAuthStatus(Data(#"{"email":"a@b.c"}"#.utf8)) == nil)
     }
 
+    // MARK: - Osaurus MCP bridge
+
+    /// The dispatch tool must never be reachable: it can queue agent runs, and
+    /// a queued run can start another Claude Code subprocess.
+    @Test func scheduleToolIsNeverExposed() {
+        let readOnly = ClaudeCodeConfiguration.osaurusToolPatterns(allowConfigWrites: false)
+        let full = ClaudeCodeConfiguration.osaurusToolPatterns(allowConfigWrites: true)
+
+        #expect(!readOnly.contains("osaurus_schedule"))
+        #expect(!full.contains("osaurus_schedule"))
+        #expect(ClaudeCodeConfiguration.osaurusExcludedTools.contains("osaurus_schedule"))
+    }
+
+    @Test func configWritesAreOptIn() {
+        let readOnly = ClaudeCodeConfiguration.osaurusToolPatterns(allowConfigWrites: false)
+        let full = ClaudeCodeConfiguration.osaurusToolPatterns(allowConfigWrites: true)
+
+        #expect(readOnly.contains("osaurus_status"))
+        #expect(!readOnly.contains("osaurus_agent"))
+        #expect(full.contains("osaurus_agent"))
+        #expect(full.count > readOnly.count)
+    }
+
+    /// Claude Code addresses MCP tools as `mcp__<server>__<tool>`; the bare
+    /// name would silently never match the allow-list.
+    @Test func allowedNamesUseClaudeCodeMCPNamespace() {
+        let names = ClaudeCodeConfiguration.osaurusAllowedToolNames(allowConfigWrites: false)
+
+        #expect(names.contains("mcp__osaurus__osaurus_status"))
+        #expect(names.allSatisfy { $0.hasPrefix("mcp__osaurus__") })
+    }
+
+    @Test func osaurusToolsJoinTheAllowlistOnlyWhenGranted() {
+        let without = ClaudeCodeConfiguration.allowedTools(allowWrites: false, allowShell: false)
+        let with = ClaudeCodeConfiguration.allowedTools(
+            allowWrites: false,
+            allowShell: false,
+            allowOsaurusTools: true
+        )
+
+        #expect(!without.contains { $0.hasPrefix("mcp__") })
+        #expect(with.contains("mcp__osaurus__osaurus_status"))
+        // The read-only built-ins survive either way.
+        #expect(with.contains("Read"))
+    }
+
+    @Test func mcpConfigPointsAtTheGivenCLIWithAFilter() throws {
+        let json = try #require(
+            ClaudeCodeConfiguration.mcpConfigJSON(
+                cliPath: "/Apps/Osaurus.app/Contents/Helpers/osaurus",
+                allowConfigWrites: false
+            )
+        )
+        let root = try #require(
+            try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        let servers = try #require(root["mcpServers"] as? [String: Any])
+        let osaurus = try #require(servers["osaurus"] as? [String: Any])
+
+        #expect(osaurus["command"] as? String == "/Apps/Osaurus.app/Contents/Helpers/osaurus")
+        let args = try #require(osaurus["args"] as? [String])
+        #expect(args.first == "mcp")
+        #expect(args.contains("--tools"))
+        // The filter must be applied at the proxy, not left to the client.
+        let patterns = try #require(args.last)
+        #expect(patterns.contains("osaurus_status"))
+        #expect(!patterns.contains("osaurus_schedule"))
+        #expect(!patterns.contains("osaurus_agent"))
+    }
+
+    @Test func mcpConfigIsOnlyAttachedInAgentModeWithACLI() {
+        let base = ClaudeCodeRunOptions(
+            mode: .agent,
+            allowOsaurusTools: true,
+            osaurusCLIPath: "/tmp/osaurus"
+        )
+        #expect(base.attachesOsaurusMCP)
+
+        var textOnly = base
+        textOnly.mode = .textOnly
+        #expect(!textOnly.attachesOsaurusMCP)
+
+        var noGrant = base
+        noGrant.allowOsaurusTools = false
+        #expect(!noGrant.attachesOsaurusMCP)
+
+        var noCLI = base
+        noCLI.osaurusCLIPath = nil
+        #expect(!noCLI.attachesOsaurusMCP)
+    }
+
+    @Test func mcpConfigFlagOnlyAppearsWhenPathGiven() {
+        let without = ClaudeCodeConfiguration.arguments(
+            model: .sonnet,
+            mode: .agent,
+            allowedTools: ["Read"],
+            systemPrompt: nil
+        )
+        #expect(!without.contains("--mcp-config"))
+
+        let with = ClaudeCodeConfiguration.arguments(
+            model: .sonnet,
+            mode: .agent,
+            allowedTools: ["Read"],
+            systemPrompt: nil,
+            mcpConfigPath: "/tmp/mcp.json"
+        )
+        #expect(with.contains("--mcp-config"))
+        #expect(with.contains("/tmp/mcp.json"))
+        // `--strict-mcp-config` must still be present, or the CLI would also
+        // load whatever the user configured for their terminal sessions.
+        #expect(with.contains("--strict-mcp-config"))
+    }
+
+    /// Text-only mode disables every tool, so an MCP config there would be
+    /// dead weight at best and misleading at worst.
+    @Test func textOnlyModeNeverAttachesMCP() {
+        let args = ClaudeCodeConfiguration.arguments(
+            model: .sonnet,
+            mode: .textOnly,
+            allowedTools: ["Read"],
+            systemPrompt: nil,
+            mcpConfigPath: "/tmp/mcp.json"
+        )
+        #expect(!args.contains("--mcp-config"))
+    }
+
+    // MARK: - Capability note
+
+    /// The whole point: an un-bridged run must be told the tools are absent,
+    /// or it spends the turn guessing at permission errors.
+    @Test func unavailableNoteSaysToolsAreAbsentAndWhy() {
+        let note = ClaudeCodeConfiguration.osaurusToolsSystemNote(
+            available: false,
+            reason: .notEnabled
+        )
+
+        #expect(note.contains("NOT"))
+        #expect(note.contains("osaurus_status"))
+        // Must steer away from the exact failure mode observed in the wild.
+        #expect(note.lowercased().contains("permission"))
+    }
+
+    /// "Switch it on" and "start the server" are different fixes; naming the
+    /// right one saves the user a round trip.
+    @Test func unavailableNoteDistinguishesTheCause() {
+        let disabled = ClaudeCodeConfiguration.osaurusToolsSystemNote(
+            available: false,
+            reason: .notEnabled
+        )
+        let serverDown = ClaudeCodeConfiguration.osaurusToolsSystemNote(
+            available: false,
+            reason: .serverNotRunning
+        )
+        let textOnly = ClaudeCodeConfiguration.osaurusToolsSystemNote(
+            available: false,
+            reason: .textOnlyMode
+        )
+
+        #expect(disabled != serverDown)
+        #expect(serverDown != textOnly)
+        #expect(serverDown.lowercased().contains("server"))
+        #expect(textOnly.lowercased().contains("text-only"))
+    }
+
+    @Test func availableNoteListsExactlyTheGrantedTools() {
+        let note = ClaudeCodeConfiguration.osaurusToolsSystemNote(
+            available: true,
+            allowConfigWrites: false
+        )
+
+        #expect(note.contains("osaurus_status"))
+        // Un-granted and excluded tools must not be advertised.
+        #expect(!note.contains("osaurus_agent"))
+        #expect(!note.contains("osaurus_schedule"))
+        #expect(note.lowercased().contains("read-only"))
+    }
+
+    @Test func availableNoteDropsReadOnlyClaimWhenWritesGranted() {
+        let note = ClaudeCodeConfiguration.osaurusToolsSystemNote(
+            available: true,
+            allowConfigWrites: true
+        )
+
+        #expect(note.contains("osaurus_agent"))
+        #expect(!note.lowercased().contains("read-only"))
+        // Still never the dispatch tool.
+        #expect(!note.contains("osaurus_schedule"))
+    }
+
     @Test func displayPlanNormalizesWhitespaceAndEmpty() {
         #expect(ClaudeCodeAuthStatus(loggedIn: true, subscriptionType: "  ").displayPlan == nil)
         #expect(ClaudeCodeAuthStatus(loggedIn: true, subscriptionType: "").displayPlan == nil)

@@ -393,21 +393,33 @@ public struct ClaudeCodeAgentConfig: Codable, Sendable, Equatable {
     /// the Osaurus sandbox — Claude Code's shell runs unconfined on the host
     /// under the user's own account.
     public var allowShell: Bool
+    /// Agent mode: attach Osaurus's own config tools over MCP, so the run can
+    /// read this app's state. Defaults `false` — the tool definitions cost
+    /// context on every turn and only work while the Osaurus server is up.
+    public var allowOsaurusTools: Bool
+    /// Nested under `allowOsaurusTools`: also expose the Osaurus tools that
+    /// *change* configuration (agents, providers, models, plugins). Defaults
+    /// `false`, so the grant starts read-only like every other switch here.
+    public var allowOsaurusConfigWrites: Bool
 
     public init(
         mode: ClaudeCodeMode = .agent,
         allowWrites: Bool = false,
-        allowShell: Bool = false
+        allowShell: Bool = false,
+        allowOsaurusTools: Bool = false,
+        allowOsaurusConfigWrites: Bool = false
     ) {
         self.mode = mode
         self.allowWrites = allowWrites
         self.allowShell = allowShell
+        self.allowOsaurusTools = allowOsaurusTools
+        self.allowOsaurusConfigWrites = allowOsaurusConfigWrites
     }
 
     public static let `default` = ClaudeCodeAgentConfig()
 
     private enum CodingKeys: String, CodingKey {
-        case mode, allowWrites, allowShell
+        case mode, allowWrites, allowShell, allowOsaurusTools, allowOsaurusConfigWrites
     }
 
     /// Custom decode so a missing key — or a `mode` written by a future build
@@ -422,6 +434,9 @@ public struct ClaudeCodeAgentConfig: Codable, Sendable, Equatable {
         }
         allowWrites = try c.decodeIfPresent(Bool.self, forKey: .allowWrites) ?? false
         allowShell = try c.decodeIfPresent(Bool.self, forKey: .allowShell) ?? false
+        allowOsaurusTools = try c.decodeIfPresent(Bool.self, forKey: .allowOsaurusTools) ?? false
+        allowOsaurusConfigWrites =
+            try c.decodeIfPresent(Bool.self, forKey: .allowOsaurusConfigWrites) ?? false
     }
 }
 

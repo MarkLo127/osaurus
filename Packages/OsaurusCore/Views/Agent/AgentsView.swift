@@ -5289,6 +5289,28 @@ struct AgentDetailView: View {
                         ) { allow in
                             updateClaudeCode(from: config) { $0.allowShell = allow }
                         }
+
+                        featureCard(
+                            title: "Give It Osaurus's Own Tools",
+                            subtitle:
+                                "Expose Osaurus's configuration tools so it can read this app's agents, models, and providers. Requires the Osaurus server to be running.",
+                            isOn: config.allowOsaurusTools
+                        ) { allow in
+                            updateClaudeCode(from: config) { $0.allowOsaurusTools = allow }
+                        }
+
+                        if config.allowOsaurusTools {
+                            featureCard(
+                                title: "Let It Change Osaurus Settings",
+                                subtitle:
+                                    "Also expose the tools that modify agents, providers, models, and plugins. Off keeps its view of Osaurus read-only.",
+                                isOn: config.allowOsaurusConfigWrites
+                            ) { allow in
+                                updateClaudeCode(from: config) {
+                                    $0.allowOsaurusConfigWrites = allow
+                                }
+                            }
+                        }
                     }
                 }
             }

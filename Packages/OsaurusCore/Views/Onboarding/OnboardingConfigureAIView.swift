@@ -48,6 +48,10 @@ enum APISubstate: Equatable {
     case apiKeyPicker
     case keyForm(ProviderPreset)
     case customForm
+    /// Claude Code sign-in status. Not a `keyForm`: there is no key to enter
+    /// and no `RemoteProvider` to build — the CLI owns the session, so this
+    /// screen only reports state and offers to start the CLI's own sign-in.
+    case claudeCode
 }
 
 enum APITestResult: Equatable {
@@ -586,7 +590,9 @@ final class ConfigureAIState: ObservableObject {
         switch apiSubstate {
         case .keyForm(let p): return p
         case .customForm: return .custom
-        case .picker, .apiKeyPicker: return nil
+        // Claude Code has no `ProviderPreset`: it builds no `RemoteProvider`,
+        // so every preset-keyed path (test, save, telemetry) must skip it.
+        case .picker, .apiKeyPicker, .claudeCode: return nil
         }
     }
 
@@ -684,6 +690,44 @@ final class ConfigureAIState: ObservableObject {
     /// is decided by where the card lives: the OAuth-first top level uses OAuth,
     /// the "Use an API key" sub-list (`preferAPIKey`) uses the pasted key. There
     /// is no in-form fork, so we pin the auth mode here at selection time.
+    /// Claude Code sign-in status, resolved when its screen appears. Lives on
+    /// the shared state rather than the body view because the footer CTA is a
+    /// separate struct and has to read the same answer.
+    @Published var claudeCodeAuth: ClaudeCodeAuthStatus?
+    @Published var isCheckingClaudeCode = false
+    @Published var isSigningInClaudeCode = false
+
+    func refreshClaudeCodeAuth() async {
+        isCheckingClaudeCode = true
+        claudeCodeAuth = await ClaudeCodeConfiguration.authStatus()
+        isCheckingClaudeCode = false
+    }
+
+    /// Run the CLI's own browser sign-in, then re-read the status.
+    func signInClaudeCode() async {
+        isSigningInClaudeCode = true
+        defer { isSigningInClaudeCode = false }
+        if let status = await ClaudeCodeConfiguration.login(), status.loggedIn {
+            claudeCodeAuth = status
+        } else {
+            // Cancelled or failed — re-probe rather than asserting a failure we
+            // can't distinguish from the user closing the browser.
+            await refreshClaudeCodeAuth()
+        }
+    }
+
+    /// Drill into the Claude Code screen. No preset and no auth method: the
+    /// choice doesn't flow through `ProviderCatalog` at all.
+    func selectClaudeCode() {
+        substateDirection = .forward
+        apiSubstate = .claudeCode
+    }
+
+    func popClaudeCodeToPicker() {
+        substateDirection = .backward
+        apiSubstate = .picker
+    }
+
     func selectAPIPreset(_ preset: ProviderPreset, preferAPIKey: Bool = false) {
         substateDirection = .forward
         if let entry = ProviderCatalog.entry(for: preset) {
@@ -875,6 +919,7 @@ struct ConfigureAIBody: View {
             case .apiKeyPicker: return "byok-key-picker"
             case .keyForm(let p): return "byok-key-\(p.rawValue)"
             case .customForm: return "byok-custom"
+            case .claudeCode: return "byok-claude-code"
             }
         }
     }
@@ -923,6 +968,10 @@ struct ConfigureAIBody: View {
         case .customForm:
             substateWithBackBar(onBack: { state.popFormToPicker(for: .custom) }) {
                 apiCustomFormView
+            }
+        case .claudeCode:
+            substateWithBackBar(onBack: { state.popClaudeCodeToPicker() }) {
+                claudeCodeView
             }
         }
     }
@@ -1043,8 +1092,17 @@ struct ConfigureAIBody: View {
     /// API key" drill-in.
     private var apiPickerView: some View {
         VStack(alignment: .leading, spacing: OnboardingMetrics.cardSpacing) {
-            ForEach(ProviderPreset.oauthProviders, id: \.id) { preset in
+            ForEach(Array(ProviderPreset.oauthProviders.enumerated()), id: \.element.id) {
+                index,
+                preset in
                 apiPresetCard(preset)
+
+                // Second, next to the other subscription sign-ins. Only when
+                // the CLI is installed: onboarding shouldn't send a new user
+                // off to install other software mid-flow.
+                if index == 0, ClaudeCodeConfiguration.isAvailable() {
+                    claudeCodeCard
+                }
             }
             useAPIKeyCard
         }
@@ -1062,6 +1120,67 @@ struct ConfigureAIBody: View {
         ) {
             state.showAPIKeyPicker()
         }
+    }
+
+    /// Claude Code entry. Sits with the OAuth sign-ins rather than under "Use
+    /// an API key" because it is subscription-backed and stores no key.
+    private var claudeCodeCard: some View {
+        OnboardingRowCard(
+            icon: .symbol("terminal.fill"),
+            title: L("Claude Code"),
+            subtitle: L("Use your Claude Pro or Max subscription — no API key"),
+            accessory: .chevron
+        ) {
+            state.selectClaudeCode()
+        }
+    }
+
+    /// Claude Code sign-in status.
+    ///
+    /// Deliberately thin next to the key forms: there is nothing to type and
+    /// nothing to test. Either the CLI is signed in — in which case the only
+    /// action is to continue — or it isn't, and the fix is the CLI's own
+    /// browser sign-in.
+    @ViewBuilder
+    private var claudeCodeView: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Claude Code", bundle: .module)
+                .font(theme.font(size: 20, weight: .semibold))
+                .foregroundColor(theme.primaryText)
+
+            Text(
+                "Osaurus runs your local `claude` command, so requests use your Claude subscription and Osaurus never stores an Anthropic key.",
+                bundle: .module
+            )
+            .font(theme.font(size: 13))
+            .foregroundColor(theme.secondaryText)
+            .fixedSize(horizontal: false, vertical: true)
+
+            if let status = state.claudeCodeAuth, status.loggedIn {
+                OnboardingRowCard(
+                    icon: .symbol("checkmark.circle.fill"),
+                    title: status.email ?? L("Signed in and ready"),
+                    subtitle: status.displayPlan.map { L("Claude \($0)") },
+                    accessory: .none
+                ) {}
+            } else if state.isCheckingClaudeCode {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking Claude Code…", bundle: .module)
+                        .font(theme.font(size: 13))
+                        .foregroundColor(theme.secondaryText)
+                }
+            } else {
+                Text(
+                    "Sign in with the Anthropic account that has your Pro or Max subscription.",
+                    bundle: .module
+                )
+                .font(theme.font(size: 12))
+                .foregroundColor(theme.tertiaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .task { await state.refreshClaudeCodeAuth() }
     }
 
     /// Grouped API-key sub-list (key vendors / Local / Custom). Azure OpenAI is
@@ -1892,7 +2011,9 @@ struct ConfigureAICTA: View {
                             state.saveProviderAndContinue(onComplete: onComplete)
                         }
                     }
-                case .picker, .apiKeyPicker:
+                // Claude Code never runs the connection test — there is no
+                // endpoint to probe — so it can't reach this auto-advance.
+                case .picker, .apiKeyPicker, .claudeCode:
                     break
                 }
             }
@@ -1913,7 +2034,35 @@ struct ConfigureAICTA: View {
                 providerPickerHint
             case .keyForm, .customForm:
                 apiActionButton
+            case .claudeCode:
+                claudeCodeActionButton
             }
+        }
+    }
+
+    /// Footer CTA for the Claude Code screen. Signed in, it continues; signed
+    /// out, it starts the CLI's own browser sign-in. There is no "test" step —
+    /// `claude auth status` already answered the only question.
+    @ViewBuilder
+    private var claudeCodeActionButton: some View {
+        if let status = state.claudeCodeAuth, status.loggedIn {
+            OnboardingBrandButton(
+                title: L("Continue"),
+                action: {
+                    state.selectedBrainSource = .claudeCode
+                    onComplete()
+                },
+                isEnabled: true
+            )
+            .fixedSize(horizontal: true, vertical: false)
+        } else {
+            OnboardingBrandButton(
+                title: state.isSigningInClaudeCode
+                    ? L("Waiting for your browser…") : L("Sign in with Claude"),
+                action: { Task { await state.signInClaudeCode() } },
+                isEnabled: !state.isSigningInClaudeCode && !state.isCheckingClaudeCode
+            )
+            .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -1931,7 +2080,7 @@ struct ConfigureAICTA: View {
             .fixedSize(horizontal: true, vertical: false)
 
             if !state.hasStartedLocalDownload,
-               state.selectedModel?.isDownloaded != true
+                state.selectedModel?.isDownloaded != true
             {
                 OnboardingTextButton(title: "Skip download and use Cloud only") {
                     state.chooseOsaurusAndContinue(onComplete: onComplete)

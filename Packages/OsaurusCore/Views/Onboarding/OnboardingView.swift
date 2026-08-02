@@ -573,6 +573,13 @@ public struct OnboardingView: View {
             if let providerId = configureAIState.providerModelPinTarget {
                 pinProviderModel(providerId: providerId, forAgent: agentId)
             }
+        case .claudeCode:
+            // No catalog to wait on and no provider to connect: the picker ids
+            // are a fixed set, so the default can be pinned immediately.
+            AgentManager.shared.updateDefaultModel(
+                for: agentId,
+                model: ClaudeCodeModel.sonnet.pickerId
+            )
         case nil:
             break
         }
