@@ -96,3 +96,30 @@ struct MCPToolFilterTests {
         #expect(filter.summary.contains("osaurus_*"))
     }
 }
+
+// MARK: - Bridge grant
+
+@Suite("MCP bridge grant header")
+struct MCPBridgeGrantTests {
+    /// Pins both literals. `ClaudeCodeBridgeGrantStore` in OsaurusCore declares
+    /// the same two strings; the CLI cannot import Core, so a rename on either
+    /// side silently breaks the bridge unless something asserts the values.
+    @Test("constants match the OsaurusCore contract")
+    func constantsMatchCore() {
+        #expect(MCPCommand.bridgeGrantEnvironmentKey == "OSAURUS_MCP_BRIDGE_GRANT")
+        #expect(MCPCommand.bridgeGrantHeaderName == "X-Osaurus-Bridge-Grant")
+    }
+
+    @Test("grant header is absent when the environment does not carry one")
+    func absentWithoutEnvironment() throws {
+        // A user-configured MCP client is spawned without the variable, and must
+        // stay unattributed rather than inheriting some other turn's identity.
+        let request = MCPCommand.makeProxyRequest(
+            url: try #require(URL(string: "http://127.0.0.1:1337/mcp/call")),
+            method: "POST",
+            timeout: 30,
+            credential: nil
+        )
+        #expect(request.value(forHTTPHeaderField: MCPCommand.bridgeGrantHeaderName) == nil)
+    }
+}

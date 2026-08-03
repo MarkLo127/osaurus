@@ -3418,7 +3418,8 @@ final class ChatSession: ObservableObject {
             allowOsaurusTools: config.allowOsaurusTools,
             allowOsaurusConfigWrites: config.allowOsaurusConfigWrites,
             osaurusCLIPath: ClaudeCodeConfiguration.embeddedCLIPath(),
-            workingDirectory: root
+            workingDirectory: root,
+            agentId: agentId
         )
     }
 

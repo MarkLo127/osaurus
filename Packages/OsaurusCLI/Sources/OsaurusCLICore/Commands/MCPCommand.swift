@@ -229,8 +229,25 @@ public struct MCPCommand: Command {
         if let credential {
             request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
         }
+        // Present the per-turn bridge grant when Osaurus spawned us for one of
+        // its own chat turns. It tells the server which agent's tool call this
+        // is — identity the process boundary would otherwise drop, since the
+        // server sees an ordinary loopback request either way. Absent for a
+        // user-configured MCP client, which is exactly the caller that should
+        // not be able to act as an agent.
+        if let grant = ProcessInfo.processInfo.environment[bridgeGrantEnvironmentKey],
+            !grant.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            request.setValue(grant, forHTTPHeaderField: bridgeGrantHeaderName)
+        }
         return request
     }
+
+    /// Kept in sync with `ClaudeCodeBridgeGrantStore` in OsaurusCore. The CLI
+    /// does not depend on Core, so the two constants are duplicated rather than
+    /// shared; `MCPBridgeGrantTests` pins the literals on both sides.
+    static let bridgeGrantEnvironmentKey = "OSAURUS_MCP_BRIDGE_GRANT"
+    static let bridgeGrantHeaderName = "X-Osaurus-Bridge-Grant"
 
     private static let accessKeyOptionNames: Set<String> = [
         "--access-key",

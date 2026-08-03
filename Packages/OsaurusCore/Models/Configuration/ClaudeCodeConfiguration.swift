@@ -293,20 +293,26 @@ public enum ClaudeCodeConfiguration {
     ///
     /// `osaurus mcp` proxies to `127.0.0.1:<port>` and relies on loopback trust
     /// when network exposure is off, so no credential is embedded here.
+    /// - Parameter bridgeGrant: Per-turn grant proving which agent's chat this
+    ///   subprocess serves. Delivered through the server block's `env` rather
+    ///   than `args`, so it never appears in `ps` output for other processes on
+    ///   the machine. Nil omits it, which leaves the child unattributed — fine
+    ///   for a custom agent, but the Default agent's tools will refuse.
     public static func mcpConfigJSON(
         cliPath: String,
-        allowConfigWrites: Bool
+        allowConfigWrites: Bool,
+        bridgeGrant: String? = nil
     ) -> String? {
         let patterns = osaurusToolPatterns(allowConfigWrites: allowConfigWrites)
         guard !patterns.isEmpty else { return nil }
-        let payload: [String: Any] = [
-            "mcpServers": [
-                mcpServerName: [
-                    "command": cliPath,
-                    "args": ["mcp", "--tools", patterns.joined(separator: ",")],
-                ]
-            ]
+        var server: [String: Any] = [
+            "command": cliPath,
+            "args": ["mcp", "--tools", patterns.joined(separator: ",")],
         ]
+        if let bridgeGrant, !bridgeGrant.isEmpty {
+            server["env"] = [ClaudeCodeBridgeGrantStore.environmentKey: bridgeGrant]
+        }
+        let payload: [String: Any] = ["mcpServers": [mcpServerName: server]]
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         else { return nil }
         return String(decoding: data, as: UTF8.self)

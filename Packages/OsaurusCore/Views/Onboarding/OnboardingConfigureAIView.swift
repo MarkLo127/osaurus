@@ -1160,7 +1160,7 @@ struct ConfigureAIBody: View {
                 OnboardingRowCard(
                     icon: .symbol("checkmark.circle.fill"),
                     title: status.email ?? L("Signed in and ready"),
-                    subtitle: status.displayPlan.map { L("Claude \($0)") },
+                    subtitle: status.displayPlan.map { String(format: L("Claude %@"), $0) },
                     accessory: .none
                 ) {}
             } else if state.isCheckingClaudeCode {

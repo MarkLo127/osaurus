@@ -33,6 +33,13 @@ public struct ClaudeCodeRunOptions: Sendable, Equatable {
     /// The chat's working folder. Nil falls back to a scratch directory, so a
     /// run without a folder can't wander into the app bundle or the user's home.
     public var workingDirectory: URL?
+    /// The agent this turn belongs to.
+    ///
+    /// Claude Code runs out of process, so `ChatExecutionContext.currentAgentId`
+    /// — a `@TaskLocal` — cannot reach the tool calls it makes back through the
+    /// MCP bridge. Carrying the id here lets the bridge mint a grant the server
+    /// can verify, which is what restores the identity the boundary lost.
+    public var agentId: UUID?
 
     public init(
         mode: ClaudeCodeMode = .agent,
@@ -41,7 +48,8 @@ public struct ClaudeCodeRunOptions: Sendable, Equatable {
         allowOsaurusTools: Bool = false,
         allowOsaurusConfigWrites: Bool = false,
         osaurusCLIPath: String? = nil,
-        workingDirectory: URL? = nil
+        workingDirectory: URL? = nil,
+        agentId: UUID? = nil
     ) {
         self.mode = mode
         self.allowWrites = allowWrites
@@ -50,6 +58,7 @@ public struct ClaudeCodeRunOptions: Sendable, Equatable {
         self.allowOsaurusConfigWrites = allowOsaurusConfigWrites
         self.osaurusCLIPath = osaurusCLIPath
         self.workingDirectory = workingDirectory
+        self.agentId = agentId
     }
 
     /// Whether this run should actually attach the MCP bridge.
@@ -114,7 +123,18 @@ actor ClaudeCodeService: ToolCapableService {
         // while the server is down would hand the model tools whose every call
         // fails. Resolving it here (rather than at settings time) also means
         // starting the server mid-session makes the tools work on the next turn.
-        let mcpConfigURL = await Self.makeOsaurusMCPConfig(options: options)
+        // Minted before the config so the grant can be embedded in it. Nil when
+        // the run has no agent to speak for; the bridge still attaches, the
+        // child is just unattributed and the Default agent's tools will refuse.
+        let bridgeGrant: String? = await {
+            guard options.attachesOsaurusMCP, let agentId = options.agentId else { return nil }
+            return await ClaudeCodeBridgeGrantStore.shared.mint(
+                agentId: agentId,
+                allowsConfigWrites: options.allowOsaurusConfigWrites
+            )
+        }()
+
+        let mcpConfigURL = await Self.makeOsaurusMCPConfig(options: options, bridgeGrant: bridgeGrant)
 
         // Tell the model what it actually has. Osaurus agent prompts routinely
         // instruct "read state with osaurus_status"; that text arrives here
@@ -155,6 +175,15 @@ actor ClaudeCodeService: ToolCapableService {
 
         let (stream, continuation) = AsyncThrowingStream<String, Error>.makeStream()
         let producerTask = Task {
+            // A grant outlives its usefulness the moment the turn ends, so it is
+            // revoked on every exit — normal finish, thrown error, and
+            // cancellation alike. `defer` rather than a trailing call because
+            // the loop below has three separate returns.
+            defer {
+                if let bridgeGrant {
+                    Task { await ClaudeCodeBridgeGrantStore.shared.revoke(bridgeGrant) }
+                }
+            }
             do {
                 for try await event in events {
                     if Task.isCancelled {
@@ -381,20 +410,32 @@ actor ClaudeCodeService: ToolCapableService {
     /// The file is rewritten each turn (fixed path, not a temp file) so a
     /// setting change takes effect on the next message without cleanup
     /// bookkeeping, and a crashed run leaves nothing to reap.
-    private static func makeOsaurusMCPConfig(options: ClaudeCodeRunOptions) async -> URL? {
+    private static func makeOsaurusMCPConfig(
+        options: ClaudeCodeRunOptions,
+        bridgeGrant: String?
+    ) async -> URL? {
         guard options.attachesOsaurusMCP, let cliPath = options.osaurusCLIPath else { return nil }
         let port = await MainActor.run { ServerConfigurationStore.load()?.port ?? 1337 }
         guard isOsaurusServerReachable(port: port) else { return nil }
         guard
             let json = ClaudeCodeConfiguration.mcpConfigJSON(
                 cliPath: cliPath,
-                allowConfigWrites: options.allowOsaurusConfigWrites
+                allowConfigWrites: options.allowOsaurusConfigWrites,
+                bridgeGrant: bridgeGrant
             )
         else { return nil }
 
         let url = scratchDirectory().appendingPathComponent("mcp-config.json", isDirectory: false)
         do {
             try Data(json.utf8).write(to: url, options: .atomic)
+            // The file now carries the turn's grant, so it must not be readable
+            // by other accounts on the machine. `.atomic` writes a fresh inode
+            // under the process umask, so the mode is set after the fact rather
+            // than assumed.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
             return url
         } catch {
             return nil
