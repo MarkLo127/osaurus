@@ -1971,8 +1971,12 @@ extension AppDelegate {
         let targetPort = desiredPort ?? (ServerConfigurationStore.load()?.port ?? 1337)
         guard (1 ..< 65536).contains(targetPort) else { return }
 
-        // Apply exposure policy based on request (default localhost-only)
+        // Apply exposure policy based on request (default localhost-only).
+        // An explicit flag is the user speaking, so it takes ownership of the
+        // setting away from the Bonjour sync — otherwise removing the last
+        // Bonjour agent would close a port the user asked to have open.
         serverController.configuration.exposeToNetwork = exposeFlag
+        serverController.configuration.exposureAutoEnabledByBonjour = false
         serverController.port = targetPort
         serverController.saveConfiguration()
 

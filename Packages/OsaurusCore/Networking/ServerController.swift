@@ -284,31 +284,58 @@ final class ServerController: ObservableObject {
             synchronizeSpawnBatchLimit(from: existingRuntimeSettings)
         }
         // Keep exposeToNetwork in sync with Bonjour-enabled agents.
-        // Only turn ON when a Bonjour agent requires it — never force
-        // it OFF, so the user's manual "expose to local network" setting
-        // is preserved across launches.
+        //
+        // Bonjour needs the server off loopback, so an agent enabling it forces
+        // exposure on. This sync also retracts that — but *only* what it set
+        // itself, tracked by `exposureAutoEnabledByBonjour`. An exposure the
+        // user asked for (`--expose`, or any config predating the flag) is
+        // still never touched, which was the original intent; previously that
+        // was achieved by never turning exposure off at all, which left the
+        // side effect stuck on forever once any agent had ever used Bonjour.
         agentsCancellable = AgentManager.shared.$agents
             .sink { agents in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let shouldExpose = agents.contains { $0.bonjourEnabled }
-                    // Only act when an agent is forcing exposure ON.
-                    // If no agent requires it, leave the user's setting alone.
-                    guard shouldExpose, !self.configuration.exposeToNetwork else { return }
-                    self.configuration.exposeToNetwork = true
-                    self.runtimeSettings.network.host = "0.0.0.0"
-                    self.saveConfiguration()
-                    ServerRuntimeSettingsStore.save(self.runtimeSettings)
-                    // Only restart for a live config change *after* launch has
-                    // settled. During launch the initial auto-start already
-                    // reads the updated config, so restarting here would be
-                    // redundant server churn racing the launch sequence — the
-                    // mid-launch restart the hang audit flagged.
-                    if self.isRunning && self.isLaunchComplete {
-                        await self.restartServer()
-                    }
+                    await self.reconcileBonjourExposure(shouldExpose: shouldExpose)
                 }
             }
+    }
+
+    /// Bring `exposeToNetwork` in line with whether any agent still needs
+    /// Bonjour, touching it only when this sync owns the current value.
+    @MainActor
+    func reconcileBonjourExposure(shouldExpose: Bool) async {
+        let isExposed = configuration.exposeToNetwork
+        let ownedByBonjour = configuration.exposureAutoEnabledByBonjour
+
+        if shouldExpose {
+            guard !isExposed else {
+                // Already exposed. If that was the user's doing, leave the
+                // provenance alone: they keep ownership once Bonjour stops
+                // needing it, so removing the agent won't close their port.
+                return
+            }
+            configuration.exposeToNetwork = true
+            configuration.exposureAutoEnabledByBonjour = true
+            runtimeSettings.network.host = "0.0.0.0"
+        } else {
+            // Retract only an exposure this sync opened.
+            guard isExposed, ownedByBonjour else { return }
+            configuration.exposeToNetwork = false
+            configuration.exposureAutoEnabledByBonjour = false
+            runtimeSettings.network.host = "127.0.0.1"
+        }
+
+        saveConfiguration()
+        ServerRuntimeSettingsStore.save(runtimeSettings)
+        // Only restart for a live config change *after* launch has settled.
+        // During launch the initial auto-start already reads the updated
+        // config, so restarting here would be redundant server churn racing
+        // the launch sequence — the mid-launch restart the hang audit flagged.
+        if isRunning && isLaunchComplete {
+            await restartServer()
+        }
     }
 
     /// Runs the one-shot legacy → vmlx runtime-settings migration and
