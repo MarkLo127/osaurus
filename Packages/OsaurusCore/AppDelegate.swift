@@ -155,6 +155,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        // Lift the default 256-fd soft limit before the NIO server, plugin
+        // host, and storage layer start opening descriptors — SwiftNIO dies
+        // fatally on `kqueue(): Too many open files` (APPLE-MACOS-19T).
+        FileDescriptorLimit.raiseToMaximum()
+
         // sequoia fallback. Tahoe already ran this in
         // `applicationWillFinishLaunching`.
         if #unavailable(macOS 26.0) {
@@ -219,6 +224,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         // Bring up analytics early so the launch + onboarding funnel is
         // captured. No-ops silently when no Aptabase key is configured.
         TelemetryService.shared.configure()
+
+        // Attribute the `brain_source` dimension for installs that completed
+        // onboarding before the choice existed: stamp `pre_choice` once so
+        // their chat sends land in a named bucket instead of the historical
+        // unattributable coverage gap.
+        FeatureTelemetry.stampLegacyBrainSourceIfNeeded()
 
         // Install the crash + app-hang handler as early as possible so it
         // covers the rest of launch. Crash reporting is opt-out (on unless the
@@ -2390,6 +2401,11 @@ extension AppDelegate {
                 category: "navigation",
                 message: "management.window \(shownTab.rawValue)"
             )
+            // Settings-engagement signal. Every real open funnels through
+            // here (the launch-time prewarm builds the window hidden and
+            // never does), so this — plus the tab-switch emit in
+            // `ManagementView.handleTabChange` — covers settings visits.
+            FeatureTelemetry.settingsOpened(tab: shownTab)
             let windowManager = WindowManager.shared
             let themeManager = ThemeManager.shared
             let root = ManagementView(
