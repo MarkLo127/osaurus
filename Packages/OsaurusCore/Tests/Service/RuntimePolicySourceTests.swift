@@ -781,7 +781,7 @@ struct RuntimePolicySourceTests {
         // and both xcworkspace Package.resolved files. Miss one and a release
         // surface resolves a revision nobody proved. OsaurusEvals resolves
         // this manifest transitively and its local Package.resolved is ignored.
-        let expectedRuntimeHardenedRevision = "0beef2031e963cfd2ba5ddd362fdd6cb072a809f"
+        let expectedRuntimeHardenedRevision = "8e2c3d6ebca6a43be6a516eb3dc55ef49c174a5d"
         let manifestRevision = try Self.vmlxPinRevision(in: manifest)
         let coreResolvedRevision = try Self.vmlxPinRevision(in: coreResolved)
         let workspaceRevision = try Self.vmlxPinRevision(in: workspaceResolved)
@@ -1196,6 +1196,21 @@ struct RuntimePolicySourceTests {
         #expect(!adapter.contains(#""cacheStableSystemPrefix""#))
     }
 
+    @Test("near-limit wrap-up notice stages only on a mid-run tool tail")
+    func nearLimitNoticeStagesOnlyMidRun() throws {
+        // The "Context is nearly full — wrap up" notice is a mid-run nudge.
+        // Staging it on a fresh user question appends it as the trailing
+        // user-role message and displaces the real query (observed live:
+        // the model reasoned about the notice instead of the question), and
+        // staging it on a non-tool tail also breaks the byte-identical
+        // rebuild contract of reasoning-continuation retries.
+        let chatView = try Self.source("Views/Chat/ChatView.swift")
+        #expect(chatView.contains(#"let midRunToolTail = msgs.last?.role == "tool""#))
+        #expect(
+            chatView.contains("!tokenBudgetNoticeFired,\n                                midRunToolTail,")
+        )
+    }
+
     @Test("Server settings cache changes clear loaded model runtime")
     func cacheSettingsChangesClearLoadedModelRuntime() throws {
         let controller = try Self.source("Networking/ServerController.swift")
@@ -1538,7 +1553,6 @@ struct RuntimePolicySourceTests {
     @Test("Background fallback LLM does not force no-think model options")
     func backgroundFallbackLLMDoesNotForceNoThinkOptions() throws {
         let coreModel = try Self.source("Services/Inference/CoreModelService.swift")
-        let greeting = try Self.source("Services/Chat/GenerativeGreetingService.swift")
 
         #expect(
             coreModel.contains("modelOptions: [String: ModelOptionValue]"),
@@ -1549,8 +1563,12 @@ struct RuntimePolicySourceTests {
             "CoreModelService.generate must thread modelOptions into GenerationParameters before routing to MLX/remote services"
         )
         #expect(
-            !greeting.contains("modelOptions: [\"reasoningEffort\": .string(\"no_think\")]"),
-            "GenerativeGreetingService must not force no_think for internal greeting calls; model generation_config/runtime defaults remain authoritative"
+            coreModel.contains("modelOptions: [:]"),
+            "CoreModelService's public generation path must default to no synthetic model options so model generation_config/runtime defaults remain authoritative"
+        )
+        #expect(
+            !coreModel.contains("modelOptions: [\"reasoningEffort\": .string(\"no_think\")]"),
+            "CoreModelService must not force no_think for background calls"
         )
     }
 

@@ -36,43 +36,6 @@ struct QueuedSend: Equatable {
     var oneOffSkillId: UUID?
 }
 
-/// Lifecycle of the generative greeting for a single chat session. Drives
-/// the empty-state UI: `.idle` and `.failed` render the static greeting +
-/// the agent's configured quick actions, `.loading` renders an animated
-/// skeleton, and `.ready` renders the freshly produced AI payload with a
-/// shimmer fade-in. A separate `.failed` (vs `.idle`) lets the UI know the
-/// loader actually completed without a result so it doesn't re-trigger
-/// from a stale state.
-enum GenerativeGreetingState: Equatable {
-    case idle
-    case loading
-    case ready(GenerativeGreeting)
-    case failed
-}
-
-/// Lifts the empty-state's "kick off a generative greeting" wiring out of
-/// `ChatView.body` so the closure stays small enough for the type checker.
-/// Re-runs `loadGenerativeGreetingIfNeeded` whenever the selected model or
-/// active agent changes; the session-level cache key absorbs idempotent
-/// re-fires (re-appearing the empty state, scrolling, etc.).
-private struct GenerativeGreetingTrigger: ViewModifier {
-    @ObservedObject var session: ChatSession
-    @ObservedObject var windowState: ChatWindowState
-
-    func body(content: Content) -> some View {
-        content
-            .onAppear { trigger() }
-            .onChange(of: session.selectedModel) { _, _ in trigger() }
-            .onChange(of: windowState.agentId) { _, _ in trigger() }
-    }
-
-    private func trigger() {
-        // AI greetings are a per-agent opt-in; the agent's own flag is
-        // the sole control.
-        session.loadGenerativeGreetingIfNeeded(agent: windowState.activeAgent)
-    }
-}
-
 /// Equatable wrapper around `ChatEmptyState` so it only re-renders when one of
 /// its actual inputs changes. `ChatView` observes the whole `ChatSession`
 /// object, so its body re-evaluates on any `@Published` mutation — including
@@ -90,7 +53,6 @@ private struct EmptyStateContent: View, Equatable {
     let agents: [Agent]
     let activeAgentId: UUID
     let quickActions: [AgentQuickAction]
-    let generativeGreetingState: GenerativeGreetingState
     let pendingLocalModelId: String?
     let temporaryCloudModelName: String?
     let activeDiscoveredAgent: DiscoveredAgent?
@@ -113,7 +75,6 @@ private struct EmptyStateContent: View, Equatable {
             && lhs.agents == rhs.agents
             && lhs.activeAgentId == rhs.activeAgentId
             && lhs.quickActions == rhs.quickActions
-            && lhs.generativeGreetingState == rhs.generativeGreetingState
             && lhs.pendingLocalModelId == rhs.pendingLocalModelId
             && lhs.temporaryCloudModelName == rhs.temporaryCloudModelName
             && lhs.activeDiscoveredAgent == rhs.activeDiscoveredAgent
@@ -131,7 +92,6 @@ private struct EmptyStateContent: View, Equatable {
             agents: agents,
             activeAgentId: activeAgentId,
             quickActions: quickActions,
-            generativeGreetingState: generativeGreetingState,
             onOpenModelManager: onOpenModelManager,
             onUseFoundation: onUseFoundation,
             onQuickAction: onQuickAction,
@@ -511,6 +471,39 @@ final class ChatSession: ObservableObject {
     /// (regeneration/edit) via identity validation.
     private let compactionWatermark = CompactionWatermark()
 
+    // MARK: - LLM Context Compaction State
+
+    /// Non-destructive LLM compaction result: the covered oldest turns are
+    /// replaced by this summary in the OUTBOUND message array only (the
+    /// visible transcript is untouched). Persisted with the session;
+    /// invalidated when covered turns are edited/regenerated away (see
+    /// `validateConversationSummary`).
+    @Published var conversationSummary: ConversationSummary?
+
+    /// Live compaction progress, rendered by the Context Budget popover
+    /// (inline) and the compaction dialog.
+    @Published var compactionState: ContextCompactionUIState = .idle
+
+    /// Presents `CompactionDialogView`: the first-run model picker, or the
+    /// live-progress sheet for auto-triggered runs.
+    @Published var showCompactionDialog = false
+
+    /// True when the in-flight/pending compaction was auto-triggered by a
+    /// send; the stashed send resumes once compaction settles (success,
+    /// failure, or the user dismissing the first-run dialog).
+    private var resumeSendAfterCompaction = false
+
+    /// One-shot latch so the resumed send doesn't immediately re-enter the
+    /// auto-compaction gate.
+    private var skipAutoCompactionForNextSend = false
+
+    /// In-flight compaction run, if any. Kept so `reset()` can cancel it
+    /// (compaction never overlaps a streaming run — manual is gated on
+    /// `!isStreaming` and the auto-trigger fires pre-send — so `stop()`
+    /// has nothing to cancel; a run that outlives its transcript is
+    /// dropped by the `summaryIsValid` check before it can apply).
+    private var compactionTask: Task<Void, Never>?
+
     /// Per-session always-loaded + capabilities_load tool kit lives in the
     /// process-wide `SessionToolStateStore` so chat sessions and the
     /// HTTP/plugin path share one cache. Keyed by `sessionId.uuidString`.
@@ -563,23 +556,6 @@ final class ChatSession: ObservableObject {
     /// Set to the assistant turn id when a streaming run finalizes successfully.
     /// `ChatView` observes this to drive auto-speak. Not set on stop/error.
     @Published var lastCompletedAssistantTurnId: UUID?
-
-    /// Lifecycle of the generative greeting for the current empty state.
-    /// Drives skeleton vs static vs AI-produced rendering — see
-    /// `GenerativeGreetingState`. Populated by
-    /// `loadGenerativeGreetingIfNeeded(...)`, reset on `reset()`.
-    @Published var generativeGreetingState: GenerativeGreetingState = .idle
-
-    /// In-flight generation, retained so we can cancel it on reset / send /
-    /// teardown. The state machine on `generativeGreetingState` is what the
-    /// UI observes; the task is kept here purely for cooperative cancel.
-    private var generativeGreetingTask: Task<Void, Never>?
-
-    /// Cache key for the most recently kicked-off generation. Encodes
-    /// session id, agent id, and model so the call only re-runs when one
-    /// of those actually changed (re-appearing the empty state for the
-    /// same context is a no-op).
-    private var generativeGreetingKey: String?
 
     /// Weak back-reference to the owning window state (set by ChatWindowState).
     weak var windowState: ChatWindowState?
@@ -814,8 +790,8 @@ final class ChatSession: ObservableObject {
                 guard let self else { return }
                 let isSessionActive =
                     self.windowState.map {
-                        ChatWindowManager.shared.isChatWindowActive(id: $0.windowId)
-                    } ?? false
+                    ChatWindowManager.shared.isChatWindowActive(id: $0.windowId)
+                } ?? false
                 self.warmupController.handleRuntimeResidencyChanged(
                     session: self,
                     snapshot: snapshot,
@@ -996,10 +972,10 @@ final class ChatSession: ObservableObject {
         // settings notifications remain no-ops after recomposition.
         let budgetSignals: [AnyPublisher<Void, Never>] =
             Self.promptShapeNotificationNames.map(voidNotification) + [
-                folderState.objectWillChange
-                    .map { _ in () }.eraseToAnyPublisher(),
-                $selectedModel.map { _ in () }.eraseToAnyPublisher(),
-            ]
+            folderState.objectWillChange
+                .map { _ in () }.eraseToAnyPublisher(),
+            $selectedModel.map { _ in () }.eraseToAnyPublisher(),
+        ]
         contextEstimateCancellable = Publishers.MergeMany(budgetSignals)
             .debounce(for: .milliseconds(80), scheduler: RunLoop.main)
             .sink { [weak self] _ in
@@ -1051,7 +1027,6 @@ final class ChatSession: ObservableObject {
         preSendHandshakeEpoch &+= 1
         preSendHandshakeTask?.cancel()
         currentTask?.cancel()
-        generativeGreetingTask?.cancel()
         if let observer = remoteModelsObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -1444,6 +1419,7 @@ final class ChatSession: ObservableObject {
         guard let option = pickerItems.first(where: { $0.id == modelId }) else { return false }
         // Image-edit models accept image input (osaurus image-edit feature).
         if option.imageCapabilities?.imageEdit == true { return true }
+        if option.mediaModel?.kind == .imageToVideo { return true }
         if option.isVLM { return true }
         if case .remote = option.source { return !option.isEmbedding }
         return false
@@ -1467,15 +1443,29 @@ final class ChatSession: ObservableObject {
 
     var selectedImagePickerItem: ModelPickerItem? {
         guard let model = selectedModel else { return nil }
-        return pickerItems.first { $0.id == model && $0.source.isImageGeneration }
+        return pickerItems.first {
+            $0.id == model
+                && ($0.source.isImageGeneration || $0.mediaModel?.kind == .image)
+        }
+    }
+
+    var selectedVideoPickerItem: ModelPickerItem? {
+        guard let model = selectedModel else { return nil }
+        return pickerItems.first {
+            $0.id == model && $0.mediaModel?.kind.isVideo == true
+        }
     }
 
     private func applyImageModelDefaults(for model: String?) {
         guard let model,
-            let item = pickerItems.first(where: { $0.id == model && $0.source.isImageGeneration })
+            let item = pickerItems.first(where: { $0.id == model && $0.isMediaGeneration })
         else { return }
         var settings = imageComposerSettings
+        if let media = item.mediaModel {
+            settings.applyMediaDefaults(media.constraints)
+        } else {
         settings.applyModelDefaults(steps: item.imageDefaultSteps, guidance: item.imageDefaultGuidance)
+        }
         imageComposerSettings = settings
     }
 
@@ -1635,10 +1625,15 @@ final class ChatSession: ObservableObject {
 
         seedAutoExpandedReasoningBlocks(streamingTurnId: streamingTurnId)
 
-        let newBlocks = blockMemoizer.blocks(
-            from: effectiveTurns,
-            streamingTurnId: streamingTurnId,
-            agentName: displayName
+        // Display-time only, like coalescing/rollup: the LLM compaction
+        // divider never enters the memoizer cache, so per-turn incremental
+        // regeneration keeps its stable ids.
+        let newBlocks = insertCompactionMarkerIfNeeded(
+            into: blockMemoizer.blocks(
+                from: effectiveTurns,
+                streamingTurnId: streamingTurnId,
+                agentName: displayName
+            )
         )
         let newHeaderMap = blockMemoizer.groupHeaderMap
 
@@ -1653,6 +1648,26 @@ final class ChatSession: ObservableObject {
             visibleBlocksStore.blocks = newBlocks
             visibleBlocksStore.groupHeaderMap = newHeaderMap
         }
+    }
+
+    /// Inject the compaction-boundary divider right after the last block of
+    /// the last summary-covered turn. No-ops when there's no (valid) summary
+    /// or the covered span was windowed out by the display cap.
+    private func insertCompactionMarkerIfNeeded(into blocks: [ContentBlock]) -> [ContentBlock] {
+        guard let summary = conversationSummary,
+            ContextCompactionService.summaryIsValid(summary, for: turns),
+            let lastCoveredId = summary.coveredTurnIds.last
+        else { return blocks }
+        let covered = Set(summary.coveredTurnIds)
+        guard let lastIndex = blocks.lastIndex(where: { covered.contains($0.turnId) }) else {
+            return blocks
+        }
+        var result = blocks
+        result.insert(
+            .compactionMarker(summary: summary, afterTurnId: lastCoveredId),
+            at: lastIndex + 1
+        )
+        return result
     }
 
     /// Auto-expand the thinking block of a completed reasoning-only turn so the
@@ -1754,19 +1769,46 @@ final class ChatSession: ObservableObject {
             return active
         }
 
-        let outputTokens = ContextBudgetManager.estimateOutputTokens(for: turns)
-        let conversationTokens = ContextBudgetManager.estimateTokens(for: turns) - outputTokens
+        // With an LLM compaction summary, the model sees the summary message
+        // instead of the covered turns — price the next send accordingly and
+        // surface the summary's own cost as a dedicated row.
+        let coveredIds = summaryCoveredTurnIds
+        let modelVisibleTurns =
+            coveredIds.isEmpty ? turns : turns.filter { !coveredIds.contains($0.id) }
+        let summaryTokens =
+            conversationSummary.map {
+                ContextBudgetManager.estimateTokens(for: $0.contextMessageText)
+            } ?? 0
+
+        let outputTokens = ContextBudgetManager.estimateOutputTokens(for: modelVisibleTurns)
+        let conversationTokens =
+            ContextBudgetManager.estimateTokens(for: modelVisibleTurns) - outputTokens
         var inputTokens = 0
         if !input.isEmpty { inputTokens += ContextBudgetManager.estimateTokens(for: input) }
         for attachment in pendingAttachments { inputTokens += attachment.estimatedTokens }
 
+        func addingSummaryRow(_ breakdown: ContextBreakdown) -> ContextBreakdown {
+            guard summaryTokens > 0 else { return breakdown }
+            var bd = breakdown
+            bd.setTokens(
+                for: "summary",
+                in: \.messages,
+                tokens: summaryTokens,
+                label: L("Summary"),
+                tint: .teal
+            )
+            return bd
+        }
+
         if let ctx = cachedContext {
-            return .from(
-                context: ctx,
-                screenContextTokens: cachedScreenContextTokens,
-                conversationTokens: conversationTokens,
-                inputTokens: inputTokens,
-                outputTokens: outputTokens
+            return addingSummaryRow(
+                .from(
+                    context: ctx,
+                    screenContextTokens: cachedScreenContextTokens,
+                    conversationTokens: conversationTokens,
+                    inputTokens: inputTokens,
+                    outputTokens: outputTokens
+                )
             )
         }
 
@@ -1787,23 +1829,27 @@ final class ChatSession: ObservableObject {
             // is in flight and we won't park the main thread to open the DB).
             // Surface the cheap conversation/input/output overlay now; the
             // system-prefix rows fill in once `refreshContextEstimates` runs.
-            return .from(
-                manifest: .empty,
+            return addingSummaryRow(
+                .from(
+                    manifest: .empty,
+                    memoryTokens: cachedMemoryTokens,
+                    screenContextTokens: cachedScreenContextTokens,
+                    conversationTokens: conversationTokens,
+                    inputTokens: inputTokens,
+                    outputTokens: outputTokens
+                )
+            )
+        }
+        return addingSummaryRow(
+            .from(
+                manifest: preview.manifest,
+                toolTokens: preview.toolTokens,
                 memoryTokens: cachedMemoryTokens,
                 screenContextTokens: cachedScreenContextTokens,
                 conversationTokens: conversationTokens,
                 inputTokens: inputTokens,
                 outputTokens: outputTokens
             )
-        }
-        return .from(
-            manifest: preview.manifest,
-            toolTokens: preview.toolTokens,
-            memoryTokens: cachedMemoryTokens,
-            screenContextTokens: cachedScreenContextTokens,
-            conversationTokens: conversationTokens,
-            inputTokens: inputTokens,
-            outputTokens: outputTokens
         )
     }
 
@@ -2076,6 +2122,18 @@ final class ChatSession: ObservableObject {
             windowState?.showLocalModelBusyAlert = true
             return
         }
+        // Auto LLM compaction: when the estimated next send crosses the
+        // near-limit threshold and there's an uncovered older span, compact
+        // FIRST (dialog shows live progress; first run asks for a model),
+        // then resume this send. The draft stays in `input` untouched.
+        let hasSendableContent =
+            !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !pendingAttachments.isEmpty
+        if hasSendableContent, shouldAutoCompactBeforeSend {
+            beginCompaction(resumeSend: true, showDialogWhileRunning: true)
+            return
+        }
+        skipAutoCompactionForNextSend = false
         let text = input
         let attachments = pendingAttachments
         input = ""
@@ -2426,6 +2484,14 @@ final class ChatSession: ObservableObject {
         currentTodo = nil
         lastCompletionSummary = nil
         lastCompletionWasBlocked = false
+        // A fresh chat starts uncompacted.
+        compactionTask?.cancel()
+        compactionTask = nil
+        conversationSummary = nil
+        compactionState = .idle
+        showCompactionDialog = false
+        resumeSendAfterCompaction = false
+        skipAutoCompactionForNextSend = false
         promptQueue.drainAll()
         let oldSid = expectedTodoSessionId
         Task { await AgentTodoStore.shared.clear(for: oldSid) }
@@ -2442,7 +2508,6 @@ final class ChatSession: ObservableObject {
         visibleBlocksStore.blocks = []
         visibleBlocksStore.groupHeaderMap = [:]
 
-        resetGenerativeGreeting()
         warmupController.reset()
 
         applyEffectiveModel(for: agentId)
@@ -2462,165 +2527,223 @@ final class ChatSession: ObservableObject {
         Task { [weak self] in await self?.refreshContextEstimates() }
     }
 
-    // MARK: - Generative Greeting
+    // MARK: - LLM Context Compaction
 
-    /// Asynchronously fetch (and cache) a delightful greeting + four quick
-    /// actions for the current empty state. Idempotent for a given
-    /// `(session, agent, model)` combination — re-appearing the empty
-    /// state, scrolling, or theme changes won't re-fire the inference.
-    ///
-    /// State machine: `idle` (feature off / no model) → `loading` (task in
-    /// flight) → `ready(payload)` on success, `failed` on any throw or
-    /// cancellation. The UI uses `loading` to render a skeleton, and both
-    /// `idle` and `failed` to render the static fallback.
-    func loadGenerativeGreetingIfNeeded(agent: Agent) {
-        // No local greeting generation when the feature is off, or for a
-        // remote-agent chat (Mode 2) — the latter would load a local model
-        // purely for empty-state flavor text and stamp the local persona onto a
-        // remote conversation. The empty state shows the remote agent's
-        // name/avatar and the static greeting instead.
-        guard !isRemoteAgentTarget, agent.shouldUseGenerativeGreetings else {
-            resetGenerativeGreeting()
+    /// Turn IDs the active summary replaces in the outbound context.
+    /// Empty when there is no summary.
+    var summaryCoveredTurnIds: Set<UUID> {
+        guard let summary = conversationSummary else { return [] }
+        return Set(summary.coveredTurnIds)
+    }
+
+    /// Drop the summary when it no longer lines up with the live
+    /// transcript (covered turns edited, regenerated, or deleted). Called
+    /// on session load and at the top of every send.
+    func validateConversationSummary() {
+        guard let summary = conversationSummary else { return }
+        if !ContextCompactionService.summaryIsValid(summary, for: turns) {
+            conversationSummary = nil
+        }
+    }
+
+    /// Whether the conversation currently has a span a (new) summary could
+    /// cover. Gates the popover button and the auto-trigger.
+    var hasCompactableConversation: Bool {
+        ContextCompactionService.compactionCutIndex(
+            turns: turns,
+            existingSummary: conversationSummary
+        ) != nil
+    }
+
+    /// Estimated fraction of the usable (effective) budget the next send
+    /// occupies — the same denominator the runtime trims against.
+    private var contextUsageFractionEstimate: Double? {
+        guard let model = selectedModel else { return nil }
+        let window = AgentLoopBudget.resolveContextWindowSync(modelId: model)
+        let effective = ContextBudgetManager(contextLength: window).effectiveBudget
+        guard effective > 0 else { return nil }
+        let total = estimatedContextBreakdown.total
+        guard total > 0 else { return nil }
+        return Double(total) / Double(effective)
+    }
+
+    /// Popover-button gate: utilization crossed the manual threshold (~70%)
+    /// and there's an uncovered older span a summary could reclaim.
+    var canManuallyCompactConversation: Bool {
+        guard hasCompactableConversation,
+            let fraction = contextUsageFractionEstimate
+        else { return false }
+        return fraction >= ContextCompactionService.manualTriggerThreshold
+    }
+
+    /// One-shot suppression after the user dismisses the first-run dialog
+    /// without picking a model: stop auto-prompting for the rest of this
+    /// session (the manual popover button remains available).
+    private var compactionDeclinedForSession = false
+
+    /// Auto-trigger gate, checked at send time: the estimated next send is
+    /// at ≥85% of the usable budget (the same near-limit signal that turns
+    /// the context chip amber) and there is an uncovered span to summarize.
+    private var shouldAutoCompactBeforeSend: Bool {
+        guard !skipAutoCompactionForNextSend,
+            !compactionDeclinedForSession,
+            compactionState == .idle,
+            hasCompactableConversation,
+            let fraction = contextUsageFractionEstimate
+        else { return false }
+        return fraction >= 0.85
+    }
+
+    /// Manual entry point (Context Budget popover). Runs inline — progress
+    /// shows in the popover — unless no model is configured yet, in which
+    /// case the first-run dialog opens.
+    func requestManualCompaction() {
+        guard !isStreaming, !compactionState.isRunning else { return }
+        beginCompaction(resumeSend: false, showDialogWhileRunning: false)
+    }
+
+    /// First-run dialog: persist the chosen model, then run.
+    func chooseCompactionModelAndRun(_ identifier: String) {
+        ContextCompactionService.saveConfiguredModel(identifier: identifier)
+        runCompaction()
+    }
+
+    /// Retry button in the dialog / popover after a failure.
+    func retryCompaction() {
+        guard !compactionState.isRunning else { return }
+        runCompaction()
+    }
+
+    /// Dialog dismissed. If a run is in flight it keeps going (state stays
+    /// visible in the popover); a declined first-run model pick resumes any
+    /// stashed send without compaction (deterministic trimming remains the
+    /// safety net).
+    func cancelCompactionDialog() {
+        showCompactionDialog = false
+        guard !compactionState.isRunning else { return }
+        if case .needsModelSelection = compactionState {
+            compactionState = .idle
+            compactionDeclinedForSession = true
+        }
+        if case .failed = compactionState { compactionState = .idle }
+        if resumeSendAfterCompaction {
+            resumeSendAfterCompaction = false
+            skipAutoCompactionForNextSend = true
+            sendCurrent()
+        }
+    }
+
+    private func beginCompaction(resumeSend: Bool, showDialogWhileRunning: Bool) {
+        validateConversationSummary()
+        resumeSendAfterCompaction = resumeSend
+        guard ContextCompactionService.configuredModelIdentifier() != nil else {
+            // First run: no model configured. Open the explainer dialog and
+            // let the user pick one (or decline).
+            compactionState = .needsModelSelection
+            showCompactionDialog = true
             return
         }
+        if showDialogWhileRunning { showCompactionDialog = true }
+        runCompaction()
+    }
 
-        guard hasAnyModel else { return }
-        guard let model = selectedModel, !model.isEmpty else { return }
-
-        let sessionPart = sessionId?.uuidString ?? "draft"
-        let key = "\(sessionPart):\(agent.id.uuidString):\(model)"
-        if key == generativeGreetingKey { return }
-
-        generativeGreetingKey = key
-        generativeGreetingTask?.cancel()
-
-        let snapshot = agent
-        generativeGreetingTask = Task { [weak self] in
-            // Tell the pool which (agent, model) the user is looking
-            // at so its periodic ticker has a refill target even when
-            // no popFresh / warmUp call is in flight.
-            await GenerativeGreetingPool.shared.setActive(
-                agent: snapshot,
-                model: model
-            )
-
-            // Hot path: a pre-generated greeting is already waiting.
-            // Skip the loading skeleton entirely and ride straight to
-            // `.ready`, then fire a background warmUp to top the pool
-            // back up to target.
-            if let cached = await GenerativeGreetingPool.shared.popFresh(
-                for: snapshot,
-                model: model
-            ) {
-                // Commit to the UI atomically: only assign `.ready` if
-                // the task hasn't been cancelled and the cache key
-                // still matches. If it doesn't match (rapid hide/show,
-                // agent switch landed mid-pop), push the cached entry
-                // BACK into the pool — it cost us a model call to
-                // produce, throwing it away on every fast switch is
-                // wasteful. Returning a `Bool` from `MainActor.run`
-                // lets us keep the commit guard atomic without
-                // splitting it across two hops.
-                let didCommit = await MainActor.run { () -> Bool in
-                    guard let self = self else { return false }
-                    guard !Task.isCancelled,
-                        self.generativeGreetingKey == key
-                    else { return false }
-                    self.generativeGreetingState = .ready(cached)
-                    return true
-                }
-                if !didCommit {
-                    await GenerativeGreetingPool.shared.seed(
-                        cached,
-                        for: snapshot,
-                        model: model
-                    )
+    private func runCompaction() {
+        guard !compactionState.isRunning else { return }
+        compactionTask?.cancel()
+        let turnsSnapshot = turns
+        let existing = conversationSummary
+        let sid = sessionId
+        compactionState = .running(.preparing)
+        compactionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let summary = try await ContextCompactionService.shared.summarize(
+                    turns: turnsSnapshot,
+                    existingSummary: existing,
+                    sessionId: sid,
+                    onPhase: { [weak self] phase in
+                        self?.compactionState = .running(phase)
+                    }
+                )
+                guard !Task.isCancelled else {
+                    self.compactionState = .idle
                     return
                 }
-                await GenerativeGreetingPool.shared.warmUp(
-                    for: snapshot,
-                    model: model
-                )
-                return
-            }
-
-            // Don't start a local greeting generation while another window is
-            // already running a local model. The shared inference context runs
-            // one generation at a time, so a greeting load here would stall behind
-            // the active user stream (and on the strict-eviction path could
-            // disturb it). Fall back to the static greeting; the pool refills
-            // once inference goes idle. Remote/foundation greetings don't
-            // contend, so they're unaffected.
-            // Resolve whether the greeting model is local off the main thread.
-            // `findInstalledModel` funnels into `discoverLocalModels`, which
-            // blocks on a condition wait (up to the scan wait-limit) while the
-            // background disk scan runs. This closure inherits the main actor
-            // from its enclosing method, so the wait was freezing the app while
-            // an empty-state greeting loaded.
-            let greetingModelIsLocal = await Task.detached(priority: .userInitiated) {
-                ModelManager.findInstalledModel(named: model) != nil
-            }.value
-            let localStreamBusy = await MainActor.run {
-                ChatWindowManager.shared.isAnyWindowStreamingLocalModel
-            }
-            if greetingModelIsLocal, localStreamBusy {
-                await MainActor.run {
-                    guard let self = self else { return }
-                    guard self.generativeGreetingKey == key else { return }
-                    self.generativeGreetingState = .failed
+                // The transcript may have changed while the summarizer ran
+                // (covered turn edited/regenerated/deleted). A summary that
+                // no longer lines up would be dropped at the next send
+                // anyway; discard it now so the budget breakdown never
+                // prices a stale summary row.
+                guard ContextCompactionService.summaryIsValid(summary, for: self.turns) else {
+                    self.compactionState = .idle
+                    return
                 }
-                return
-            }
-
-            // Cold path: pool was empty (first session of the run, or
-            // an invalidation just landed). Flip to `.loading` so the
-            // empty state renders the skeleton, then generate inline
-            // and seed the pool with the result so the *next* session
-            // open is hot.
-            await MainActor.run {
-                guard let self = self else { return }
-                guard self.generativeGreetingKey == key else { return }
-                self.generativeGreetingState = .loading
-            }
-            do {
-                let result = try await GenerativeGreetingService.shared.generate(
-                    agent: snapshot,
-                    fallbackModel: model
-                )
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    guard let self = self else { return }
-                    guard self.generativeGreetingKey == key else { return }
-                    self.generativeGreetingState = .ready(result)
-                }
-                await GenerativeGreetingPool.shared.warmUp(
-                    for: snapshot,
-                    model: model
-                )
+                self.conversationSummary = summary
+                self.save()
+                // The outbound message shape changed (covered turns replaced
+                // by the summary), so the watermark's recorded decisions no
+                // longer line up — its identity validation resets it on the
+                // next trim, effectively rebasing at the summary boundary.
+                self.rebuildVisibleBlocks()
+                // Rewarm the post-compaction shape (system + summary + recent
+                // turns) as required-context work: the prefill it stores (KV +
+                // disk L2) is an exact prefix of the next send, which awaits
+                // it in the pre-send handshake and prefix-hits instead of
+                // cold-re-prefilling past the static system prefix. The warm
+                // fingerprint folds in the summary identity, so the stale
+                // pre-compaction warm claim can't coalesce this away.
+                self.invalidateWarmupAfterContextShapeChange()
+                self.compactionState = .completed(savedTokens: summary.savedTokensEstimate)
+                self.finishCompaction(success: true)
+            } catch let compactionError as ContextCompactionError
+                where compactionError == .needsModelSelection
+            {
+                self.compactionState = .needsModelSelection
+                self.showCompactionDialog = true
+            } catch is CancellationError {
+                self.compactionState = .idle
             } catch {
-                guard !Task.isCancelled else { return }
-                // Silent fallback — `.failed` flips the empty state back
-                // to the static greeting + the agent's configured quick
-                // actions. `.idle` is reserved for "feature is off" so
-                // the UI can distinguish the two.
-                await MainActor.run {
-                    guard let self = self else { return }
-                    guard self.generativeGreetingKey == key else { return }
-                    self.generativeGreetingState = .failed
+                guard !Task.isCancelled else {
+                    self.compactionState = .idle
+                    return
                 }
+                self.compactionState = .failed(message: error.localizedDescription)
+                self.finishCompaction(success: false)
             }
         }
     }
 
-    /// Cancel any in-flight greeting generation and clear cached output.
-    /// Called from `reset()`, `deinit`, and `ChatWindowManager.hideWindow`
-    /// — the latter so re-opening the window pops a fresh entry from the
-    /// pool instead of briefly flashing the previous session's greeting.
-    func resetGenerativeGreeting() {
-        generativeGreetingTask?.cancel()
-        generativeGreetingTask = nil
-        generativeGreetingKey = nil
-        generativeGreetingState = .idle
+    /// Post-run bookkeeping: resume a stashed auto-triggered send, and let
+    /// transient states (completed badge) settle back to idle.
+    private func finishCompaction(success: Bool) {
+        let shouldResume = resumeSendAfterCompaction
+        resumeSendAfterCompaction = false
+        if shouldResume {
+            Task { @MainActor [weak self] in
+                // Let the user read the "done" state briefly before the
+                // dialog closes and the send proceeds. Failures resume
+                // immediately — the deterministic trimmer still protects
+                // the request, and the failed state stays visible in the
+                // budget popover.
+                if success {
+                    try? await Task.sleep(nanoseconds: 900_000_000)
+                }
+                guard let self else { return }
+                self.showCompactionDialog = false
+                self.skipAutoCompactionForNextSend = true
+                self.sendCurrent()
+            }
+        }
+        // Settle transient completed/failed badges back to idle so the
+        // popover button doesn't stay stuck on an old outcome.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard let self else { return }
+            switch self.compactionState {
+            case .completed, .failed: self.compactionState = .idle
+            default: break
+            }
+        }
     }
 
     /// Invalidate send-time token accounting (called when tools/skills or
@@ -2691,7 +2814,8 @@ final class ChatSession: ObservableObject {
             pinned: pinned,
             capabilities: SessionCapability.derive(from: turnData),
             folderBookmark: folderState.persistedBookmark,
-            folderPath: folderState.persistedPath
+            folderPath: folderState.persistedPath,
+            conversationSummary: conversationSummary
         )
     }
 
@@ -2773,6 +2897,14 @@ final class ChatSession: ObservableObject {
         }
 
         turns = data.turns.map { ChatTurn(from: $0) }
+        // Restore the LLM compaction summary and drop it immediately when it
+        // no longer lines up with the restored transcript.
+        conversationSummary = data.conversationSummary
+        validateConversationSummary()
+        compactionState = .idle
+        showCompactionDialog = false
+        resumeSendAfterCompaction = false
+        skipAutoCompactionForNextSend = false
         voiceInputState = .idle
         showVoiceOverlay = false
         input = ""
@@ -3090,7 +3222,7 @@ final class ChatSession: ObservableObject {
         guard let sessionId else { return toolResult }
         let contextId = sessionId.uuidString
         let outcome = await Task.detached(priority: .userInitiated) {
-            NativeImageToolArtifactBridge.processFirstImageArtifact(
+            GeneratedMediaToolArtifactBridge.processFirstMediaArtifact(
                 toolName: toolName,
                 toolResult: toolResult,
                 contextId: contextId,
@@ -3405,9 +3537,11 @@ final class ChatSession: ObservableObject {
 
     /// Per-run options for the Claude Code subprocess backend.
     ///
-    /// The working directory is the same folder root the turn's tools are
-    /// bound to, so Claude Code's own file tools can't reach outside the
-    /// folder the user picked for this chat.
+    /// The working directory is the same folder root the turn's tools are bound
+    /// to, so Claude Code's own file tools can't reach outside the folder the
+    /// user picked for this chat. `agentId` travels with the run because the
+    /// subprocess is out of process: the `@TaskLocal` chat identity cannot
+    /// follow it, so the MCP bridge mints a grant naming this agent instead.
     private func claudeCodeRunOptions(for agentId: UUID) -> ClaudeCodeRunOptions {
         let config = AgentManager.shared.effectiveClaudeCodeConfig(for: agentId)
         let root = activeFolderContext(for: agentId)?.rootPath
@@ -3583,6 +3717,69 @@ final class ChatSession: ObservableObject {
         ChatSessionsManager.shared.renameQuietly(id: sid, title: newTitle)
         // Update the open chat's header only if it still shows this session.
         if sessionId == sid { title = newTitle }
+    }
+
+    /// Generate an AI title on demand from the `/title` slash command. Unlike
+    /// the automatic path this ignores the auto-title setting and any earlier
+    /// manual rename — the user explicitly asked for a new name — and it
+    /// surfaces failures as a toast instead of staying silent, because the
+    /// user is waiting on the result.
+    func generateTitleFromSlashCommand() {
+        let turnData = turns.map { ChatTurnData(from: $0) }
+        guard
+            let sid = sessionId,
+            let userTurn = turnData.first(where: {
+                $0.role == .user
+                    && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            })
+        else {
+            ToastManager.shared.infoLocalized(
+                "Chat Title",
+                message: "Send a message first, then use /title to name the chat."
+            )
+            return
+        }
+        let assistantText =
+            turnData.first(where: {
+                $0.role == .assistant
+                    && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            })?.content ?? ""
+        // Latch so a later clean run completion doesn't auto-title over the
+        // name the user just asked for.
+        autoTitleGenerationStarted = true
+        let fallbackModel = selectedModel
+        // Loading toast while the model thinks (up to the service's 8s
+        // timeout), updated in place to the success/error outcome.
+        let toastId = ToastManager.shared.loadingLocalized("Generating Title…")
+        Task { [weak self] in
+            guard
+                let generated = await ChatTitleService.shared.generateTitle(
+                    userMessage: userTurn.content,
+                    assistantResponse: assistantText,
+                    fallbackModel: fallbackModel
+                )
+            else {
+                ToastManager.shared.update(
+                    id: toastId,
+                    type: .error,
+                    title: L("Chat Title"),
+                    message: L("Couldn't generate a title. Check that a model is available and try again.")
+                )
+                return
+            }
+            guard let self else {
+                ToastManager.shared.dismiss(id: toastId)
+                return
+            }
+            ChatSessionsManager.shared.renameQuietly(id: sid, title: generated)
+            if self.sessionId == sid { self.title = generated }
+            ToastManager.shared.update(
+                id: toastId,
+                type: .success,
+                title: L("Chat Renamed"),
+                message: generated
+            )
+        }
     }
 
     /// A stopped (or errored) run can leave an assistant tool call that never
@@ -4321,7 +4518,17 @@ final class ChatSession: ObservableObject {
         #endif
         guard let id, !id.isEmpty else { return false }
         return ModelPickerItemCache.shared.items.contains {
-            $0.id == id && $0.source.isImageGeneration
+            $0.id == id && ($0.source.isImageGeneration || $0.mediaModel?.kind == .image)
+        }
+    }
+
+    func isVideoGenerationModel(_ id: String?) -> Bool {
+        #if DEBUG
+            if forceChatEngineRouteForTests { return false }
+        #endif
+        guard let id, !id.isEmpty else { return false }
+        return ModelPickerItemCache.shared.items.contains {
+            $0.id == id && $0.mediaModel?.kind.isVideo == true
         }
     }
 
@@ -4350,6 +4557,17 @@ final class ChatSession: ObservableObject {
         guard let imageItem = selectedImagePickerItem else {
             turn.content = L("Image generation failed: selected model is not an image model.")
             rebuildVisibleBlocks()
+            return
+        }
+        if let mediaModel = imageItem.mediaModel {
+            await runRemoteImageGeneration(
+                prompt: prompt,
+                attachments: attachments,
+                settings: settings,
+                model: mediaModel,
+                into: turn,
+                runId: runId
+            )
             return
         }
 
@@ -4452,6 +4670,269 @@ final class ChatSession: ObservableObject {
         isDirty = true
     }
 
+    private func runRemoteImageGeneration(
+        prompt: String,
+        attachments: [Attachment],
+        settings: ImageComposerSettings,
+        model: MediaModelInfo,
+        into turn: ChatTurn,
+        runId: UUID
+    ) async {
+        guard attachments.loadImages().isEmpty else {
+            turn.content = L("Remote image editing is not supported yet. Remove the source image.")
+            rebuildVisibleBlocks()
+            return
+        }
+        if let limit = model.constraints.promptCharacterLimit, prompt.count > limit {
+            turn.content = String(format: L("The image prompt exceeds this model's %d character limit."), limit)
+            rebuildVisibleBlocks()
+            return
+        }
+
+        turn.content = L("Generating image…")
+        rebuildVisibleBlocks()
+        let usesCatalogSize =
+            !model.constraints.aspectRatios.isEmpty || !model.constraints.resolutions.isEmpty
+        let request = MediaImageGenerationRequest(
+            target: model.target,
+            prompt: prompt,
+            negativePrompt: settings.normalizedNegativePrompt,
+            width: usesCatalogSize ? nil : settings.clampedWidth,
+            height: usesCatalogSize ? nil : settings.clampedHeight,
+            aspectRatio: settings.aspectRatio,
+            resolution: settings.resolution,
+            quality: settings.quality,
+            steps: model.constraints.defaultSteps == nil ? nil : settings.clampedSteps,
+            guidance: Double(settings.clampedGuidance),
+            seed: settings.normalizedSeed.flatMap(Int.init(exactly:)),
+            count: settings.clampedImageCount,
+            format: settings.effectiveOutputFormat
+        )
+        do {
+            var approvalValues: [String: Any] = [
+                "prompt": prompt,
+                "resolved_model": model.displayName,
+                "backend": Self.mediaBackendDescription(model),
+                "billing_notice": "Approving starts a billable remote image generation.",
+            ]
+            if let privacy = model.privacy {
+                approvalValues["privacy"] = privacy
+            }
+            if let minimum = model.pricing?.minimumUSD {
+                approvalValues["estimated_minimum_usd"] = minimum
+            }
+            approvalValues["aspect_ratio"] = settings.aspectRatio
+            approvalValues["resolution"] = settings.resolution
+            approvalValues["quality"] = settings.quality
+            let approved = await ToolPermissionPromptService.requestApproval(
+                toolName: "image",
+                description:
+                    "Generate a billable remote image. Review the provider, privacy policy, "
+                    + "estimated minimum price, and selected options.",
+                argumentsJSON: SubagentApprovalArguments.enrichedJSON(
+                    from: "{}",
+                    values: approvalValues
+                )
+            )
+            guard approved else {
+                turn.content = L("Remote image generation cancelled before billing.")
+                rebuildVisibleBlocks()
+                return
+            }
+            let generated = try await MediaGenerationCoordinator.shared.generateImage(request)
+            guard !generated.isEmpty else {
+                throw MediaGenerationError.invalidResponse
+            }
+            guard isRunActive(runId) else { return }
+            for media in generated {
+                attachGeneratedMedia(media, prompt: prompt, to: turn)
+            }
+            if generated.count > 1 {
+                let cost = generated.compactMap(\.settledCostUSD).first
+                turn.content = "\(L("Generated images")): \(generated.count)"
+                if let cost {
+                    turn.content += " · \(String(format: "$%.4f", cost))"
+                }
+            }
+        } catch is CancellationError {
+            turn.content = L("Image generation cancelled.")
+        } catch {
+            debugLog(
+                "[MediaGeneration] image generation failed "
+                    + "backend=\(model.target.backend) model=\(model.target.modelID) "
+                    + "error=\(String(reflecting: error))"
+            )
+            turn.content = "\(L("Image generation failed:")) \(error.localizedDescription)"
+        }
+        isDirty = true
+        rebuildVisibleBlocks()
+    }
+
+    private static func mediaBackendDescription(_ model: MediaModelInfo) -> String {
+        switch model.target.backend {
+        case .local:
+            return "Local"
+        case .remoteProvider:
+            return model.providerName
+        case .osaurusCloud:
+            return "Osaurus Cloud"
+        }
+    }
+
+    func runVideoGeneration(
+        prompt: String,
+        attachments: [Attachment],
+        settings: ImageComposerSettings,
+        into turn: ChatTurn,
+        runId: UUID
+    ) async {
+        guard let model = selectedVideoPickerItem?.mediaModel else {
+            turn.content = L("Video generation failed: selected model is unavailable.")
+            rebuildVisibleBlocks()
+            return
+        }
+        let sourceImages = attachments.loadImages()
+        switch model.kind {
+        case .imageToVideo:
+            guard sourceImages.count == 1, sourceImages.count == attachments.count else {
+                turn.content = L("Attach exactly one source image for image-to-video generation.")
+                rebuildVisibleBlocks()
+                return
+            }
+        case .textToVideo:
+            guard attachments.isEmpty else {
+                turn.content = L("This text-to-video model does not accept attachments.")
+                rebuildVisibleBlocks()
+                return
+            }
+        case .image:
+            turn.content = L("The selected model is not a video model.")
+            rebuildVisibleBlocks()
+            return
+        }
+        guard let duration = settings.duration ?? model.constraints.durations.first else {
+            turn.content = L("The selected video model does not advertise a duration.")
+            rebuildVisibleBlocks()
+            return
+        }
+        if let limit = model.constraints.promptCharacterLimit, prompt.count > limit {
+            turn.content = String(format: L("The video prompt exceeds this model's %d character limit."), limit)
+            rebuildVisibleBlocks()
+            return
+        }
+
+        let request = MediaVideoGenerationRequest(
+            target: model.target,
+            prompt: prompt,
+            negativePrompt: settings.normalizedNegativePrompt,
+            sourceImage: sourceImages.first,
+            sourceImageMIMEType: sourceImages.isEmpty ? nil : "image/png",
+            duration: duration,
+            aspectRatio: settings.aspectRatio,
+            resolution: settings.resolution,
+            audio: model.constraints.audioConfigurable ? settings.audio : nil
+        )
+
+        do {
+            turn.content = L("Getting video quote…")
+            rebuildVisibleBlocks()
+            let quote = try await MediaGenerationCoordinator.shared.quoteVideo(request)
+            var approvalValues: [String: Any] = [
+                "prompt": prompt,
+                "resolved_model": model.displayName,
+                "duration": duration,
+                "quote_usd": quote.usd,
+                "billing_notice": "Approving queues a billable remote job that cannot be cancelled upstream.",
+            ]
+            approvalValues["resolution"] = settings.resolution
+            approvalValues["aspect_ratio"] = settings.aspectRatio
+            approvalValues["audio"] = settings.audio
+            let approvalJSON = SubagentApprovalArguments.enrichedJSON(
+                from: "{}",
+                values: approvalValues
+            )
+            let approved = await ToolPermissionPromptService.requestApproval(
+                toolName: "video",
+                description: VideoTool.toolDescription,
+                argumentsJSON: approvalJSON
+            )
+            guard approved else {
+                turn.content = L("Video generation cancelled before queueing.")
+                rebuildVisibleBlocks()
+                return
+            }
+
+            turn.content = String(format: L("Queueing video (quoted $%.4f)…"), quote.usd)
+            rebuildVisibleBlocks()
+            let turnID = turn.id
+            let media = try await MediaGenerationCoordinator.shared.generateVideo(
+                request,
+                approvedQuote: quote
+            ) { [weak self] event in
+                Task { @MainActor in
+                    guard
+                        let self,
+                        let turn = self.turns.first(where: { $0.id == turnID }),
+                        self.isRunActive(runId)
+                    else { return }
+                    switch event {
+                    case .queued(let jobID):
+                        turn.content = jobID.map { "Video queued (\($0))…" } ?? L("Video queued…")
+                    case .running(let progress, let eta):
+                        let percent = progress.map { " \(Int($0 * 100))%" } ?? ""
+                        let estimate = eta.map { " · ~\(Int($0))s remaining" } ?? ""
+                        turn.content = "Generating video…\(percent)\(estimate)"
+                    case .completed:
+                        break
+                    case .failed(let message):
+                        turn.content = "\(L("Video generation failed:")) \(message)"
+                    case .cancelled:
+                        turn.content = L("Video generation cancelled.")
+                    }
+                    self.rebuildVisibleBlocks()
+                }
+            }
+            guard isRunActive(runId) else { return }
+            attachGeneratedMedia(media, prompt: prompt, to: turn)
+        } catch let error as MediaGenerationError {
+            turn.content =
+                error.errorDescription
+                ?? L("Video generation failed.")
+        } catch is CancellationError {
+            turn.content = L("Video generation cancelled.")
+        } catch {
+            turn.content = "\(L("Video generation failed:")) \(error.localizedDescription)"
+        }
+        isDirty = true
+        rebuildVisibleBlocks()
+    }
+
+    private func attachGeneratedMedia(_ media: GeneratedMedia, prompt: String, to turn: ChatTurn) {
+        guard let contextID = sessionId?.uuidString else {
+            turn.content = media.url.absoluteString
+            return
+        }
+        switch SharedArtifact.processTrustedLocalFileResult(
+            fileURL: media.url,
+            filename: media.url.lastPathComponent,
+            mimeType: media.mimeType,
+            description: prompt,
+            contextId: contextID,
+            contextType: .chat
+        ) {
+        case .success(let processed):
+            turn.sharedArtifacts.append(processed.artifact)
+            let label = media.kind.isVideo ? L("Generated video") : L("Generated image")
+            if let cost = media.settledCostUSD {
+                turn.content = "\(label) · \(String(format: "$%.4f", cost))"
+            } else {
+                turn.content = label
+            }
+        case .failure(let failure):
+            turn.content = "\(L("Generated media could not be displayed:")) \(failure)"
+        }
+    }
+
     /// Freeze this run's memory + screen-context blocks onto the latest user
     /// turn, once, at send time. From then on `turnToMessage` replays the
     /// prefix verbatim on every request, so the turn's wire bytes are
@@ -4522,6 +5003,11 @@ final class ChatSession: ObservableObject {
             return
         }
 
+        // The LLM compaction summary must line up with the transcript this
+        // send will build from; regenerations/edits that rewrote covered
+        // turns invalidate it here (mirrors `CompactionWatermark.validate`).
+        validateConversationSummary()
+
         // Settings notifications intentionally debounce preview work by 80 ms
         // to coalesce UI churn. A user can still click Send inside that
         // window. Recompose from the authoritative stores *before* deciding
@@ -4533,6 +5019,13 @@ final class ChatSession: ObservableObject {
         // delay. The later debounced notification observes the same bytes and
         // becomes a no-op.
         reconcilePromptShapeBeforeSend()
+
+        // DSV4 must not use the first visible response as its MLX/JIT warm-up.
+        // Promote a missing family warm-up to required handshake work before
+        // the generic scheduled-warm-up cancellation below.  The required
+        // task survives that cancellation and is awaited by the normal send
+        // lifecycle; every other model keeps the existing fast path.
+        warmupController.requireDSV4PreSendWarmupIfNeeded(session: self)
 
         // A scheduled-but-not-started warm-up must not fire mid-run.
         warmupController.cancelScheduledWarmup()
@@ -4762,47 +5255,47 @@ final class ChatSession: ObservableObject {
             let turnFolderRoot =
                 sandboxEnabled ? nil : self.activeFolderContext(for: turnAgentId)?.rootPath
             await ChatExecutionContext.$currentFolderRoot.withValue(turnFolderRoot) { [self] in
-                // Typed run provenance for the whole turn. The session's own
-                // persisted `source` is authoritative here (a dispatched
-                // schedule/watcher/self-schedule run re-binds the same value the
-                // dispatcher already bound; a UI chat turn binds `.chat`).
-                // Source-scoped capabilities (proactive channel publishing) read
-                // this instead of inferring provenance from surface flags.
-                await ChatExecutionContext.$currentSessionSource.withValue(source) { [self] in
-                    await ChatExecutionContext.$currentAgentId.withValue(turnAgentId) { [self] in
-                        await ChatExecutionContext.$currentUserRequest.withValue(
-                            trimmed.isEmpty ? nil : trimmed
-                        ) { [self] in
-                            await ChatExecutionContext.$currentModelName.withValue(
-                                self.selectedModel
-                            ) { [self] in
-                                await ChatExecutionContext.$currentEnableThinking.withValue(
-                                    turnGenerationControls.enableThinking
-                                ) { [self] in
-                                    debugLog("send: task started runId=\(runId) model=\(self.selectedModel ?? "nil")")
-                                    lastStreamError = nil
-                                    isStreaming = true
-                                    ServerController.signalGenerationStart()
-                                    var shouldPersistConversationArtifacts = true
-                                    defer {
-                                        finalizeRun(
-                                            runId: runId,
-                                            persistConversationArtifacts: shouldPersistConversationArtifacts
-                                        )
-                                    }
+            // Typed run provenance for the whole turn. The session's own
+            // persisted `source` is authoritative here (a dispatched
+            // schedule/watcher/self-schedule run re-binds the same value the
+            // dispatcher already bound; a UI chat turn binds `.chat`).
+            // Source-scoped capabilities (proactive channel publishing) read
+            // this instead of inferring provenance from surface flags.
+            await ChatExecutionContext.$currentSessionSource.withValue(source) { [self] in
+            await ChatExecutionContext.$currentAgentId.withValue(turnAgentId) { [self] in
+            await ChatExecutionContext.$currentUserRequest.withValue(
+                trimmed.isEmpty ? nil : trimmed
+            ) { [self] in
+            await ChatExecutionContext.$currentModelName.withValue(
+                self.selectedModel
+            ) { [self] in
+            await ChatExecutionContext.$currentEnableThinking.withValue(
+                turnGenerationControls.enableThinking
+            ) { [self] in
+                debugLog("send: task started runId=\(runId) model=\(self.selectedModel ?? "nil")")
+                lastStreamError = nil
+                isStreaming = true
+                ServerController.signalGenerationStart()
+                var shouldPersistConversationArtifacts = true
+                defer {
+                    finalizeRun(
+                        runId: runId,
+                        persistConversationArtifacts: shouldPersistConversationArtifacts
+                    )
+                }
 
-                                    var assistantTurn = ChatTurn(role: .assistant, content: "")
-                                    turns.append(assistantTurn)
-                                    // Must refresh block memoizer before first delta — otherwise visibleBlocks stays
-                                    // user-only while isStreaming is true and the table early-returns without assistant rows.
-                                    rebuildVisibleBlocks()
+                var assistantTurn = ChatTurn(role: .assistant, content: "")
+                turns.append(assistantTurn)
+                // Must refresh block memoizer before first delta — otherwise visibleBlocks stays
+                // user-only while isStreaming is true and the table early-returns without assistant rows.
+                rebuildVisibleBlocks()
 
-                                    // Image-generation models route through ImageGenerationService
-                                    // (a second MLX graph, gated exclusive to LLM eval) instead of
-                                    // the chat engine. The same run lifecycle (defer finalizeRun,
-                                    // currentTask cancellation) applies.
-                                    if self.isImageGenerationModel(self.selectedModel) {
-                                        await self.runImageGeneration(
+                // Image-generation models route through ImageGenerationService
+                // (a second MLX graph, gated exclusive to LLM eval) instead of
+                // the chat engine. The same run lifecycle (defer finalizeRun,
+                // currentTask cancellation) applies.
+                                    if self.isVideoGenerationModel(self.selectedModel) {
+                                        await self.runVideoGeneration(
                                             prompt: trimmed,
                                             attachments: attachments,
                                             settings: imageSettings,
@@ -4811,876 +5304,912 @@ final class ChatSession: ObservableObject {
                                         )
                                         return
                                     }
+                if self.isImageGenerationModel(self.selectedModel) {
+                    await self.runImageGeneration(
+                        prompt: trimmed,
+                        attachments: attachments,
+                        settings: imageSettings,
+                        into: assistantTurn,
+                        runId: runId
+                    )
+                    return
+                }
 
-                                    #if DEBUG
-                                        // Dev aid: stream a canned tool-call timeline instead of the real
-                                        // model so the tool-call rail animation can be exercised on demand.
-                                        // Toggle via `MockToolStream.forceEnabled` (or env OSAURUS_MOCK_STREAM=1).
-                                        if MockToolStream.enabled {
-                                            await streamMockToolTimeline(runId: runId, firstTurn: assistantTurn)
-                                            return  // `defer { finalizeRun(...) }` handles cleanup
-                                        }
-                                    #endif
+                #if DEBUG
+                    // Dev aid: stream a canned tool-call timeline instead of the real
+                    // model so the tool-call rail animation can be exercised on demand.
+                    // Toggle via `MockToolStream.forceEnabled` (or env OSAURUS_MOCK_STREAM=1).
+                    if MockToolStream.enabled {
+                        await streamMockToolTimeline(runId: runId, firstTurn: assistantTurn)
+                        return  // `defer { finalizeRun(...) }` handles cleanup
+                    }
+                #endif
 
-                                    #if DEBUG
-                                        let ttftTrace: TTFTTrace? = TTFTTrace()
-                                    #else
-                                        let ttftTrace: TTFTTrace? = nil
-                                    #endif
-                                    do {
-                                        let engine = chatEngineFactory(source.inferenceSource)
-                                        let chatCfg = ChatConfigurationStore.load()
+                #if DEBUG
+                    let ttftTrace: TTFTTrace? = TTFTTrace()
+                #else
+                    let ttftTrace: TTFTTrace? = nil
+                #endif
+                do {
+                    let engine = chatEngineFactory(source.inferenceSource)
+                    let chatCfg = ChatConfigurationStore.load()
 
-                                        // MARK: - Capability Setup
-                                        // The outer ChatExecutionContext.$currentAgentId binding
-                                        // (lifted to wrap the whole Task) already pinned this
-                                        // turn's agent id; we just alias it locally for the calls
-                                        // below that want a plain UUID.
-                                        let effectiveAgentId = turnAgentId
-                                        // Per-agent screen context (a child of Computer Use). Read
-                                        // once here so the freeze gate below and the inject gate in
-                                        // `loopHooks.buildMessages` agree on a single value for the
-                                        // whole turn.
-                                        let screenContextEnabled = AgentManager.shared
-                                            .effectiveCapabilities(for: effectiveAgentId).screenContextEnabled
-                                        ttftTrace?.mark("prepare_exec_mode_start")
-                                        let executionMode = await prepareChatExecutionMode(agentId: effectiveAgentId)
-                                        ttftTrace?.mark("prepare_exec_mode_done")
-                                        guard isRunActive(runId) else { return }
+                    // MARK: - Capability Setup
+                    // The outer ChatExecutionContext.$currentAgentId binding
+                    // (lifted to wrap the whole Task) already pinned this
+                    // turn's agent id; we just alias it locally for the calls
+                    // below that want a plain UUID.
+                    let effectiveAgentId = turnAgentId
+                    // Per-agent screen context (a child of Computer Use). Read
+                    // once here so the freeze gate below and the inject gate in
+                    // `loopHooks.buildMessages` agree on a single value for the
+                    // whole turn.
+                    let screenContextEnabled = AgentManager.shared
+                        .effectiveCapabilities(for: effectiveAgentId).screenContextEnabled
+                    ttftTrace?.mark("prepare_exec_mode_start")
+                    let executionMode = await prepareChatExecutionMode(agentId: effectiveAgentId)
+                    ttftTrace?.mark("prepare_exec_mode_done")
+                    guard isRunActive(runId) else { return }
 
-                                        let priorUserMessages: [ChatMessage] = turns.compactMap { t in
-                                            guard t.role == .user, !t.contentIsEmpty else { return nil }
-                                            return ChatMessage(role: "user", content: t.content)
-                                        }
+                    let priorUserMessages: [ChatMessage] = turns.compactMap { t in
+                        guard t.role == .user, !t.contentIsEmpty else { return nil }
+                        return ChatMessage(role: "user", content: t.content)
+                    }
 
-                                        // Reuse the per-session always-loaded + capabilities_load
-                                        // union on subsequent sends so the schema stays stable.
-                                        // First, ask the store to drop the cache if the
-                                        // (executionMode, toolMode) fingerprint flipped since the
-                                        // last turn — otherwise stale dynamically-loaded tools
-                                        // would leak into the new mode's schema.
+                    // Reuse the per-session always-loaded + capabilities_load
+                    // union on subsequent sends so the schema stays stable.
+                    // First, ask the store to drop the cache if the
+                    // (executionMode, toolMode) fingerprint flipped since the
+                    // last turn — otherwise stale dynamically-loaded tools
+                    // would leak into the new mode's schema.
                                         let liveToolMode = AgentManager.shared.effectiveToolSelectionMode(
                                             for: effectiveAgentId
                                         )
-                                        let liveFingerprint = SessionToolState.fingerprint(
-                                            executionMode: executionMode,
-                                            toolMode: liveToolMode
-                                        )
-                                        let cachedSession: SessionToolState?
-                                        if let sid = sessionId {
-                                            let key = sessionStateKey(sid)
-                                            await SessionToolStateStore.shared.invalidateIfFingerprintChanged(
-                                                key,
-                                                liveFingerprint: liveFingerprint
-                                            )
-                                            cachedSession = await SessionToolStateStore.shared.get(key)
-                                        } else {
-                                            cachedSession = nil
-                                        }
+                    let liveFingerprint = SessionToolState.fingerprint(
+                        executionMode: executionMode,
+                        toolMode: liveToolMode
+                    )
+                    let cachedSession: SessionToolState?
+                    if let sid = sessionId {
+                        let key = sessionStateKey(sid)
+                        await SessionToolStateStore.shared.invalidateIfFingerprintChanged(
+                            key,
+                            liveFingerprint: liveFingerprint
+                        )
+                        cachedSession = await SessionToolStateStore.shared.get(key)
+                    } else {
+                        cachedSession = nil
+                    }
 
-                                        // Opt-in screen context: freeze a distilled snapshot of
-                                        // what the user is doing, once per session on the first
-                                        // send, so the assistant has ambient awareness of their
-                                        // current task. Reused unchanged for the rest of the
-                                        // session and injected onto the latest user message — so it
-                                        // flows through the Privacy Filter — in
-                                        // `loopHooks.buildMessages` below.
-                                        if !isRemoteAgentTarget,
-                                            screenContextEnabled,
-                                            !self.isScreenContextFrozen
-                                        {
-                                            // A welcome-screen preview may have already captured the
-                                            // snapshot (reused as-is to avoid a second Accessibility
-                                            // walk); otherwise capture it now.
-                                            if self.frozenScreenContext == nil {
-                                                let snapshot = await ScreenContextDistiller.captureForChat()
-                                                let rendered = snapshot.render()
-                                                self.frozenScreenContext = rendered.isEmpty ? nil : rendered
-                                                guard isRunActive(runId) else { return }
-                                            }
-                                            self.cachedScreenContextTokens =
-                                                self.frozenScreenContext.map {
-                                                    ContextBudgetManager.estimateTokens(for: $0)
-                                                } ?? 0
-                                            self.isScreenContextFrozen = true
-                                        }
+                    // Opt-in screen context: freeze a distilled snapshot of
+                    // what the user is doing, once per session on the first
+                    // send, so the assistant has ambient awareness of their
+                    // current task. Reused unchanged for the rest of the
+                    // session and injected onto the latest user message — so it
+                    // flows through the Privacy Filter — in
+                    // `loopHooks.buildMessages` below.
+                    if !isRemoteAgentTarget,
+                        screenContextEnabled,
+                        !self.isScreenContextFrozen
+                    {
+                        // A welcome-screen preview may have already captured the
+                        // snapshot (reused as-is to avoid a second Accessibility
+                        // walk); otherwise capture it now.
+                        if self.frozenScreenContext == nil {
+                            let snapshot = await ScreenContextDistiller.captureForChat()
+                            let rendered = snapshot.render()
+                            self.frozenScreenContext = rendered.isEmpty ? nil : rendered
+                            guard isRunActive(runId) else { return }
+                        }
+                        self.cachedScreenContextTokens =
+                            self.frozenScreenContext.map {
+                                ContextBudgetManager.estimateTokens(for: $0)
+                            } ?? 0
+                        self.isScreenContextFrozen = true
+                    }
 
-                                        // Keep the first real send byte-identical to warmup and
-                                        // restart restore: plugin tools/skills are part of the
-                                        // static prompt and must come from a completed catalog
-                                        // snapshot, not launch-task timing.
-                                        if !isRemoteAgentTarget {
-                                            await PluginManager.shared.ensurePromptCatalogReady()
-                                            guard isRunActive(runId) else { return }
-                                        }
+                    // Keep the first real send byte-identical to warmup and
+                    // restart restore: plugin tools/skills are part of the
+                    // static prompt and must come from a completed catalog
+                    // snapshot, not launch-task timing.
+                    if !isRemoteAgentTarget {
+                        await PluginManager.shared.ensurePromptCatalogReady()
+                        guard isRunActive(runId) else { return }
+                    }
 
-                                        // Resolve the pending one-off skill BEFORE composing.
-                                        // Skill instructions routinely name the exact tools they
-                                        // expect the model to call (MCP / plugin tools), but those
-                                        // tools only enter the schema via `capabilities_load` —
-                                        // injecting the instructions after the tool schema and
-                                        // execution scope were frozen left every such call refused
-                                        // as tool_not_found (#2145). Scan the instructions for
-                                        // agent-granted dynamic tools and ride them in through
-                                        // `additionalToolNames`, the same channel a prior-turn
-                                        // `capabilities_load` would use. Consume the pending id
-                                        // either way, but never inject in Mode 2 (the request
-                                        // must stay bare).
-                                        var oneOffSkillSection: (name: String, body: String)?
-                                        var skillReferencedTools: LoadedTools = []
-                                        if let skillId = pendingOneOffSkillId {
-                                            pendingOneOffSkillId = nil
+                    // Resolve the pending one-off skill BEFORE composing.
+                    // Skill instructions routinely name the exact tools they
+                    // expect the model to call (MCP / plugin tools), but those
+                    // tools only enter the schema via `capabilities_load` —
+                    // injecting the instructions after the tool schema and
+                    // execution scope were frozen left every such call refused
+                    // as tool_not_found (#2145). Scan the instructions for
+                    // agent-granted dynamic tools and ride them in through
+                    // `additionalToolNames`, the same channel a prior-turn
+                    // `capabilities_load` would use. Consume the pending id
+                    // either way, but never inject in Mode 2 (the request
+                    // must stay bare).
+                    var oneOffSkillSection: (name: String, body: String)?
+                    var skillReferencedTools: LoadedTools = []
+                    if let skillId = pendingOneOffSkillId {
+                        pendingOneOffSkillId = nil
                                             if !isRemoteAgentTarget, let skill = SkillManager.shared.skill(for: skillId)
                                             {
-                                                let body = await SkillManager.shared.buildFullInstructions(for: skill)
-                                                oneOffSkillSection = (skill.name, body)
-                                                let granted = AgentManager.shared
-                                                    .effectiveEnabledToolNames(for: effectiveAgentId)
-                                                    .map(Set.init)
-                                                let dynamicNames = Set(
-                                                    ToolRegistry.shared.listDynamicTools().map(\.name)
-                                                ).filter { granted?.contains($0) ?? true }
-                                                skillReferencedTools = LoadedTools(
-                                                    SkillManager.toolNames(referencedIn: body, from: dynamicNames)
-                                                )
-                                            }
-                                        }
+                            let body = await SkillManager.shared.buildFullInstructions(for: skill)
+                            oneOffSkillSection = (skill.name, body)
+                            let granted = AgentManager.shared
+                                .effectiveEnabledToolNames(for: effectiveAgentId)
+                                .map(Set.init)
+                            let dynamicNames = Set(
+                                ToolRegistry.shared.listDynamicTools().map(\.name)
+                            ).filter { granted?.contains($0) ?? true }
+                            skillReferencedTools = LoadedTools(
+                                SkillManager.toolNames(referencedIn: body, from: dynamicNames)
+                            )
+                        }
+                    }
 
-                                        let context = await SystemPromptComposer.composeChatContext(
-                                            agentId: effectiveAgentId,
-                                            executionMode: executionMode,
-                                            model: selectedModel,
-                                            modelType: selectedPickerItem?.modelType,
-                                            query: trimmed,
-                                            messages: priorUserMessages,
-                                            toolsDisabled: chatCfg.disableTools,
-                                            additionalToolNames: (cachedSession?.loadedToolNames ?? [])
-                                                .union(skillReferencedTools),
-                                            frozenAlwaysLoadedNames: cachedSession?.initialAlwaysLoadedNames,
-                                            frozenToolSpecs: cachedSession?.initialToolSpecs,
-                                            frozenManifest: cachedSession?.frozenManifest,
-                                            frozenSoul: cachedSession?.frozenSoul,
-                                            trace: ttftTrace
-                                        )
-                                        guard isRunActive(runId) else { return }
+                    let context = await SystemPromptComposer.composeChatContext(
+                        agentId: effectiveAgentId,
+                        executionMode: executionMode,
+                        model: selectedModel,
+                        modelType: selectedPickerItem?.modelType,
+                        query: trimmed,
+                        messages: priorUserMessages,
+                        toolsDisabled: chatCfg.disableTools,
+                        additionalToolNames: (cachedSession?.loadedToolNames ?? [])
+                            .union(skillReferencedTools),
+                        frozenAlwaysLoadedNames: cachedSession?.initialAlwaysLoadedNames,
+                        frozenToolSpecs: cachedSession?.initialToolSpecs,
+                        frozenManifest: cachedSession?.frozenManifest,
+                        frozenSoul: cachedSession?.frozenSoul,
+                        trace: ttftTrace
+                    )
+                    guard isRunActive(runId) else { return }
 
-                                        // Mode 2 (remote agent run): send NO local system prompt.
-                                        // The remote agent composes its own persona/memory/tools on
-                                        // the bare conversation server-side, so anything we'd inject
-                                        // here (local agent prompt, plugin instructions, one-off
-                                        // skill) would leak the caller's context onto the agent.
-                                        var sys = isRemoteAgentTarget ? "" : context.prompt
+                    // Mode 2 (remote agent run): send NO local system prompt.
+                    // The remote agent composes its own persona/memory/tools on
+                    // the bare conversation server-side, so anything we'd inject
+                    // here (local agent prompt, plugin instructions, one-off
+                    // skill) would leak the caller's context onto the agent.
+                    var sys = isRemoteAgentTarget ? "" : context.prompt
 
-                                        // Plugin-dispatched tasks (host->dispatch) carry their
-                                        // source plugin id on the session. Append that plugin's
-                                        // instructions so the dispatched chat sees the same
-                                        // contract the plugin would have published via
-                                        // host->complete. Mirrors `PluginHostAPI.prepareInference`
-                                        // through the shared `PluginInstructionsResolver`. Without
-                                        // this, plugin manifest `instructions` are silently
-                                        // dropped on the dispatch path, leaving the model
-                                        // unaware of plugin-specific contracts (e.g. Telegram's
-                                        // `[reply_token …]` / `reply` / `reply_typing` flow).
-                                        if !isRemoteAgentTarget,
-                                            let pid = sourcePluginId,
-                                            let pluginInstructions = PluginInstructionsResolver.instructions(
-                                                pluginId: pid,
-                                                agentId: agentId
-                                            )
-                                        {
-                                            sys = sys.isEmpty ? pluginInstructions : sys + "\n\n" + pluginInstructions
-                                        }
+                    // Plugin-dispatched tasks (host->dispatch) carry their
+                    // source plugin id on the session. Append that plugin's
+                    // instructions so the dispatched chat sees the same
+                    // contract the plugin would have published via
+                    // host->complete. Mirrors `PluginHostAPI.prepareInference`
+                    // through the shared `PluginInstructionsResolver`. Without
+                    // this, plugin manifest `instructions` are silently
+                    // dropped on the dispatch path, leaving the model
+                    // unaware of plugin-specific contracts (e.g. Telegram's
+                    // `[reply_token …]` / `reply` / `reply_typing` flow).
+                    if !isRemoteAgentTarget,
+                        let pid = sourcePluginId,
+                        let pluginInstructions = PluginInstructionsResolver.instructions(
+                            pluginId: pid,
+                            agentId: agentId
+                        )
+                    {
+                        sys = sys.isEmpty ? pluginInstructions : sys + "\n\n" + pluginInstructions
+                    }
 
-                                        // Inject the one-off skill the user selected via slash
-                                        // command (resolved above, before compose, so the tools it
-                                        // references made it into the schema).
-                                        if let oneOff = oneOffSkillSection {
-                                            sys += "\n\n## Active Skill: \(oneOff.name)\n\n\(oneOff.body)"
-                                        }
+                    // Inject the one-off skill the user selected via slash
+                    // command (resolved above, before compose, so the tools it
+                    // references made it into the schema).
+                    if let oneOff = oneOffSkillSection {
+                        sys += "\n\n## Active Skill: \(oneOff.name)\n\n\(oneOff.body)"
+                    }
 
-                                        // FROZEN for the whole run (deferred-schema / KV-prefix
-                                        // stability): the rendered `<tools>` block never changes
-                                        // mid-run, even after `capabilities_load`. Loaded tools are
-                                        // callable immediately by name and their schemas ride in the
-                                        // tool result (see `CapabilitiesLoadTool.loadedSchemaBlock`);
-                                        // they fold into `<tools>` on the next user turn. In Mode 2
-                                        // we send no tools: the remote agent advertises and executes
-                                        // its own tools server-side and only streams text back.
-                                        let toolSpecs = isRemoteAgentTarget ? [] : context.tools
-                                        let isManualTools = liveToolMode == .manual
-                                        cachedContext = context
+                    // FROZEN for the whole run (deferred-schema / KV-prefix
+                    // stability): the rendered `<tools>` block never changes
+                    // mid-run, even after `capabilities_load`. Loaded tools are
+                    // callable immediately by name and their schemas ride in the
+                    // tool result (see `CapabilitiesLoadTool.loadedSchemaBlock`);
+                    // they fold into `<tools>` on the next user turn. In Mode 2
+                    // we send no tools: the remote agent advertises and executes
+                    // its own tools server-side and only streams text back.
+                    let toolSpecs = isRemoteAgentTarget ? [] : context.tools
+                    let isManualTools = liveToolMode == .manual
+                    cachedContext = context
 
-                                        // What this run may EXECUTE, seeded from what it actually EXPOSED.
-                                        //
-                                        // The model can name a tool it was never shown (the parser records any name
-                                        // once a schema exists) and the registry used to run it. One object for the
-                                        // whole run: `capabilities_load` legitimately GROWS this set mid-run while
-                                        // `toolSpecs` stays frozen, so an immutable snapshot would kill that feature.
-                                        let toolScope = ToolExecutionScope(exposed: toolSpecs)
+                    // What this run may EXECUTE, seeded from what it actually EXPOSED.
+                    //
+                    // The model can name a tool it was never shown (the parser records any name
+                    // once a schema exists) and the registry used to run it. One object for the
+                    // whole run: `capabilities_load` legitimately GROWS this set mid-run while
+                    // `toolSpecs` stays frozen, so an immutable snapshot would kill that feature.
+                    let toolScope = ToolExecutionScope(exposed: toolSpecs)
 
-                                        // Persist the always-loaded snapshot back onto the session
-                                        // so the next send freezes the schema against tools that
-                                        // register mid-session. Preserves any capabilities_load
-                                        // names already accumulated this session. Stamp the live
-                                        // fingerprint so the invalidation rule above can detect
-                                        // a flip on the next turn.
-                                        if let sid = sessionId {
-                                            await SessionToolStateStore.shared.setInitial(
-                                                sessionStateKey(sid),
-                                                alwaysLoadedNames: context.alwaysLoadedNames,
-                                                toolSpecs: context.initialToolSpecs,
-                                                fingerprint: liveFingerprint,
-                                                manifest: context.enabledManifest,
-                                                soul: context.soul
-                                            )
-                                        }
+                    // Persist the always-loaded snapshot back onto the session
+                    // so the next send freezes the schema against tools that
+                    // register mid-session. Preserves any capabilities_load
+                    // names already accumulated this session. Stamp the live
+                    // fingerprint so the invalidation rule above can detect
+                    // a flip on the next turn.
+                    if let sid = sessionId {
+                        await SessionToolStateStore.shared.setInitial(
+                            sessionStateKey(sid),
+                            alwaysLoadedNames: context.alwaysLoadedNames,
+                            toolSpecs: context.initialToolSpecs,
+                            fingerprint: liveFingerprint,
+                            manifest: context.enabledManifest,
+                            soul: context.soul
+                        )
+                    }
 
-                                        // Skill-referenced tools joined this turn's schema above;
-                                        // persist them into the session's loaded-tool union (auto
-                                        // mode only, mirroring the capabilities_load drain path)
-                                        // so the next turn's frozen schema still contains them.
-                                        if !skillReferencedTools.isEmpty, !isManualTools, let sid = sessionId {
-                                            await SessionToolStateStore.shared.appendLoadedTools(
-                                                sessionStateKey(sid),
-                                                names: Array(skillReferencedTools),
-                                                fallbackAlwaysLoadedNames: context.alwaysLoadedNames
-                                            )
-                                        }
+                    // Skill-referenced tools joined this turn's schema above;
+                    // persist them into the session's loaded-tool union (auto
+                    // mode only, mirroring the capabilities_load drain path)
+                    // so the next turn's frozen schema still contains them.
+                    if !skillReferencedTools.isEmpty, !isManualTools, let sid = sessionId {
+                        await SessionToolStateStore.shared.appendLoadedTools(
+                            sessionStateKey(sid),
+                            names: Array(skillReferencedTools),
+                            fallbackAlwaysLoadedNames: context.alwaysLoadedNames
+                        )
+                    }
 
-                                        budgetTracker.snapshot(context: context)
-                                        budgetTracker.updateScreenContext(tokens: cachedScreenContextTokens)
+                    budgetTracker.snapshot(context: context)
+                    budgetTracker.updateScreenContext(tokens: cachedScreenContextTokens)
 
-                                        // Freeze this turn's memory + screen/automation-context prefix into
-                                        // the turn history BEFORE any messages are rendered: the
-                                        // injected bytes become part of the turn's permanent
-                                        // rendering, so turn N+1 replays turn N byte-identically
-                                        // and the paged KV cache reuses the whole previous
-                                        // exchange. (Previously the prefix was re-injected onto
-                                        // whichever user message was latest and vanished from
-                                        // history on the next turn, re-prefilling the last
-                                        // exchange every turn.) Skipped in Mode 2: requests stay
-                                        // bare and the remote agent applies its own context.
-                                        let appleScriptWorkingContext =
-                                            !isRemoteAgentTarget
-                                                && toolSpecs.contains(where: {
-                                                    $0.function.name == AppleScriptTool.toolName
-                                                })
-                                            ? SystemPromptComposer.appleScriptWorkingAppContext(
-                                                appName: FrontmostAppTracker.shared.lastNonSelfAppName
-                                            )
-                                            : nil
-                                        if !isRemoteAgentTarget {
-                                            freezeInjectedContextOntoLatestUserTurn(
-                                                memorySection: context.memorySection,
-                                                screenContext: screenContextEnabled ? frozenScreenContext : nil,
-                                                automationContext: appleScriptWorkingContext
-                                            )
-                                        }
+                    // Freeze this turn's memory + screen/automation-context prefix into
+                    // the turn history BEFORE any messages are rendered: the
+                    // injected bytes become part of the turn's permanent
+                    // rendering, so turn N+1 replays turn N byte-identically
+                    // and the paged KV cache reuses the whole previous
+                    // exchange. (Previously the prefix was re-injected onto
+                    // whichever user message was latest and vanished from
+                    // history on the next turn, re-prefilling the last
+                    // exchange every turn.) Skipped in Mode 2: requests stay
+                    // bare and the remote agent applies its own context.
+                    let appleScriptWorkingContext =
+                        !isRemoteAgentTarget
+                        && toolSpecs.contains(where: {
+                            $0.function.name == AppleScriptTool.toolName
+                        })
+                        ? SystemPromptComposer.appleScriptWorkingAppContext(
+                            appName: FrontmostAppTracker.shared.lastNonSelfAppName
+                        )
+                        : nil
+                    if !isRemoteAgentTarget {
+                        freezeInjectedContextOntoLatestUserTurn(
+                            memorySection: context.memorySection,
+                            screenContext: screenContextEnabled ? frozenScreenContext : nil,
+                            automationContext: appleScriptWorkingContext
+                        )
+                    }
 
                                         let effectiveMaxTokensForAgent = AgentManager.shared.effectiveMaxTokens(
                                             for: effectiveAgentId
                                         )
 
-                                        // KV-cache-aware history compaction: shared window
-                                        // resolution + reservations via `AgentLoopBudget` (parity
-                                        // with the plugin host's budget manager). Trimming only
-                                        // activates once the conversation outgrows the history
-                                        // budget; the system prefix is never rewritten so paged-KV
-                                        // reuse survives compaction.
-                                        let loopBudgetManager: ContextBudgetManager = await {
-                                            let contextWindow = await AgentLoopBudget.resolveContextWindow(
-                                                modelId: selectedModel ?? "default"
-                                            )
-                                            return AgentLoopBudget.makeBudgetManager(
-                                                contextWindow: contextWindow,
-                                                systemPromptChars: sys.count,
-                                                toolTokens: context.toolTokens,
-                                                maxResponseTokens: effectiveMaxTokensForAgent
-                                            )
-                                        }()
+                    // KV-cache-aware history compaction: shared window
+                    // resolution + reservations via `AgentLoopBudget` (parity
+                    // with the plugin host's budget manager). Trimming only
+                    // activates once the conversation outgrows the history
+                    // budget; the system prefix is never rewritten so paged-KV
+                    // reuse survives compaction.
+                    let loopBudgetManager: ContextBudgetManager = await {
+                        let contextWindow = await AgentLoopBudget.resolveContextWindow(
+                            modelId: selectedModel ?? "default"
+                        )
+                        return AgentLoopBudget.makeBudgetManager(
+                            contextWindow: contextWindow,
+                            systemPromptChars: sys.count,
+                            toolTokens: context.toolTokens,
+                            maxResponseTokens: effectiveMaxTokensForAgent
+                        )
+                    }()
 
-                                        // Incomplete reasoning attempts remain visible in the
-                                        // transcript but must not be fed back into the retry.
-                                        // Bundle templates do not share a continuation contract:
-                                        // Gemma drops tool-free reasoning history while Ornith
-                                        // closes and rewrites it. Excluding only these captured
-                                        // attempt ids makes the bounded retry an exact replay of
-                                        // the pre-attempt model-visible history.
-                                        var incompleteReasoningRetryOrdinal = 0
-                                        // Set only after this logical run emits a parsed tool call.
-                                        // Tool schemas being available is not itself agent work and
-                                        // must not force an intentional reasoning-only direct answer
-                                        // through the post-tool recovery path.
-                                        var hasStructuredToolWorkThisRun = false
+                    // Incomplete reasoning attempts remain visible in the
+                    // transcript but must not be fed back into the retry.
+                    // Bundle templates do not share a continuation contract:
+                    // Gemma drops tool-free reasoning history while Ornith
+                    // closes and rewrites it. Excluding only these captured
+                    // attempt ids makes the bounded retry an exact replay of
+                    // the pre-attempt model-visible history.
+                    var incompleteReasoningRetryOrdinal = 0
+                    // Set only after this logical run emits a parsed tool call.
+                    // Tool schemas being available is not itself agent work and
+                    // must not force an intentional reasoning-only direct answer
+                    // through the post-tool recovery path.
+                    var hasStructuredToolWorkThisRun = false
 
-                                        /// Convert a single turn to a ChatMessage (returns nil if should be skipped)
-                                        @MainActor
-                                        func turnToMessage(_ t: ChatTurn, isLastTurn: Bool) -> ChatMessage? {
-                                            switch t.role {
-                                            case .assistant:
-                                                return Self.modelVisibleAssistantMessage(
-                                                    t,
-                                                    isLastTurn: isLastTurn
-                                                )
-                                            case .tool:
-                                                return ChatMessage(
-                                                    role: "tool",
-                                                    content: t.content,
-                                                    tool_calls: nil,
-                                                    tool_call_id: t.toolCallId
-                                                )
-                                            case .user:
-                                                let base = Self.buildUserChatMessage(
-                                                    content: t.content,
-                                                    attachments: t.attachments,
-                                                    supportsImages: selectedModelSupportsImages,
-                                                    supportsAudio: selectedModelSupportsAudio,
-                                                    supportsVideo: selectedModelSupportsVideo
-                                                )
-                                                // Replay the frozen memory / screen-context block
-                                                // this turn was originally sent with, so its wire
-                                                // bytes never change once it has been part of a
-                                                // token stream (paged-KV prefix reuse across
-                                                // turns). Mode 2 requests stay bare — the local
-                                                // agent's memory must not ride to a remote agent.
-                                                if isRemoteAgentTarget { return base }
-                                                return Self.applyingFrozenInjectedPrefix(
-                                                    t.injectedContextPrefix,
-                                                    to: base
-                                                )
-                                            default:
-                                                return ChatMessage(role: t.role.rawValue, content: t.content)
-                                            }
-                                        }
+                    /// Convert a single turn to a ChatMessage (returns nil if should be skipped)
+                    @MainActor
+                    func turnToMessage(_ t: ChatTurn, isLastTurn: Bool) -> ChatMessage? {
+                        switch t.role {
+                        case .assistant:
+                            return Self.modelVisibleAssistantMessage(
+                                t,
+                                isLastTurn: isLastTurn
+                            )
+                        case .tool:
+                            return ChatMessage(
+                                role: "tool",
+                                content: t.content,
+                                tool_calls: nil,
+                                tool_call_id: t.toolCallId
+                            )
+                        case .user:
+                            let base = Self.buildUserChatMessage(
+                                content: t.content,
+                                attachments: t.attachments,
+                                supportsImages: selectedModelSupportsImages,
+                                supportsAudio: selectedModelSupportsAudio,
+                                supportsVideo: selectedModelSupportsVideo
+                            )
+                            // Replay the frozen memory / screen-context block
+                            // this turn was originally sent with, so its wire
+                            // bytes never change once it has been part of a
+                            // token stream (paged-KV prefix reuse across
+                            // turns). Mode 2 requests stay bare — the local
+                            // agent's memory must not ride to a remote agent.
+                            if isRemoteAgentTarget { return base }
+                            return Self.applyingFrozenInjectedPrefix(
+                                t.injectedContextPrefix,
+                                to: base
+                            )
+                        default:
+                            return ChatMessage(role: t.role.rawValue, content: t.content)
+                        }
+                    }
 
-                                        @MainActor
-                                        func buildMessages() -> [ChatMessage] {
-                                            var msgs: [ChatMessage] = []
-                                            if !sys.isEmpty { msgs.append(ChatMessage(role: "system", content: sys)) }
+                    @MainActor
+                    func buildMessages() -> [ChatMessage] {
+                        var msgs: [ChatMessage] = []
+                        if !sys.isEmpty { msgs.append(ChatMessage(role: "system", content: sys)) }
 
-                                            for (index, t) in turns.enumerated() {
-                                                let isLastTurn = index == turns.count - 1
-                                                if let msg = turnToMessage(t, isLastTurn: isLastTurn) {
-                                                    msgs.append(msg)
-                                                }
-                                            }
+                        // Non-destructive LLM compaction: turns covered by the
+                        // session's ConversationSummary are replaced by ONE
+                        // byte-stable summary message in the outbound array —
+                        // the visible transcript keeps every turn. When a new
+                        // summary lands between runs, the built shape changes
+                        // and `CompactionWatermark.validate` resets its sticky
+                        // decisions (an implicit rebase at the boundary); the
+                        // deterministic trimmer still runs on the remainder.
+                        let summary = self.conversationSummary
+                        let coveredIds = summary.map { Set($0.coveredTurnIds) } ?? []
+                        var summaryInjected = false
 
-                                            return msgs
-                                        }
+                        for (index, t) in turns.enumerated() {
+                            if let summary, coveredIds.contains(t.id) {
+                                if !summaryInjected {
+                                    msgs.append(
+                                        ChatMessage(
+                                            role: "user",
+                                            content: summary.contextMessageText
+                                        )
+                                    )
+                                    summaryInjected = true
+                                }
+                                continue
+                            }
+                            let isLastTurn = index == turns.count - 1
+                            if let msg = turnToMessage(t, isLastTurn: isLastTurn) {
+                                msgs.append(msg)
+                            }
+                        }
 
-                                        let maxAttempts = max(chatCfg.maxToolAttempts ?? 15, 1)
-                                        // Reset within-message dedupe/bias tracking for this user
-                                        // turn (lastListing intentionally persists across messages).
-                                        taskState.beginMessage()
-                                        // Transient stream errors (e.g. provider closes connection
-                                        // mid-tool-args, see `RemoteProviderService` truncation
-                                        // detection) shouldn't immediately surface to the user — they
-                                        // tend to retry cleanly. The modelStep hook retries the same
-                                        // iteration up to `maxTransientRetries` times (via the
-                                        // driver's `.retryWithoutCharge`) before giving up. The
-                                        // counter is reset whenever a stream finishes naturally so
-                                        // unrelated future failures get a fresh budget.
-                                        let maxTransientRetries = 2
-                                        var transientRetries = 0
+                        return msgs
+                    }
+
+                    let maxAttempts = max(chatCfg.maxToolAttempts ?? 15, 1)
+                    // Reset within-message dedupe/bias tracking for this user
+                    // turn (lastListing intentionally persists across messages).
+                    taskState.beginMessage()
+                    // Transient stream errors (e.g. provider closes connection
+                    // mid-tool-args, see `RemoteProviderService` truncation
+                    // detection) shouldn't immediately surface to the user — they
+                    // tend to retry cleanly. The modelStep hook retries the same
+                    // iteration up to `maxTransientRetries` times (via the
+                    // driver's `.retryWithoutCharge`) before giving up. The
+                    // counter is reset whenever a stream finishes naturally so
+                    // unrelated future failures get a fresh budget.
+                    let maxTransientRetries = 2
+                    var transientRetries = 0
                                         let effectiveTemp = AgentManager.shared.effectiveTemperature(
                                             for: effectiveAgentId
                                         )
 
-                                        ttftTrace?.mark("pre_ttft_done")
+                    ttftTrace?.mark("pre_ttft_done")
 
-                                        // Per-call presentation override: the model keeps a compact
-                                        // result while the card retains the full chart/image payload.
-                                        // This prevents a large display artifact from being re-prefilled
-                                        // through the model on the next agent-loop iteration.
-                                        var toolCardOverrides: [String: String] = [:]
+                    // Per-call presentation override: the model keeps a compact
+                    // result while the card retains the full chart/image payload.
+                    // This prevents a large display artifact from being re-prefilled
+                    // through the model on the next agent-loop iteration.
+                    var toolCardOverrides: [String: String] = [:]
 
-                                        // Build the matching tool-result turn for a call. Every
-                                        // assistant `tool_use` MUST be paired with a tool turn
-                                        // before the loop yields control — Anthropic's Messages
-                                        // API rejects subsequent sends otherwise ("tool_use ids
-                                        // were found without tool_result blocks immediately
-                                        // after"). Shared by the agent-loop intercepts (`complete`,
-                                        // `clarify`), the dedupe replay, and the normal
-                                        // post-execution path so there's only one place that gets
-                                        // the pairing right.
-                                        @MainActor
-                                        @discardableResult
-                                        func recordToolTurn(_ result: String, callId: String) -> ChatTurn {
-                                            // Attach the result to the turn that owns this call's
-                                            // row. On the serial path that's always the current
-                                            // `assistantTurn`; on the parallel batch path every
-                                            // row was materialised on the turn that was current
-                                            // when the batch started, while `assistantTurn`
-                                            // advances as each result lands.
-                                            let owner =
-                                                self.turns.last(where: { turn in
-                                                    turn.role == .assistant
-                                                        && (turn.toolCalls?.contains { $0.id == callId } ?? false)
-                                                }) ?? assistantTurn
-                                            // Card uses the override when present (native image);
-                                            // every other tool falls back to the model-facing result.
-                                            owner.setToolResult(toolCardOverrides[callId] ?? result, for: callId)
-                                            let toolTurn = ChatTurn(role: .tool, content: result)
-                                            toolTurn.toolCallId = callId
-                                            return toolTurn
-                                        }
+                    // Build the matching tool-result turn for a call. Every
+                    // assistant `tool_use` MUST be paired with a tool turn
+                    // before the loop yields control — Anthropic's Messages
+                    // API rejects subsequent sends otherwise ("tool_use ids
+                    // were found without tool_result blocks immediately
+                    // after"). Shared by the agent-loop intercepts (`complete`,
+                    // `clarify`), the dedupe replay, and the normal
+                    // post-execution path so there's only one place that gets
+                    // the pairing right.
+                    @MainActor
+                    @discardableResult
+                    func recordToolTurn(_ result: String, callId: String) -> ChatTurn {
+                        // Attach the result to the turn that owns this call's
+                        // row. On the serial path that's always the current
+                        // `assistantTurn`; on the parallel batch path every
+                        // row was materialised on the turn that was current
+                        // when the batch started, while `assistantTurn`
+                        // advances as each result lands.
+                        let owner =
+                            self.turns.last(where: { turn in
+                                turn.role == .assistant
+                                    && (turn.toolCalls?.contains { $0.id == callId } ?? false)
+                            }) ?? assistantTurn
+                        // Card uses the override when present (native image);
+                        // every other tool falls back to the model-facing result.
+                        owner.setToolResult(toolCardOverrides[callId] ?? result, for: callId)
+                        let toolTurn = ChatTurn(role: .tool, content: result)
+                        toolTurn.toolCallId = callId
+                        return toolTurn
+                    }
 
-                                        // Everything that happens to a tool result AFTER the
-                                        // registry returned it: the agent-loop intercepts
-                                        // (`complete`/`clarify`), hot-loading capability tools,
-                                        // artifact enrichment, the secret prompt, and recording
-                                        // the hidden tool turn. Shared by the serial single-call
-                                        // path and the parallel batch path (which runs registry
-                                        // dispatch concurrently, then post-processes results
-                                        // here on the MainActor in model order).
-                                        @MainActor
-                                        func postProcessToolResult(
-                                            _ inv: ServiceToolInvocation,
-                                            callId: String,
-                                            resultText rawResult: String
-                                        ) async -> AgentLoopToolExecution {
-                                            var resultText = rawResult
-                                            if !self.isRunActive(runId) {
-                                                // Cancelled mid-execution — the driver's
-                                                // post-call probe ends the run before this
-                                                // result is recorded into history or state.
-                                                return AgentLoopToolExecution(result: resultText)
-                                            }
+                    // Everything that happens to a tool result AFTER the
+                    // registry returned it: the agent-loop intercepts
+                    // (`complete`/`clarify`), hot-loading capability tools,
+                    // artifact enrichment, the secret prompt, and recording
+                    // the hidden tool turn. Shared by the serial single-call
+                    // path and the parallel batch path (which runs registry
+                    // dispatch concurrently, then post-processes results
+                    // here on the MainActor in model order).
+                    @MainActor
+                    func postProcessToolResult(
+                        _ inv: ServiceToolInvocation,
+                        callId: String,
+                        resultText rawResult: String
+                    ) async -> AgentLoopToolExecution {
+                        var resultText = rawResult
+                        if !self.isRunActive(runId) {
+                            // Cancelled mid-execution — the driver's
+                            // post-call probe ends the run before this
+                            // result is recorded into history or state.
+                            return AgentLoopToolExecution(result: resultText)
+                        }
 
-                                            // Agent-loop intercepts: `complete` and `clarify`
-                                            // end the iteration loop. `todo` already wrote
-                                            // into AgentTodoStore via TaskLocal; the session
-                                            // observer mirrors it into the inline UI block.
-                                            //
-                                            // CRITICAL: gate the inline UI on whether the
-                                            // tool result is a success envelope. The previous
-                                            // implementation pulled `summary` straight from
-                                            // the JSON arguments and surfaced it regardless
-                                            // of whether `CompleteTool.execute` rejected it
-                                            // for being a placeholder ("done", "looks good").
-                                            // That let the inline completion banner show a
-                                            // rejected summary as if the loop had ended
-                                            // cleanly. We now only intercept when the result
-                                            // is a success envelope; on rejection the loop
-                                            // continues so the model sees the failure and
-                                            // retries with a real summary.
-                                            if inv.toolName == "complete" {
-                                                if !ToolEnvelope.isError(resultText) {
-                                                    if let todo = await AgentTodoStore.shared.todo(
-                                                        for: todoSessionIdForRun
-                                                    ) {
-                                                        self.lastCompletionWasBlocked =
-                                                            todo.doneCount < todo.totalCount
-                                                    } else {
-                                                        self.lastCompletionWasBlocked = false
-                                                    }
-                                                    self.lastCompletionSummary =
-                                                        Self.parseCompleteSummary(from: inv.jsonArguments) ?? resultText
-                                                    // Drain any pending prompts so a stale
-                                                    // clarify card doesn't sit on top of the
-                                                    // completion banner.
-                                                    self.promptQueue.drainAll()
-                                                    self.turns.append(recordToolTurn(resultText, callId: callId))
-                                                    self.rebuildVisibleBlocks()
-                                                    return AgentLoopToolExecution(result: resultText, endRun: true)
-                                                }
-                                                // Fall through — let the model see the
-                                                // failure envelope and try again with a
-                                                // proper summary.
-                                            }
-                                            if inv.toolName == "clarify" {
-                                                if !ToolEnvelope.isError(resultText),
-                                                    let payload = Self.parseClarifyPayload(from: inv.jsonArguments)
-                                                {
-                                                    // Build a ClarifyPromptState bound to
-                                                    // `self.send(...)` so the user's answer
-                                                    // dispatches as the next user turn
-                                                    // through the existing chat send path.
-                                                    // The agent loop ends here; the model
-                                                    // resumes on the next send with the
-                                                    // answer in history.
-                                                    self.turns.append(recordToolTurn(resultText, callId: callId))
-                                                    self.rebuildVisibleBlocks()
-                                                    // Surface the parsed payload on the
-                                                    // session BEFORE breaking the loop so
-                                                    // the BackgroundTaskManager observer
-                                                    // sees the clarify state ahead of the
-                                                    // streaming-end tick — that ordering
-                                                    // is what gates the COMPLETED-suppression
-                                                    // path for plugin-dispatched runs.
-                                                    self.awaitingClarify = payload
-                                                    let clarifyState = ClarifyPromptState(
-                                                        question: payload.question,
-                                                        options: payload.options,
-                                                        allowMultiple: payload.allowMultiple,
-                                                        onSubmit: { [weak self] answer in
-                                                            self?.send(answer)
-                                                        },
-                                                        onUserCancel: { [weak self] in
-                                                            self?.appendClarifyQuestionTrace(payload)
-                                                        }
-                                                    )
-                                                    self.promptQueue.enqueue(.clarify(clarifyState))
-                                                    self.lastCompletionSummary = nil
-                                                    return AgentLoopToolExecution(result: resultText, endRun: true)
-                                                }
-                                                // Fall through on failure (empty question,
-                                                // etc.) so the model sees the rejection.
-                                            }
+                        // Agent-loop intercepts: `complete` and `clarify`
+                        // end the iteration loop. `todo` already wrote
+                        // into AgentTodoStore via TaskLocal; the session
+                        // observer mirrors it into the inline UI block.
+                        //
+                        // CRITICAL: gate the inline UI on whether the
+                        // tool result is a success envelope. The previous
+                        // implementation pulled `summary` straight from
+                        // the JSON arguments and surfaced it regardless
+                        // of whether `CompleteTool.execute` rejected it
+                        // for being a placeholder ("done", "looks good").
+                        // That let the inline completion banner show a
+                        // rejected summary as if the loop had ended
+                        // cleanly. We now only intercept when the result
+                        // is a success envelope; on rejection the loop
+                        // continues so the model sees the failure and
+                        // retries with a real summary.
+                        if inv.toolName == "complete" {
+                            if !ToolEnvelope.isError(resultText) {
+                                if let todo = await AgentTodoStore.shared.todo(
+                                    for: todoSessionIdForRun
+                                ) {
+                                    self.lastCompletionWasBlocked =
+                                        todo.doneCount < todo.totalCount
+                                } else {
+                                    self.lastCompletionWasBlocked = false
+                                }
+                                self.lastCompletionSummary =
+                                    Self.parseCompleteSummary(from: inv.jsonArguments) ?? resultText
+                                // Drain any pending prompts so a stale
+                                // clarify card doesn't sit on top of the
+                                // completion banner.
+                                self.promptQueue.drainAll()
+                                self.turns.append(recordToolTurn(resultText, callId: callId))
+                                self.rebuildVisibleBlocks()
+                                return AgentLoopToolExecution(result: resultText, endRun: true)
+                            }
+                            // Fall through — let the model see the
+                            // failure envelope and try again with a
+                            // proper summary.
+                        }
+                        if inv.toolName == "clarify" {
+                            if !ToolEnvelope.isError(resultText),
+                                let payload = Self.parseClarifyPayload(from: inv.jsonArguments)
+                            {
+                                // Build a ClarifyPromptState bound to
+                                // `self.send(...)` so the user's answer
+                                // dispatches as the next user turn
+                                // through the existing chat send path.
+                                // The agent loop ends here; the model
+                                // resumes on the next send with the
+                                // answer in history.
+                                self.turns.append(recordToolTurn(resultText, callId: callId))
+                                self.rebuildVisibleBlocks()
+                                // Surface the parsed payload on the
+                                // session BEFORE breaking the loop so
+                                // the BackgroundTaskManager observer
+                                // sees the clarify state ahead of the
+                                // streaming-end tick — that ordering
+                                // is what gates the COMPLETED-suppression
+                                // path for plugin-dispatched runs.
+                                self.awaitingClarify = payload
+                                let clarifyState = ClarifyPromptState(
+                                    question: payload.question,
+                                    options: payload.options,
+                                    allowMultiple: payload.allowMultiple,
+                                    onSubmit: { [weak self] answer in
+                                        self?.send(answer)
+                                    },
+                                    onUserCancel: { [weak self] in
+                                        self?.appendClarifyQuestionTrace(payload)
+                                    }
+                                )
+                                self.promptQueue.enqueue(.clarify(clarifyState))
+                                self.lastCompletionSummary = nil
+                                return AgentLoopToolExecution(result: resultText, endRun: true)
+                            }
+                            // Fall through on failure (empty question,
+                            // etc.) so the model sees the rejection.
+                        }
 
-                                            // Tools loaded via capabilities_load / sandbox_plugin_register.
-                                            // Deferred-schema policy (KV-prefix stability): the loaded
-                                            // tools are callable IMMEDIATELY — the registry dispatches
-                                            // by name and their schemas ride in the tool result (see
-                                            // `CapabilitiesLoadTool.loadedSchemaBlock`) — but
-                                            // `toolSpecs` stays FROZEN for the rest of this run.
-                                            // Rewriting the rendered `<tools>` block mid-run busts the
-                                            // paged-KV prefix for the whole conversation. The loaded
-                                            // names persist into the session's tool union so the NEXT
-                                            // user turn composes their full schemas into `<tools>`.
-                                            if inv.toolName == "capabilities_load"
-                                                || inv.toolName == "capabilities"
-                                                || inv.toolName == "sandbox_plugin_register"
-                                            {
-                                                // Always drain so a buffered spec can't leak into an
-                                                // unrelated run; persist only in auto mode (manual
-                                                // mode keeps the user's explicit tool set fixed).
-                                                let newTools = await CapabilityLoadBuffer.shared.drain()
-                                                // These tools were just made callable to the model — their schemas ride
-                                                // in the tool result — while `toolSpecs` stays frozen. Authorize them
-                                                // for the rest of THIS run, or the allowlist above would refuse the very
-                                                // tools the model was just handed.
-                                                toolScope.activate(newTools.map { $0.function.name })
-                                                if !newTools.isEmpty, !isManualTools, let sid = self.sessionId {
-                                                    let names = newTools.map { $0.function.name }
-                                                    let snapshot = context.alwaysLoadedNames
-                                                    await SessionToolStateStore.shared.appendLoadedTools(
-                                                        self.sessionStateKey(sid),
-                                                        names: names,
-                                                        fallbackAlwaysLoadedNames: snapshot
-                                                    )
-                                                }
-                                            }
+                        // Tools loaded via capabilities_load / sandbox_plugin_register.
+                        // Deferred-schema policy (KV-prefix stability): the loaded
+                        // tools are callable IMMEDIATELY — the registry dispatches
+                        // by name and their schemas ride in the tool result (see
+                        // `CapabilitiesLoadTool.loadedSchemaBlock`) — but
+                        // `toolSpecs` stays FROZEN for the rest of this run.
+                        // Rewriting the rendered `<tools>` block mid-run busts the
+                        // paged-KV prefix for the whole conversation. The loaded
+                        // names persist into the session's tool union so the NEXT
+                        // user turn composes their full schemas into `<tools>`.
+                        if inv.toolName == "capabilities_load"
+                            || inv.toolName == "capabilities"
+                            || inv.toolName == "sandbox_plugin_register"
+                        {
+                            // Always drain so a buffered spec can't leak into an
+                            // unrelated run; persist only in auto mode (manual
+                            // mode keeps the user's explicit tool set fixed).
+                            let newTools = await CapabilityLoadBuffer.shared.drain()
+                            // These tools were just made callable to the model — their schemas ride
+                            // in the tool result — while `toolSpecs` stays frozen. Authorize them
+                            // for the rest of THIS run, or the allowlist above would refuse the very
+                            // tools the model was just handed.
+                            toolScope.activate(newTools.map { $0.function.name })
+                            if !newTools.isEmpty, !isManualTools, let sid = self.sessionId {
+                                let names = newTools.map { $0.function.name }
+                                let snapshot = context.alwaysLoadedNames
+                                await SessionToolStateStore.shared.appendLoadedTools(
+                                    self.sessionStateKey(sid),
+                                    names: names,
+                                    fallbackAlwaysLoadedNames: snapshot
+                                )
+                            }
+                        }
 
-                                            if inv.toolName == "render_chart",
-                                                let compactResult = RenderChartTool.compactModelResult(from: resultText)
-                                            {
-                                                // The full marker renders the chart card, while the
-                                                // model gets a compact confirmation instead of
-                                                // re-prefilling every category/value and inventing
-                                                // a second artifact-sharing step.
-                                                toolCardOverrides[callId] = resultText
-                                                resultText = compactResult
-                                            } else if inv.toolName == "share_artifact" {
-                                                resultText = await self.processShareArtifactResult(
-                                                    toolResult: resultText,
-                                                    executionMode: executionMode
-                                                )
-                                                if let artifact = SharedArtifact.fromEnrichedToolResult(resultText) {
+                        if inv.toolName == "render_chart",
+                            let compactResult = RenderChartTool.compactModelResult(from: resultText)
+                        {
+                            // The full marker renders the chart card, while the
+                            // model gets a compact confirmation instead of
+                            // re-prefilling every category/value and inventing
+                            // a second artifact-sharing step.
+                            toolCardOverrides[callId] = resultText
+                            resultText = compactResult
+                        } else if inv.toolName == "share_artifact" {
+                            resultText = await self.processShareArtifactResult(
+                                toolResult: resultText,
+                                executionMode: executionMode
+                            )
+                            if let artifact = SharedArtifact.fromEnrichedToolResult(resultText) {
                                                     await PluginManager.shared.notifyArtifactHandlers(
                                                         artifact: artifact
                                                     )
-                                                }
-                                            } else if NativeImageToolArtifactBridge.isNativeImageTool(inv.toolName) {
-                                                // Enrich for the artifact card only; the model keeps
-                                                // the compact `toolPayload` in `resultText`. The bridge
-                                                // returns its input unchanged on failure, so a changed
-                                                // string means success — route it to the card.
-                                                let enriched = await self.processNativeImageToolResult(
-                                                    toolName: inv.toolName,
-                                                    toolResult: resultText
-                                                )
-                                                if enriched != resultText {
-                                                    toolCardOverrides[callId] = enriched
-                                                    if let artifact = SharedArtifact.fromEnrichedToolResult(enriched) {
+                            }
+                                            } else if GeneratedMediaToolArtifactBridge.isGeneratedMediaTool(
+                                                inv.toolName
+                                            ) {
+                            // Enrich for the artifact card only; the model keeps
+                            // the compact `toolPayload` in `resultText`. The bridge
+                            // returns its input unchanged on failure, so a changed
+                            // string means success — route it to the card.
+                            let enriched = await self.processNativeImageToolResult(
+                                toolName: inv.toolName,
+                                toolResult: resultText
+                            )
+                            if enriched != resultText {
+                                toolCardOverrides[callId] = enriched
+                                if let artifact = SharedArtifact.fromEnrichedToolResult(enriched) {
                                                         await PluginManager.shared.notifyArtifactHandlers(
                                                             artifact: artifact
                                                         )
-                                                    }
-                                                }
-                                            }
-                                            if let fileCard = WorkspaceFileReference.cardResult(
-                                                toolResult: resultText,
-                                                toolName: inv.toolName
-                                            ) {
-                                                // Keep the compact typed reference in model history,
-                                                // but make its Open/Reveal or Export path explicit
-                                                // on the user-facing tool card.
-                                                toolCardOverrides[callId] = fileCard
-                                            }
+                                }
+                            }
+                        }
+                        if let fileCard = WorkspaceFileReference.cardResult(
+                            toolResult: resultText,
+                            toolName: inv.toolName
+                        ) {
+                            // Keep the compact typed reference in model history,
+                            // but make its Open/Reveal or Export path explicit
+                            // on the user-facing tool card.
+                            toolCardOverrides[callId] = fileCard
+                        }
 
-                                            if inv.toolName == "sandbox_secret_set",
-                                                let prompt = SecretPromptParser.parse(resultText)
-                                            {
-                                                let stored: Bool = await withCheckedContinuation { continuation in
-                                                    let promptState = SecretPromptState(
-                                                        key: prompt.key,
-                                                        description: prompt.description,
-                                                        instructions: prompt.instructions,
-                                                        agentId: prompt.agentId
-                                                    ) { value in
-                                                        continuation.resume(returning: value != nil)
-                                                    }
-                                                    // Route through the shared queue so
-                                                    // a clarify can't pop on top of a
-                                                    // pending secret (and vice versa).
-                                                    self.promptQueue.enqueue(.secret(promptState))
-                                                }
-                                                // The overlay's dismiss closure already
-                                                // called `promptQueue.advance()` once
-                                                // the user resolved; nothing to clean
-                                                // up here.
-                                                resultText =
-                                                    stored
-                                                    ? SecretToolResult.stored(key: prompt.key)
-                                                    : SecretToolResult.cancelled(key: prompt.key)
-                                            }
+                        if inv.toolName == "sandbox_secret_set",
+                            let prompt = SecretPromptParser.parse(resultText)
+                        {
+                            let stored: Bool = await withCheckedContinuation { continuation in
+                                let promptState = SecretPromptState(
+                                    key: prompt.key,
+                                    description: prompt.description,
+                                    instructions: prompt.instructions,
+                                    agentId: prompt.agentId
+                                ) { value in
+                                    continuation.resume(returning: value != nil)
+                                }
+                                // Route through the shared queue so
+                                // a clarify can't pop on top of a
+                                // pending secret (and vice versa).
+                                self.promptQueue.enqueue(.secret(promptState))
+                            }
+                            // The overlay's dismiss closure already
+                            // called `promptQueue.advance()` once
+                            // the user resolved; nothing to clean
+                            // up here.
+                            resultText =
+                                stored
+                                ? SecretToolResult.stored(key: prompt.key)
+                                : SecretToolResult.cancelled(key: prompt.key)
+                        }
 
-                                            // Log tool success (truncated result)
-                                            let truncatedResult = resultText.prefix(500)
-                                            print(
-                                                "[Osaurus][Tool] Success: \(inv.toolName) returned \(resultText.count) chars: \(truncatedResult)\(resultText.count > 500 ? "..." : "")"
-                                            )
+                        // Log tool success (truncated result)
+                        let truncatedResult = resultText.prefix(500)
+                        print(
+                            "[Osaurus][Tool] Success: \(inv.toolName) returned \(resultText.count) chars: \(truncatedResult)\(resultText.count > 500 ? "..." : "")"
+                        )
 
-                                            // Turn persistence intentionally does NOT happen here.
-                                            // Non-intercept results are appended by the
-                                            // `onBatchComplete` hook in the driver's slot (model)
-                                            // order — mid-batch appends were the source of
-                                            // out-of-order transcripts (denials and deferred
-                                            // dedupe replays landing around executed siblings).
-                                            return AgentLoopToolExecution(result: resultText)
-                                        }
+                        // Turn persistence intentionally does NOT happen here.
+                        // Non-intercept results are appended by the
+                        // `onBatchComplete` hook in the driver's slot (model)
+                        // order — mid-batch appends were the source of
+                        // out-of-order transcripts (denials and deferred
+                        // dedupe replays landing around executed siblings).
+                        return AgentLoopToolExecution(result: resultText)
+                    }
 
-                                        // The historical single-call path: registry dispatch
-                                        // (permission gate included) followed by post-processing.
-                                        // Thrown errors become rejection envelopes flagged
-                                        // `isError`, which under the chat policy
-                                        // (`stopOnToolRejection`) ends the batch and the run.
-                                        @MainActor
-                                        func executeSingleToolCall(
-                                            _ inv: ServiceToolInvocation,
-                                            callId: String
-                                        ) async -> AgentLoopToolExecution {
-                                            do {
-                                                // Never print a direct secret-set value to the
-                                                // process log. Execution below still receives the
-                                                // original arguments.
-                                                let recordedArgs = SecretArgumentScrubber.recordedArguments(
-                                                    toolName: inv.toolName,
-                                                    argumentsJSON: inv.jsonArguments
-                                                )
-                                                let truncatedArgs = recordedArgs.prefix(200)
-                                                print(
-                                                    "[Osaurus][Tool] Executing: \(inv.toolName) with args: \(truncatedArgs)\(recordedArgs.count > 200 ? "..." : "")"
-                                                )
+                    // The historical single-call path: registry dispatch
+                    // (permission gate included) followed by post-processing.
+                    // Thrown errors become rejection envelopes flagged
+                    // `isError`, which under the chat policy
+                    // (`stopOnToolRejection`) ends the batch and the run.
+                    @MainActor
+                    func executeSingleToolCall(
+                        _ inv: ServiceToolInvocation,
+                        callId: String
+                    ) async -> AgentLoopToolExecution {
+                        do {
+                            // Never print a direct secret-set value to the
+                            // process log. Execution below still receives the
+                            // original arguments.
+                            let recordedArgs = SecretArgumentScrubber.recordedArguments(
+                                toolName: inv.toolName,
+                                argumentsJSON: inv.jsonArguments
+                            )
+                            let truncatedArgs = recordedArgs.prefix(200)
+                            print(
+                                "[Osaurus][Tool] Executing: \(inv.toolName) with args: \(truncatedArgs)\(recordedArgs.count > 200 ? "..." : "")"
+                            )
 
-                                                if executionMode.usesSandboxTools {
+                            if executionMode.usesSandboxTools {
                                                     await SandboxToolRegistrar.shared.registerTools(
                                                         for: effectiveAgentId
                                                     )
-                                                    if !self.isRunActive(runId) {
-                                                        // Run was cancelled before execution; the
-                                                        // driver's post-call cancellation probe
-                                                        // ends the run before this placeholder is
-                                                        // recorded anywhere.
-                                                        return AgentLoopToolExecution(result: "")
-                                                    }
-                                                }
+                                if !self.isRunActive(runId) {
+                                    // Run was cancelled before execution; the
+                                    // driver's post-call cancellation probe
+                                    // ends the run before this placeholder is
+                                    // recorded anywhere.
+                                    return AgentLoopToolExecution(result: "")
+                                }
+                            }
 
-                                                // Bind the session id so the unified Chat agent
-                                                // tools (`todo`, etc.) can address per-session
-                                                // state in their stores. Falls back to a stable
-                                                // string when no session has been created yet so
-                                                // brand-new chats still get a todo store entry.
-                                                // `currentAgentId` is already pinned by the
-                                                // outer turn-level binding; we only need to
-                                                // layer per-tool-call session/turn/call ids.
-                                                let resultText = try await ChatExecutionContext.$toolExecutionScope
-                                                    .withValue(toolScope) {
-                                                        try await ChatExecutionContext.$currentSessionId.withValue(
-                                                            todoSessionIdForRun
-                                                        ) {
-                                                            try await ChatExecutionContext.$currentAssistantTurnId
-                                                                .withValue(assistantTurn.id) {
-                                                                    try await ChatExecutionContext.$currentToolCallId
-                                                                        .withValue(callId) {
-                                                                            // The combined-mode host-read scope +
-                                                                            // secret-read policy are bound centrally
-                                                                            // inside ToolRegistry.execute, so every
-                                                                            // entrypoint inherits them uniformly.
-                                                                            try await ToolRegistry.shared.execute(
-                                                                                name: inv.toolName,
-                                                                                argumentsJSON: inv.jsonArguments
-                                                                            )
-                                                                        }
-                                                                }
-                                                        }
+                            // Bind the session id so the unified Chat agent
+                            // tools (`todo`, etc.) can address per-session
+                            // state in their stores. Falls back to a stable
+                            // string when no session has been created yet so
+                            // brand-new chats still get a todo store entry.
+                            // `currentAgentId` is already pinned by the
+                            // outer turn-level binding; we only need to
+                            // layer per-tool-call session/turn/call ids.
+                            let resultText = try await ChatExecutionContext.$toolExecutionScope
+                                .withValue(toolScope) {
+                                    try await ChatExecutionContext.$currentSessionId.withValue(
+                                        todoSessionIdForRun
+                                    ) {
+                                        try await ChatExecutionContext.$currentAssistantTurnId
+                                            .withValue(assistantTurn.id) {
+                                                try await ChatExecutionContext.$currentToolCallId
+                                                    .withValue(callId) {
+                                                        // The combined-mode host-read scope +
+                                                        // secret-read policy are bound centrally
+                                                        // inside ToolRegistry.execute, so every
+                                                        // entrypoint inherits them uniformly.
+                                                        try await ToolRegistry.shared.execute(
+                                                            name: inv.toolName,
+                                                            argumentsJSON: inv.jsonArguments
+                                                        )
                                                     }
+                                            }
+                                    }
+                                }
                                                 return await postProcessToolResult(
                                                     inv,
                                                     callId: callId,
                                                     resultText: resultText
                                                 )
-                                            } catch {
-                                                // Store rejection/error as the result so UI shows "Rejected" instead of hanging.
-                                                // The structured envelope replaces the legacy `[REJECTED] …` string so
-                                                // local models read a clear `{ok, kind, message, retryable}` rather than
-                                                // a marker they misinterpret as a sticky policy refusal. `fromError`
-                                                // maps FolderToolError + registry permission codes to the right `kind`
-                                                // so user denials, missing files, and bad arguments don't all get the
-                                                // same opaque `executionError` treatment. The driver records the
-                                                // envelope into the task state and, under the chat policy, stops the
-                                                // run (remaining calls in the batch are skipped). Turn persistence
-                                                // happens in `onBatchComplete`, in slot order.
-                                                let rejectionMessage = ToolEnvelope.fromError(error, tool: inv.toolName)
-                                                return AgentLoopToolExecution(result: rejectionMessage, isError: true)
-                                            }
-                                        }
+                        } catch {
+                            // Store rejection/error as the result so UI shows "Rejected" instead of hanging.
+                            // The structured envelope replaces the legacy `[REJECTED] …` string so
+                            // local models read a clear `{ok, kind, message, retryable}` rather than
+                            // a marker they misinterpret as a sticky policy refusal. `fromError`
+                            // maps FolderToolError + registry permission codes to the right `kind`
+                            // so user denials, missing files, and bad arguments don't all get the
+                            // same opaque `executionError` treatment. The driver records the
+                            // envelope into the task state and, under the chat policy, stops the
+                            // run (remaining calls in the batch are skipped). Turn persistence
+                            // happens in `onBatchComplete`, in slot order.
+                            let rejectionMessage = ToolEnvelope.fromError(error, tool: inv.toolName)
+                            return AgentLoopToolExecution(result: rejectionMessage, isError: true)
+                        }
+                    }
 
-                                        // Approval-aware parallel batch execution (chat
-                                        // semantics): approvals resolve FIRST, serially and in
-                                        // model order, so permission prompts never stack or
-                                        // race; the approved set then executes concurrently
-                                        // (registry dispatch only); results post-process on the
-                                        // MainActor in model order. On a denial the remaining
-                                        // unstarted calls are skipped with a paired envelope —
-                                        // the chat policy (`stopOnToolRejection`) stops the
-                                        // loop after the batch — while nothing was yet running.
-                                        @MainActor
-                                        func executeToolBatch(
-                                            _ calls: [(invocation: ServiceToolInvocation, callId: String)]
-                                        ) async -> [AgentLoopToolExecution] {
-                                            // Cancelled before any execution: return NO results.
-                                            // The driver treats missing slots as never-executed
-                                            // (no turn appended, no `state.record`) — matching
-                                            // the serial cancel semantics instead of recording
-                                            // empty placeholder envelopes.
-                                            guard self.isRunActive(runId) else { return [] }
+                    // Approval-aware parallel batch execution (chat
+                    // semantics): approvals resolve FIRST, serially and in
+                    // model order, so permission prompts never stack or
+                    // race; the approved set then executes concurrently
+                    // (registry dispatch only); results post-process on the
+                    // MainActor in model order. On a denial the remaining
+                    // unstarted calls are skipped with a paired envelope —
+                    // the chat policy (`stopOnToolRejection`) stops the
+                    // loop after the batch — while nothing was yet running.
+                    @MainActor
+                    func executeToolBatch(
+                        _ calls: [(invocation: ServiceToolInvocation, callId: String)]
+                    ) async -> [AgentLoopToolExecution] {
+                        // Cancelled before any execution: return NO results.
+                        // The driver treats missing slots as never-executed
+                        // (no turn appended, no `state.record`) — matching
+                        // the serial cancel semantics instead of recording
+                        // empty placeholder envelopes.
+                        guard self.isRunActive(runId) else { return [] }
 
-                                            // Serial fallback for batches of one — identical to
-                                            // the historical single-call path.
-                                            if calls.count == 1, let only = calls.first {
+                        // Serial fallback for batches of one — identical to
+                        // the historical single-call path.
+                        if calls.count == 1, let only = calls.first {
                                                 let execution = await executeSingleToolCall(
                                                     only.invocation,
                                                     callId: only.callId
                                                 )
-                                                // Cancelled before execution produced anything:
-                                                // report "never ran" rather than an empty
-                                                // envelope the driver would record.
+                            // Cancelled before execution produced anything:
+                            // report "never ran" rather than an empty
+                            // envelope the driver would record.
                                                 if execution.result.isEmpty, !execution.isError,
                                                     !self.isRunActive(runId)
                                                 {
-                                                    return []
-                                                }
-                                                return [execution]
-                                            }
+                                return []
+                            }
+                            return [execution]
+                        }
 
-                                            // Todo replaces one session-scoped checklist wholesale.
-                                            // Concurrent Todo calls would make the final store value
-                                            // depend on completion order instead of model order.
-                                            // Keep the batch framing, but execute every call in the
-                                            // batch serially when it contains Todo; onBatchComplete
-                                            // still persists all result turns in slot order.
-                                            if calls.contains(where: { $0.invocation.toolName == "todo" }),
-                                                !AgentToolLoop.containsIntercept(calls)
-                                            {
-                                                var serialExecutions: [AgentLoopToolExecution] = []
-                                                for call in calls {
-                                                    guard self.isRunActive(runId) else { break }
-                                                    let execution = await executeSingleToolCall(
-                                                        call.invocation,
-                                                        callId: call.callId
-                                                    )
-                                                    if execution.result.isEmpty,
-                                                        !execution.isError,
-                                                        !self.isRunActive(runId)
-                                                    {
-                                                        break
-                                                    }
-                                                    serialExecutions.append(execution)
-                                                }
-                                                return serialExecutions
-                                            }
+                        // Todo replaces one session-scoped checklist wholesale.
+                        // Concurrent Todo calls would make the final store value
+                        // depend on completion order instead of model order.
+                        // Keep the batch framing, but execute every call in the
+                        // batch serially when it contains Todo; onBatchComplete
+                        // still persists all result turns in slot order.
+                        if calls.contains(where: { $0.invocation.toolName == "todo" }),
+                            !AgentToolLoop.containsIntercept(calls)
+                        {
+                            var serialExecutions: [AgentLoopToolExecution] = []
+                            for call in calls {
+                                guard self.isRunActive(runId) else { break }
+                                let execution = await executeSingleToolCall(
+                                    call.invocation,
+                                    callId: call.callId
+                                )
+                                if execution.result.isEmpty,
+                                    !execution.isError,
+                                    !self.isRunActive(runId)
+                                {
+                                    break
+                                }
+                                serialExecutions.append(execution)
+                            }
+                            return serialExecutions
+                        }
 
-                                            // Serial fallback when the batch carries a loop-ending
-                                            // intercept (`complete`/`clarify`): execute in model
-                                            // order and stop at the first `endRun`; the driver
-                                            // treats the missing trailing results as
-                                            // never-executed slots. Turns for non-intercept calls
-                                            // are appended inline here (serial execution order IS
-                                            // model order); `onBatchComplete` skips call ids that
-                                            // already have a tool turn.
-                                            if AgentToolLoop.containsIntercept(calls) {
-                                                var serialExecutions: [AgentLoopToolExecution] = []
-                                                for call in calls {
-                                                    guard self.isRunActive(runId) else { break }
-                                                    let execution = await executeSingleToolCall(
-                                                        call.invocation,
-                                                        callId: call.callId
-                                                    )
+                        // Serial fallback when the batch carries a loop-ending
+                        // intercept (`complete`/`clarify`): execute in model
+                        // order and stop at the first `endRun`; the driver
+                        // treats the missing trailing results as
+                        // never-executed slots. Turns for non-intercept calls
+                        // are appended inline here (serial execution order IS
+                        // model order); `onBatchComplete` skips call ids that
+                        // already have a tool turn.
+                        if AgentToolLoop.containsIntercept(calls) {
+                            var serialExecutions: [AgentLoopToolExecution] = []
+                            for call in calls {
+                                guard self.isRunActive(runId) else { break }
+                                let execution = await executeSingleToolCall(
+                                    call.invocation,
+                                    callId: call.callId
+                                )
                                                     if execution.result.isEmpty, !execution.isError,
                                                         !self.isRunActive(runId)
                                                     {
-                                                        break
-                                                    }
-                                                    serialExecutions.append(execution)
-                                                    if execution.endRun { break }
-                                                    // Historical serial shape: tool turn followed
-                                                    // by a fresh assistant turn for subsequent
-                                                    // content.
-                                                    let toolTurn = recordToolTurn(execution.result, callId: call.callId)
-                                                    let newAssistantTurn = ChatTurn(role: .assistant, content: "")
-                                                    self.turns.append(contentsOf: [toolTurn, newAssistantTurn])
-                                                    assistantTurn = newAssistantTurn
-                                                }
-                                                self.rebuildVisibleBlocks()
-                                                return serialExecutions
-                                            }
+                                    break
+                                }
+                                serialExecutions.append(execution)
+                                if execution.endRun { break }
+                                // Historical serial shape: tool turn followed
+                                // by a fresh assistant turn for subsequent
+                                // content.
+                                let toolTurn = recordToolTurn(execution.result, callId: call.callId)
+                                let newAssistantTurn = ChatTurn(role: .assistant, content: "")
+                                self.turns.append(contentsOf: [toolTurn, newAssistantTurn])
+                                assistantTurn = newAssistantTurn
+                            }
+                            self.rebuildVisibleBlocks()
+                            return serialExecutions
+                        }
 
                                             var executions = [AgentLoopToolExecution?](
                                                 repeating: nil,
                                                 count: calls.count
                                             )
 
-                                            if executionMode.usesSandboxTools {
-                                                await SandboxToolRegistrar.shared.registerTools(for: effectiveAgentId)
-                                            }
-                                            guard self.isRunActive(runId) else { return [] }
+                        if executionMode.usesSandboxTools {
+                            await SandboxToolRegistrar.shared.registerTools(for: effectiveAgentId)
+                        }
+                        guard self.isRunActive(runId) else { return [] }
 
-                                            // Phase 1 — approvals, serially in model order. No
-                                            // turns are appended here: denial/skip envelopes ride
-                                            // back to the driver as slotted executions and are
-                                            // persisted by `onBatchComplete` in slot order, so
-                                            // the transcript can never interleave a denial ahead
-                                            // of an earlier approved call's result.
+                        // Phase 1 — approvals, serially in model order. No
+                        // turns are appended here: denial/skip envelopes ride
+                        // back to the driver as slotted executions and are
+                        // persisted by `onBatchComplete` in slot order, so
+                        // the transcript can never interleave a denial ahead
+                        // of an earlier approved call's result.
                                             var approved:
                                                 [(slot: Int, invocation: ServiceToolInvocation, callId: String)] = []
-                                            var denied = false
-                                            for (slot, call) in calls.enumerated() {
-                                                if denied {
-                                                    // A previous call in this batch was denied:
-                                                    // skip without executing, but pair the call
-                                                    // with a result envelope so the assistant
-                                                    // `tool_use` never dangles.
-                                                    let envelope = ToolEnvelope.failure(
-                                                        kind: .rejected,
-                                                        message:
-                                                            "Skipped: an earlier tool call in this batch was rejected, so this call did not run.",
-                                                        tool: call.invocation.toolName
-                                                    )
+                        var denied = false
+                        for (slot, call) in calls.enumerated() {
+                            if denied {
+                                // A previous call in this batch was denied:
+                                // skip without executing, but pair the call
+                                // with a result envelope so the assistant
+                                // `tool_use` never dangles.
+                                let envelope = ToolEnvelope.failure(
+                                    kind: .rejected,
+                                    message:
+                                        "Skipped: an earlier tool call in this batch was rejected, so this call did not run.",
+                                    tool: call.invocation.toolName
+                                )
                                                     executions[slot] = AgentLoopToolExecution(
                                                         result: envelope,
                                                         isError: false
                                                     )
-                                                    continue
-                                                }
-                                                do {
-                                                    try await ToolRegistry.shared.resolvePermissionGate(
-                                                        name: call.invocation.toolName,
-                                                        argumentsJSON: call.invocation.jsonArguments
-                                                    )
-                                                    approved.append((slot, call.invocation, call.callId))
-                                                } catch {
+                                continue
+                            }
+                            do {
+                                try await ToolRegistry.shared.resolvePermissionGate(
+                                    name: call.invocation.toolName,
+                                    argumentsJSON: call.invocation.jsonArguments
+                                )
+                                approved.append((slot, call.invocation, call.callId))
+                            } catch {
                                                     let envelope = ToolEnvelope.fromError(
                                                         error,
                                                         tool: call.invocation.toolName
@@ -5689,842 +6218,869 @@ final class ChatSession: ObservableObject {
                                                         result: envelope,
                                                         isError: true
                                                     )
-                                                    denied = true
-                                                }
-                                            }
+                                denied = true
+                            }
+                        }
 
-                                            // Phase 2 — approved calls execute in parallel.
-                                            // Captures are value-typed (the TaskGroup executor
-                                            // is @Sendable); the registry runs tool bodies off
-                                            // the MainActor so the calls genuinely overlap.
-                                            if !approved.isEmpty {
-                                                print(
-                                                    "[Osaurus][Tool] Executing batch of \(approved.count) in parallel: \(approved.map { $0.invocation.toolName }.joined(separator: ", "))"
-                                                )
-                                                let turnIdForTools = assistantTurn.id
-                                                let results = await AgentToolLoop.runBatchInParallel(
-                                                    approved.map { ($0.invocation, $0.callId) }
-                                                ) { inv, callId in
+                        // Phase 2 — approved calls execute in parallel.
+                        // Captures are value-typed (the TaskGroup executor
+                        // is @Sendable); the registry runs tool bodies off
+                        // the MainActor so the calls genuinely overlap.
+                        if !approved.isEmpty {
+                            print(
+                                "[Osaurus][Tool] Executing batch of \(approved.count) in parallel: \(approved.map { $0.invocation.toolName }.joined(separator: ", "))"
+                            )
+                            let turnIdForTools = assistantTurn.id
+                            let results = await AgentToolLoop.runBatchInParallel(
+                                approved.map { ($0.invocation, $0.callId) }
+                            ) { inv, callId in
                                                     try await ChatExecutionContext.$toolExecutionScope.withValue(
                                                         toolScope
                                                     ) {
-                                                        try await ChatExecutionContext.$currentSessionId.withValue(
-                                                            todoSessionIdForRun
-                                                        ) {
+                                    try await ChatExecutionContext.$currentSessionId.withValue(
+                                        todoSessionIdForRun
+                                    ) {
                                                             try await ChatExecutionContext.$currentAssistantTurnId
                                                                 .withValue(turnIdForTools) {
                                                                     try await ChatExecutionContext.$currentToolCallId
                                                                         .withValue(callId) {
-                                                                            try await ToolRegistry.shared.execute(
-                                                                                name: inv.toolName,
-                                                                                argumentsJSON: inv.jsonArguments,
-                                                                                permissionGateResolved: true
-                                                                            )
-                                                                        }
-                                                                }
-                                                        }
-                                                    }
-                                                }
-
-                                                // Phase 3 — post-process on the MainActor, in
-                                                // model order: hot-loaded tools, artifacts,
-                                                // secret prompts. Turn recording is deferred to
-                                                // `onBatchComplete` (slot order).
-                                                for (entry, execution) in zip(approved, results) {
-                                                    if execution.isError {
-                                                        // Registry threw — surfaced exactly like
-                                                        // the serial catch path.
-                                                        executions[entry.slot] = execution
-                                                    } else {
-                                                        executions[entry.slot] = await postProcessToolResult(
-                                                            entry.invocation,
-                                                            callId: entry.callId,
-                                                            resultText: execution.result
-                                                        )
-                                                    }
-                                                }
+                                                try await ToolRegistry.shared.execute(
+                                                    name: inv.toolName,
+                                                    argumentsJSON: inv.jsonArguments,
+                                                    permissionGateResolved: true
+                                                )
                                             }
-
-                                            return executions.map { $0 ?? AgentLoopToolExecution(result: "") }
                                         }
+                                    }
+                                }
+                            }
 
-                                        // One-shot mid-run token notice, mirroring the iteration-
-                                        // budget warning: fired the first time the conversation
-                                        // estimate crosses 90% of the history budget so the model
-                                        // wraps up instead of relying on compaction forever.
-                                        var tokenBudgetNoticeFired = false
+                            // Phase 3 — post-process on the MainActor, in
+                            // model order: hot-loaded tools, artifacts,
+                            // secret prompts. Turn recording is deferred to
+                            // `onBatchComplete` (slot order).
+                            for (entry, execution) in zip(approved, results) {
+                                if execution.isError {
+                                    // Registry threw — surfaced exactly like
+                                    // the serial catch path.
+                                    executions[entry.slot] = execution
+                                } else {
+                                    executions[entry.slot] = await postProcessToolResult(
+                                        entry.invocation,
+                                        callId: entry.callId,
+                                        resultText: execution.result
+                                    )
+                                }
+                            }
+                        }
 
-                                        // The canonical loop skeleton — iteration budget + warning
-                                        // notice, consecutive-identical dedupe replay, task-state
-                                        // recording, next-step bias staging, rejection policy —
-                                        // lives in `AgentToolLoop`. These hooks carry everything
-                                        // the chat surface owns: turn history, streaming UI,
-                                        // TaskLocal scoping, and the agent-loop intercepts.
-                                        let loopHooks = AgentLoopHooks(
-                                            isCancelled: { !self.isRunActive(runId) },
-                                            buildMessages: { notices in
-                                                // Mid-run steering: a text-only message queued
-                                                // during the run joins the conversation at this
-                                                // iteration boundary instead of waiting for the
-                                                // run to finish (or requiring Stop).
-                                                self.injectQueuedSteerIfEligible()
+                        return executions.map { $0 ?? AgentLoopToolExecution(result: "") }
+                    }
 
-                                                ttftTrace?.mark("build_messages_start")
-                                                var msgs = buildMessages()
-                                                ttftTrace?.mark("build_messages_done")
+                    // One-shot mid-run token notice, mirroring the iteration-
+                    // budget warning: fired the first time the conversation
+                    // estimate crosses 90% of the history budget so the model
+                    // wraps up instead of relying on compaction forever.
+                    var tokenBudgetNoticeFired = false
 
-                                                // Compact history that outgrew the window: middle
-                                                // tool results summarize first, oldest middle
-                                                // messages drop second; first user message + the
-                                                // recent pairs stay intact, and the system prefix
-                                                // is untouched. No-op while within budget.
-                                                let preTrimTokens = ContextBudgetManager.estimateTokens(for: msgs)
+                    // The canonical loop skeleton — iteration budget + warning
+                    // notice, consecutive-identical dedupe replay, task-state
+                    // recording, next-step bias staging, rejection policy —
+                    // lives in `AgentToolLoop`. These hooks carry everything
+                    // the chat surface owns: turn history, streaming UI,
+                    // TaskLocal scoping, and the agent-loop intercepts.
+                    let loopHooks = AgentLoopHooks(
+                        isCancelled: { !self.isRunActive(runId) },
+                        buildMessages: { notices in
+                            // Mid-run steering: a text-only message queued
+                            // during the run joins the conversation at this
+                            // iteration boundary instead of waiting for the
+                            // run to finish (or requiring Stop).
+                            self.injectQueuedSteerIfEligible()
+
+                            ttftTrace?.mark("build_messages_start")
+                            var msgs = buildMessages()
+                            ttftTrace?.mark("build_messages_done")
+
+                            // Compact history that outgrew the window: middle
+                            // tool results summarize first, oldest middle
+                            // messages drop second; first user message + the
+                            // recent pairs stay intact, and the system prefix
+                            // is untouched. No-op while within budget.
+                            let preTrimTokens = ContextBudgetManager.estimateTokens(for: msgs)
                                                 let trimResult =
                                                     AgentLoopBudget.trimPreservingSystemPrefixReportingOverflow(
-                                                        msgs,
-                                                        with: loopBudgetManager,
-                                                        watermark: self.compactionWatermark
-                                                    )
-                                                msgs = trimResult.messages
-                                                let postTrimTokens = ContextBudgetManager.estimateTokens(for: msgs)
-                                                let savedTokens = preTrimTokens - postTrimTokens
-                                                if savedTokens > 0 {
-                                                    self.budgetTracker.updateCompaction(savedTokens: savedTokens)
-                                                }
+                                msgs,
+                                with: loopBudgetManager,
+                                watermark: self.compactionWatermark
+                            )
+                            msgs = trimResult.messages
+                            let postTrimTokens = ContextBudgetManager.estimateTokens(for: msgs)
+                            let savedTokens = preTrimTokens - postTrimTokens
+                            if savedTokens > 0 {
+                                self.budgetTracker.updateCompaction(savedTokens: savedTokens)
+                            }
+                            if let summary = self.conversationSummary {
+                                self.budgetTracker.updateSummary(
+                                    tokens: ContextBudgetManager.estimateTokens(
+                                        for: summary.contextMessageText
+                                    )
+                                )
+                            }
 
-                                                // Driver-staged `[System Notice]` lines (budget
-                                                // warning first, then dedupe/bias nudge) ride as
-                                                // transient messages — never persisted into
-                                                // `turns`, so they don't pollute later prompts. The
-                                                // shared helper keeps them KV-stable (see
-                                                // `AgentLoopBudget.appendingTransientNotices`).
-                                                msgs = AgentLoopBudget.appendingTransientNotices(notices, to: msgs)
+                            // Driver-staged `[System Notice]` lines (budget
+                            // warning first, then dedupe/bias nudge) ride as
+                            // transient messages — never persisted into
+                            // `turns`, so they don't pollute later prompts. The
+                            // shared helper keeps them KV-stable (see
+                            // `AgentLoopBudget.appendingTransientNotices`).
+                            msgs = AgentLoopBudget.appendingTransientNotices(notices, to: msgs)
 
-                                                // Mid-run near-limit notice: once the (post-trim)
-                                                // conversation estimate crosses 90% of the history
-                                                // budget, tell the model to wrap up — compaction
-                                                // remains the actual overflow handler, this is the
-                                                // early signal. Fired at most once per run, like
-                                                // the iteration-budget warning. The system prefix
-                                                // is excluded — its tokens are reserved separately
-                                                // and the history budget already accounts for them.
-                                                let historyBudget = loopBudgetManager.historyBudget
-                                                let historyTokens = ContextBudgetManager.estimateTokens(
-                                                    for: msgs.filter { $0.role != "system" }
-                                                )
-                                                if !tokenBudgetNoticeFired,
-                                                    historyBudget > 0,
-                                                    historyTokens >= Int(Double(historyBudget) * 0.9)
-                                                {
-                                                    tokenBudgetNoticeFired = true
-                                                    // Delegation nudge rides along when a spawn tool
-                                                    // is actually in this run's frozen schema: a
-                                                    // tight window is exactly when offloading bulk
-                                                    // reading to a worker pays for itself.
-                                                    let spawnVisible = toolSpecs.contains {
+                            // Mid-run near-limit notice: once the (post-trim)
+                            // conversation estimate crosses 90% of the history
+                            // budget, tell the model to wrap up — compaction
+                            // remains the actual overflow handler, this is the
+                            // early signal. Fired at most once per run, like
+                            // the iteration-budget warning, and only when the
+                            // history actually ends in an in-progress tool
+                            // exchange: "wrap up the current work" is incoherent
+                            // on a fresh user question (observed live — the
+                            // notice landed as the trailing user-role message
+                            // right after the real question and the model
+                            // reasoned about the notice instead), and skipping
+                            // it on non-tool tails also keeps reasoning-retry
+                            // rebuilds byte-identical to the pre-attempt
+                            // history. The tool tail is additionally the only
+                            // placement where `appendingTransientNotices` is
+                            // KV-stable. The system prefix is excluded — its
+                            // tokens are reserved separately and the history
+                            // budget already accounts for them.
+                            let midRunToolTail = msgs.last?.role == "tool"
+                            let historyBudget = loopBudgetManager.historyBudget
+                            let historyTokens = ContextBudgetManager.estimateTokens(
+                                for: msgs.filter { $0.role != "system" }
+                            )
+                            if !tokenBudgetNoticeFired,
+                                midRunToolTail,
+                                historyBudget > 0,
+                                historyTokens >= Int(Double(historyBudget) * 0.9)
+                            {
+                                tokenBudgetNoticeFired = true
+                                // Delegation nudge rides along when a spawn tool
+                                // is actually in this run's frozen schema: a
+                                // tight window is exactly when offloading bulk
+                                // reading to a worker pays for itself.
+                                let spawnVisible = toolSpecs.contains {
                                                         $0.function.name
                                                             == SubagentCapabilityRegistry.spawnAgentToolName
-                                                            || $0.function.name
-                                                                == SubagentCapabilityRegistry.spawnModelToolName
-                                                    }
-                                                    msgs = AgentLoopBudget.appendingTransientNotices(
-                                                        [
-                                                            AgentToolLoop.contextNearLimitNotice(
-                                                                spawnAvailable: spawnVisible
-                                                            )
-                                                        ],
-                                                        to: msgs
-                                                    )
-                                                }
+                                        || $0.function.name
+                                            == SubagentCapabilityRegistry.spawnModelToolName
+                                }
+                                msgs = AgentLoopBudget.appendingTransientNotices(
+                                    [
+                                        AgentToolLoop.contextNearLimitNotice(
+                                            spawnAvailable: spawnVisible
+                                        )
+                                    ],
+                                    to: msgs
+                                )
+                            }
 
-                                                // Memory + screen context ride the latest user
-                                                // message as a FROZEN turn prefix (see
-                                                // `freezeInjectedContextOntoLatestUserTurn`), so
-                                                // `buildMessages()` already rendered them and the
-                                                // trimmer/watermark above saw the final bytes.
-                                                // The current turn's injected block is attributed
-                                                // to its own budget rows (Memory / Screen
-                                                // Context), so subtract it from the Conversation
-                                                // total; PAST turns' frozen prefixes are genuine
-                                                // history bytes and stay counted here.
-                                                let currentInjectedTokens =
-                                                    self.turns.last(where: { $0.role == .user })?
-                                                    .injectedContextPrefix
-                                                    .map { ContextBudgetManager.estimateTokens(for: $0) } ?? 0
-                                                // The dedicated AppleScript app-name hint is part of
-                                                // the conversation, not the opt-in Screen Context
-                                                // budget row. Add its tokens back after excluding
-                                                // the memory/screen prefix from Conversation.
-                                                let automationContextTokens =
-                                                    appleScriptWorkingContext.map {
-                                                        ContextBudgetManager.estimateTokens(for: $0)
-                                                    } ?? 0
-                                                let convTokens =
-                                                    msgs
-                                                    .filter { $0.role != "system" }
+                            // Memory + screen context ride the latest user
+                            // message as a FROZEN turn prefix (see
+                            // `freezeInjectedContextOntoLatestUserTurn`), so
+                            // `buildMessages()` already rendered them and the
+                            // trimmer/watermark above saw the final bytes.
+                            // The current turn's injected block is attributed
+                            // to its own budget rows (Memory / Screen
+                            // Context), so subtract it from the Conversation
+                            // total; PAST turns' frozen prefixes are genuine
+                            // history bytes and stay counted here.
+                            let currentInjectedTokens =
+                                self.turns.last(where: { $0.role == .user })?
+                                .injectedContextPrefix
+                                .map { ContextBudgetManager.estimateTokens(for: $0) } ?? 0
+                            // The dedicated AppleScript app-name hint is part of
+                            // the conversation, not the opt-in Screen Context
+                            // budget row. Add its tokens back after excluding
+                            // the memory/screen prefix from Conversation.
+                            let automationContextTokens =
+                                appleScriptWorkingContext.map {
+                                    ContextBudgetManager.estimateTokens(for: $0)
+                                } ?? 0
+                            // The LLM compaction summary message rides inside
+                            // `msgs` but has its own budget row (set above), so
+                            // exclude it from the Conversation total.
+                            let summaryMessageTokens =
+                                self.conversationSummary.map {
+                                    ContextBudgetManager.estimateTokens(for: $0.contextMessageText)
+                                } ?? 0
+                            let convTokens =
+                                msgs
+                                .filter { $0.role != "system" }
                                                     .reduce(0) {
                                                         $0 + ContextBudgetManager.estimateTokens(for: $1.content)
                                                     }
-                                                    - max(0, currentInjectedTokens - automationContextTokens)
-                                                self.budgetTracker.updateConversation(
-                                                    tokens: max(0, convTokens),
-                                                    finishedOutputTurn: assistantTurn
-                                                )
+                                - max(0, currentInjectedTokens - automationContextTokens)
+                                - summaryMessageTokens
+                            self.budgetTracker.updateConversation(
+                                tokens: max(0, convTokens),
+                                finishedOutputTurn: assistantTurn
+                            )
 
-                                                // `overBudget` (protected first message + tail
-                                                // alone exceed the budget after every compaction
-                                                // lever) ends the run with a distinct exit
-                                                // instead of sending a doomed request.
-                                                return AgentLoopIterationInput(
-                                                    messages: msgs,
-                                                    overBudget: trimResult.overBudget
-                                                )
-                                            },
-                                            modelStep: { msgs, attempt in
-                                                ttftTrace?.set("messageCount", msgs.count)
-                                                ttftTrace?.set("conversationTurns", self.turns.count)
+                            // `overBudget` (protected first message + tail
+                            // alone exceed the budget after every compaction
+                            // lever) ends the run with a distinct exit
+                            // instead of sending a doomed request.
+                            return AgentLoopIterationInput(
+                                messages: msgs,
+                                overBudget: trimResult.overBudget
+                            )
+                        },
+                        modelStep: { msgs, attempt in
+                            ttftTrace?.set("messageCount", msgs.count)
+                            ttftTrace?.set("conversationTurns", self.turns.count)
 
-                                                #if DEBUG
-                                                    // Dump full prompt to debug log for TTFT analysis
-                                                    if attempt == 1 {
-                                                        var promptDump = "═══ FULL PROMPT DUMP ═══\n"
-                                                        for (i, m) in msgs.enumerated() {
+                            #if DEBUG
+                                // Dump full prompt to debug log for TTFT analysis
+                                if attempt == 1 {
+                                    var promptDump = "═══ FULL PROMPT DUMP ═══\n"
+                                    for (i, m) in msgs.enumerated() {
                                                             promptDump +=
                                                                 "── [\(i)] role=\(m.role) chars=\(m.content?.count ?? 0) ──\n"
-                                                            promptDump += (m.content ?? "(nil)") + "\n"
-                                                        }
-                                                        if let tools = toolSpecs.isEmpty ? nil : toolSpecs {
-                                                            promptDump += "── TOOLS (\(tools.count)) ──\n"
-                                                            for t in tools {
+                                        promptDump += (m.content ?? "(nil)") + "\n"
+                                    }
+                                    if let tools = toolSpecs.isEmpty ? nil : toolSpecs {
+                                        promptDump += "── TOOLS (\(tools.count)) ──\n"
+                                        for t in tools {
                                                                 promptDump +=
                                                                     "  - \(t.function.name): \(t.function.description ?? "")\n"
-                                                            }
-                                                        }
-                                                        promptDump += "═══ END PROMPT DUMP ═══"
-                                                        debugLog(promptDump)
-                                                    }
-                                                #endif
-                                                let requestedToolChoice = ChatToolChoicePolicy.resolve(
-                                                    tools: toolSpecs,
-                                                    userText: trimmed,
-                                                    attempt: attempt
-                                                )
-                                                var req = ChatCompletionRequest(
-                                                    // Mode 2: the wire omits the model and routing is
-                                                    // by provider id, so don't pass the local
-                                                    // `selectedModel` — it can lag the async agent pin
-                                                    // and would only leak a stale prefix internally.
-                                                    model: self.isRemoteAgentTarget
-                                                        ? "default" : (self.selectedModel ?? "default"),
-                                                    messages: msgs,
-                                                    temperature: effectiveTemp,
-                                                    max_tokens: effectiveMaxTokensForAgent,
-                                                    stream: true,
-                                                    top_p: chatCfg.topPOverride,
-                                                    frequency_penalty: nil,
-                                                    presence_penalty: nil,
-                                                    stop: nil,
-                                                    n: nil,
-                                                    tools: toolSpecs.isEmpty ? nil : toolSpecs,
-                                                    tool_choice: requestedToolChoice,
-                                                    session_id: self.sessionId?.uuidString
-                                                )
-                                                req.samplingParametersAreImplicit = true
-                                                // Mode 2 routing signal: tells `RemoteProviderService`
-                                                // to target the peer's `/agents/{address}/run`
-                                                // endpoint (remote agent runs fully server-side). The
-                                                // local `model` placeholder above is dropped from the
-                                                // wire entirely (`RemoteChatRequest.encode`), so the
-                                                // peer resolves its own live effective model. False =
-                                                // Mode 1 (plain remote inference via
-                                                // `/chat/completions`).
-                                                req.runAsRemoteAgent = self.isRemoteAgentTarget
-                                                req.cacheStableSystemPrefix =
-                                                    self.isRemoteAgentTarget ? nil : context.staticPrefix
-                                                // Mode 2 routing: target the selected agent's
-                                                // provider directly (by id), so a stale
-                                                // `selectedModel` can never redirect the run to a
-                                                // different local provider. `ChatEngine` resolves
-                                                // the service from this id and ignores the model
-                                                // string for agent runs.
-                                                req.remoteAgentProviderId =
+                                        }
+                                    }
+                                    promptDump += "═══ END PROMPT DUMP ═══"
+                                    debugLog(promptDump)
+                                }
+                            #endif
+                            let requestedToolChoice = ChatToolChoicePolicy.resolve(
+                                tools: toolSpecs,
+                                userText: trimmed,
+                                attempt: attempt
+                            )
+                            var req = ChatCompletionRequest(
+                                // Mode 2: the wire omits the model and routing is
+                                // by provider id, so don't pass the local
+                                // `selectedModel` — it can lag the async agent pin
+                                // and would only leak a stale prefix internally.
+                                model: self.isRemoteAgentTarget
+                                    ? "default" : (self.selectedModel ?? "default"),
+                                messages: msgs,
+                                temperature: effectiveTemp,
+                                max_tokens: effectiveMaxTokensForAgent,
+                                stream: true,
+                                top_p: chatCfg.topPOverride,
+                                frequency_penalty: nil,
+                                presence_penalty: nil,
+                                stop: nil,
+                                n: nil,
+                                tools: toolSpecs.isEmpty ? nil : toolSpecs,
+                                tool_choice: requestedToolChoice,
+                                session_id: self.sessionId?.uuidString
+                            )
+                            req.samplingParametersAreImplicit = true
+                            req.claudeCodeOptions = self.claudeCodeRunOptions(for: turnAgentId)
+                            // Mode 2 routing signal: tells `RemoteProviderService`
+                            // to target the peer's `/agents/{address}/run`
+                            // endpoint (remote agent runs fully server-side). The
+                            // local `model` placeholder above is dropped from the
+                            // wire entirely (`RemoteChatRequest.encode`), so the
+                            // peer resolves its own live effective model. False =
+                            // Mode 1 (plain remote inference via
+                            // `/chat/completions`).
+                            req.runAsRemoteAgent = self.isRemoteAgentTarget
+                            req.cacheStableSystemPrefix =
+                                self.isRemoteAgentTarget ? nil : context.staticPrefix
+                            // Mode 2 routing: target the selected agent's
+                            // provider directly (by id), so a stale
+                            // `selectedModel` can never redirect the run to a
+                            // different local provider. `ChatEngine` resolves
+                            // the service from this id and ignores the model
+                            // string for agent runs.
+                            req.remoteAgentProviderId =
+                                self.isRemoteAgentTarget
+                                ? self.windowState?.selectedDiscoveredAgentProviderId : nil
+                            // Insights fidelity: in Mode 2 the wire omits the
+                            // model, so log the agent's live effective model
+                            // instead of the local prefixed fallback.
+                            req.remoteAgentLogModel =
+                                self.isRemoteAgentTarget
+                                ? self.windowState?.pinnedRemoteAgentEffectiveModel : nil
+                            // Freeze agent semantics for the whole logical run.
+                            // Tool schemas stay present on ordinary iterations,
+                            // but the cap finalizer below intentionally removes
+                            // them; the explicit marker keeps both paths on the
+                            // same reasoning policy.
+                            req.isAgentRequest = !toolSpecs.isEmpty || self.isRemoteAgentTarget
+                            turnGenerationControls.apply(to: &req)
+                            req.backgroundModelLoad = (self.loadIntent == .background)
+                            req.ttftTrace = ttftTrace
+                            // Correlate the Insights log this send produces back to the
+                            // assistant turn, so the per-message "Insights" button can
+                            // open this exact response.
+                            req.turnId = assistantTurn.id
+                            // Stable per-logical-step idempotency token. The
+                            // agent loop holds `attempt` constant across
+                            // transient retries (it decrements then re-increments
+                            // on retryWithoutCharge), so a re-POST reuses this key
+                            // and the router dedupes the charge; a genuinely new
+                            // step gets a fresh key and bills normally. A user
+                            // Retry starts a new run (new runId) and re-bills by
+                            // design. `attempt` alone is not collision-safe:
+                            // budget-refunded iterations (data-movement relief,
+                            // empty-turn nudges) also reuse the counter but with
+                            // a CHANGED body, which the router 409s as
+                            // IDEMPOTENCY_CONFLICT — the body fingerprint suffix
+                            // keys those as distinct requests while identical
+                            // retryWithoutCharge re-POSTs still dedupe.
+                            req.idempotencyKey =
+                                "\(runId.uuidString):\(attempt):"
+                                + AgentToolLoop.recoveryAwareIdempotencySuffix(
+                                    messages: msgs,
+                                    incompleteReasoningRetryOrdinal:
+                                        incompleteReasoningRetryOrdinal
+                                )
+                            debugLog(
+                                "send: attempt=\(attempt) model=\(req.model) tools=\(req.tools?.count ?? 0) sessionId=\(req.session_id ?? "nil")"
+                            )
+                            // Cache-fingerprint diagnostic: one `[Cache]` log line +
+                            // matching TTFT fields per send so we can audit KV reuse
+                            // without instrumenting MLX. Helper lives on the store
+                            // so the turn counter + previous-hint comparison sit
+                            // next to the state they describe. Passing the outbound
+                            // messages adds the conversation-level line — reused vs
+                            // re-prefilled history tokens per send — which is the
+                            // tripwire for cross-turn byte divergence (frozen turn
+                            // prefixes keep it near-total reuse).
+                            if let sid = self.sessionId {
+                                await SessionToolStateStore.shared.recordSend(
+                                    sessionId: self.sessionStateKey(sid),
+                                    cacheHint: context.cacheHint,
+                                    trace: ttftTrace,
+                                    conversation: msgs
+                                )
+                            }
+                            do {
+                                let streamStartTime = Date()
+                                let (invocations, finalTurn) = try await self.processStreamDeltas(
+                                    stream: try await engine.streamChat(request: req),
+                                    assistantTurn: assistantTurn,
+                                    runId: runId,
+                                    streamStartTime: streamStartTime,
+                                    ttftTrace: ttftTrace,
+                                    selectedModel: self.selectedModel
+                                )
+                                assistantTurn = finalTurn
+                                // Stream finished naturally without a tool call — reset
+                                // the transient-retry budget so a future, unrelated
+                                // failure later in the conversation gets a fresh
+                                // allowance.
+                                if invocations.isEmpty {
+                                    transientRetries = 0
+                                    if assistantTurn.terminalStopReason == "length",
+                                        assistantTurn.pendingToolArgSize > 0
+                                    {
+                                        let pendingName =
+                                            assistantTurn.pendingToolName
+                                            == ToolDisplayName.pendingToolSentinel
+                                            ? nil : assistantTurn.pendingToolName
+                                        let argumentCharacters = assistantTurn.pendingToolArgSize
+                                        assistantTurn.pendingToolName = nil
+                                        assistantTurn.clearPendingToolArgs()
+                                        self.rebuildVisibleBlocks()
+                                        return .truncatedToolCall(
+                                            toolName: pendingName,
+                                            argumentCharacters: argumentCharacters
+                                        )
+                                    }
+                                    return AgentLoopModelStep.classifyTerminal(
+                                        contentIsBlank: assistantTurn.contentIsBlank,
+                                        thinkingIsBlank: assistantTurn.thinkingIsBlank,
+                                        stopReason: assistantTurn.terminalStopReason,
+                                        unclosedReasoning: assistantTurn.unclosedReasoning,
+                                        requiresVisibleFinalResponse:
+                                            AgentLoopVisibleResponsePolicy
+                                            .requiresVisibleFinalResponse(
+                                                hasStructuredToolWork:
+                                                    hasStructuredToolWorkThisRun,
+                                                isRemoteAgentTarget:
                                                     self.isRemoteAgentTarget
-                                                    ? self.windowState?.selectedDiscoveredAgentProviderId : nil
-                                                // Insights fidelity: in Mode 2 the wire omits the
-                                                // model, so log the agent's live effective model
-                                                // instead of the local prefixed fallback.
-                                                req.remoteAgentLogModel =
-                                                    self.isRemoteAgentTarget
-                                                    ? self.windowState?.pinnedRemoteAgentEffectiveModel : nil
-                                                // Freeze agent semantics for the whole logical run.
-                                                // Tool schemas stay present on ordinary iterations,
-                                                // but the cap finalizer below intentionally removes
-                                                // them; the explicit marker keeps both paths on the
-                                                // same reasoning policy.
-                                                req.isAgentRequest = !toolSpecs.isEmpty || self.isRemoteAgentTarget
-                                                req.claudeCodeOptions = self.claudeCodeRunOptions(for: turnAgentId)
-                                                turnGenerationControls.apply(to: &req)
-                                                req.backgroundModelLoad = (self.loadIntent == .background)
-                                                req.ttftTrace = ttftTrace
-                                                // Correlate the Insights log this send produces back to the
-                                                // assistant turn, so the per-message "Insights" button can
-                                                // open this exact response.
-                                                req.turnId = assistantTurn.id
-                                                // Stable per-logical-step idempotency token. The
-                                                // agent loop holds `attempt` constant across
-                                                // transient retries (it decrements then re-increments
-                                                // on retryWithoutCharge), so a re-POST reuses this key
-                                                // and the router dedupes the charge; a genuinely new
-                                                // step gets a fresh key and bills normally. A user
-                                                // Retry starts a new run (new runId) and re-bills by
-                                                // design. `attempt` alone is not collision-safe:
-                                                // budget-refunded iterations (data-movement relief,
-                                                // empty-turn nudges) also reuse the counter but with
-                                                // a CHANGED body, which the router 409s as
-                                                // IDEMPOTENCY_CONFLICT — the body fingerprint suffix
-                                                // keys those as distinct requests while identical
-                                                // retryWithoutCharge re-POSTs still dedupe.
-                                                req.idempotencyKey =
-                                                    "\(runId.uuidString):\(attempt):"
-                                                    + AgentToolLoop.recoveryAwareIdempotencySuffix(
-                                                        messages: msgs,
-                                                        incompleteReasoningRetryOrdinal:
-                                                            incompleteReasoningRetryOrdinal
-                                                    )
-                                                debugLog(
-                                                    "send: attempt=\(attempt) model=\(req.model) tools=\(req.tools?.count ?? 0) sessionId=\(req.session_id ?? "nil")"
-                                                )
-                                                // Cache-fingerprint diagnostic: one `[Cache]` log line +
-                                                // matching TTFT fields per send so we can audit KV reuse
-                                                // without instrumenting MLX. Helper lives on the store
-                                                // so the turn counter + previous-hint comparison sit
-                                                // next to the state they describe. Passing the outbound
-                                                // messages adds the conversation-level line — reused vs
-                                                // re-prefilled history tokens per send — which is the
-                                                // tripwire for cross-turn byte divergence (frozen turn
-                                                // prefixes keep it near-total reuse).
-                                                if let sid = self.sessionId {
-                                                    await SessionToolStateStore.shared.recordSend(
-                                                        sessionId: self.sessionStateKey(sid),
-                                                        cacheHint: context.cacheHint,
-                                                        trace: ttftTrace,
-                                                        conversation: msgs
-                                                    )
-                                                }
-                                                do {
-                                                    let streamStartTime = Date()
-                                                    let (invocations, finalTurn) = try await self.processStreamDeltas(
-                                                        stream: try await engine.streamChat(request: req),
-                                                        assistantTurn: assistantTurn,
-                                                        runId: runId,
-                                                        streamStartTime: streamStartTime,
-                                                        ttftTrace: ttftTrace,
-                                                        selectedModel: self.selectedModel
-                                                    )
-                                                    assistantTurn = finalTurn
-                                                    // Stream finished naturally without a tool call — reset
-                                                    // the transient-retry budget so a future, unrelated
-                                                    // failure later in the conversation gets a fresh
-                                                    // allowance.
-                                                    if invocations.isEmpty {
-                                                        transientRetries = 0
-                                                        if assistantTurn.terminalStopReason == "length",
-                                                            assistantTurn.pendingToolArgSize > 0
-                                                        {
-                                                            let pendingName =
-                                                                assistantTurn.pendingToolName
-                                                                    == ToolDisplayName.pendingToolSentinel
-                                                                ? nil : assistantTurn.pendingToolName
-                                                            let argumentCharacters = assistantTurn.pendingToolArgSize
-                                                            assistantTurn.pendingToolName = nil
-                                                            assistantTurn.clearPendingToolArgs()
-                                                            self.rebuildVisibleBlocks()
-                                                            return .truncatedToolCall(
-                                                                toolName: pendingName,
-                                                                argumentCharacters: argumentCharacters
-                                                            )
-                                                        }
-                                                        return AgentLoopModelStep.classifyTerminal(
-                                                            contentIsBlank: assistantTurn.contentIsBlank,
-                                                            thinkingIsBlank: assistantTurn.thinkingIsBlank,
-                                                            stopReason: assistantTurn.terminalStopReason,
-                                                            unclosedReasoning: assistantTurn.unclosedReasoning,
-                                                            requiresVisibleFinalResponse:
-                                                                AgentLoopVisibleResponsePolicy
-                                                                .requiresVisibleFinalResponse(
-                                                                    hasStructuredToolWork:
-                                                                        hasStructuredToolWorkThisRun,
-                                                                    isRemoteAgentTarget:
-                                                                        self.isRemoteAgentTarget
-                                                                )
-                                                        )
-                                                    }
-                                                    hasStructuredToolWorkThisRun = true
-                                                    return .toolCalls(invocations)
-                                                } catch let oversized as OversizedStreamingToolCall {
-                                                    print(
-                                                        "[Osaurus] Oversized streamed tool call "
-                                                            + "tool=\(oversized.toolName ?? "unknown") "
-                                                            + "chars=\(oversized.argumentCharacters); retrying with chunking notice"
-                                                    )
-                                                    assistantTurn.pendingToolName = nil
-                                                    assistantTurn.clearPendingToolArgs()
-                                                    self.rebuildVisibleBlocks()
-                                                    return .oversizedToolCall(
-                                                        toolName: oversized.toolName,
-                                                        argumentCharacters: oversized.argumentCharacters
-                                                    )
-                                                } catch let error as RemoteProviderServiceError {
-                                                    // Transient provider-side stream errors — most commonly
-                                                    // mid-tool-args truncation flagged by
-                                                    // `RemoteProviderService.makeToolInvocation`'s
-                                                    // `wasRepaired` guard. Silently retry the same
-                                                    // iteration up to `maxTransientRetries` times before
-                                                    // surfacing to the user; the model can't see what it
-                                                    // actually streamed last time so it would just retry
-                                                    // with the same broken args.
-                                                    if error.isTransientStreamRetryable,
-                                                        transientRetries < maxTransientRetries
-                                                    {
-                                                        transientRetries += 1
-                                                        print(
-                                                            "[Osaurus] Transient stream error (retry \(transientRetries)/\(maxTransientRetries)): \(error.localizedDescription)"
-                                                        )
-                                                        // Roll back any partial UI state from the failed
-                                                        // attempt so the retry starts clean.
-                                                        assistantTurn.pendingToolName = nil
-                                                        assistantTurn.clearPendingToolArgs()
-                                                        self.rebuildVisibleBlocks()
-                                                        // Not charged against the tool-iteration budget.
-                                                        return .retryWithoutCharge
-                                                    }
-                                                    throw error
-                                                }
-                                            },
-                                            prepareIncompleteReasoningContinuation: {
-                                                // Keep the model's real reasoning-only attempt in
-                                                // the UI transcript but permanently exclude that
-                                                // abandoned protocol attempt from model history.
-                                                // Stream the one natural retry into a fresh turn so
-                                                // a retry tool call and its result remain a valid,
-                                                // uncontaminated assistant/tool pair. No prompt,
-                                                // tags, or decode controls are injected here.
-                                                debugLog(
-                                                    "send: reasoning-only agent step ended without visible answer; "
-                                                        + "retrying exact pre-attempt history "
-                                                        + "stop=\(assistantTurn.terminalStopReason ?? "nil") "
-                                                        + "unclosed=\(assistantTurn.unclosedReasoning) "
-                                                        + "reasoningChars=\(assistantTurn.thinkingLength)"
-                                                )
-                                                assistantTurn.modelContextExcluded = true
-                                                let retryTurn = ChatTurn(role: .assistant, content: "")
-                                                self.turns.append(retryTurn)
-                                                assistantTurn = retryTurn
-                                                incompleteReasoningRetryOrdinal += 1
-                                                self.rebuildVisibleBlocks()
-                                            },
-                                            prepareTrackedTaskContinuation: {
-                                                // The driver observed a successful current-run Todo
-                                                // with structured pending items at an ordinary final.
-                                                // Keep the real response visible, but exclude that
-                                                // abandoned terminal attempt from model history
-                                                // before giving the bounded loop a fresh assistant
-                                                // buffer. Otherwise the next persisted tool call is
-                                                // adjacent to an assistant final after the transient
-                                                // Todo notice disappears. No prose classifier,
-                                                // reasoning marker, sampler, or decode setting is
-                                                // involved.
-                                                debugLog(
-                                                    "send: current-run todo still has unchecked work at model stop; "
-                                                        + "excluding abandoned final and continuing within the "
-                                                        + "configured tool-attempt budget"
-                                                )
-                                                Self.excludeAbandonedTrackedTaskResponse(assistantTurn)
-                                                let nextAssistantTurn = ChatTurn(role: .assistant, content: "")
-                                                self.turns.append(nextAssistantTurn)
-                                                assistantTurn = nextAssistantTurn
-                                                self.rebuildVisibleBlocks()
-                                            },
-                                            willProcessCall: { inv, callId in
-                                                // Recorded history uses the secret-safe view;
-                                                // execution still receives the original `inv`.
-                                                let call = SecretArgumentScrubber.recordedToolCall(
-                                                    id: callId,
-                                                    invocation: inv
-                                                )
-                                                assistantTurn.pendingToolName = nil
-                                                assistantTurn.clearPendingToolArgs()
-                                                if assistantTurn.toolCalls == nil { assistantTurn.toolCalls = [] }
-                                                assistantTurn.toolCalls!.append(call)
-                                                // Start the duration timer now; the call renders running
-                                                // until `recordToolTurn` lands the result after execution.
-                                                assistantTurn.markToolCallStarted(callId)
+                                            )
+                                    )
+                                }
+                                hasStructuredToolWorkThisRun = true
+                                return .toolCalls(invocations)
+                            } catch let oversized as OversizedStreamingToolCall {
+                                print(
+                                    "[Osaurus] Oversized streamed tool call "
+                                        + "tool=\(oversized.toolName ?? "unknown") "
+                                        + "chars=\(oversized.argumentCharacters); retrying with chunking notice"
+                                )
+                                assistantTurn.pendingToolName = nil
+                                assistantTurn.clearPendingToolArgs()
+                                self.rebuildVisibleBlocks()
+                                return .oversizedToolCall(
+                                    toolName: oversized.toolName,
+                                    argumentCharacters: oversized.argumentCharacters
+                                )
+                            } catch let error as RemoteProviderServiceError {
+                                // Transient provider-side stream errors — most commonly
+                                // mid-tool-args truncation flagged by
+                                // `RemoteProviderService.makeToolInvocation`'s
+                                // `wasRepaired` guard. Silently retry the same
+                                // iteration up to `maxTransientRetries` times before
+                                // surfacing to the user; the model can't see what it
+                                // actually streamed last time so it would just retry
+                                // with the same broken args.
+                                if error.isTransientStreamRetryable,
+                                    transientRetries < maxTransientRetries
+                                {
+                                    transientRetries += 1
+                                    print(
+                                        "[Osaurus] Transient stream error (retry \(transientRetries)/\(maxTransientRetries)): \(error.localizedDescription)"
+                                    )
+                                    // Roll back any partial UI state from the failed
+                                    // attempt so the retry starts clean.
+                                    assistantTurn.pendingToolName = nil
+                                    assistantTurn.clearPendingToolArgs()
+                                    self.rebuildVisibleBlocks()
+                                    // Not charged against the tool-iteration budget.
+                                    return .retryWithoutCharge
+                                }
+                                throw error
+                            }
+                        },
+                        prepareIncompleteReasoningContinuation: {
+                            // Keep the model's real reasoning-only attempt in
+                            // the UI transcript but permanently exclude that
+                            // abandoned protocol attempt from model history.
+                            // Stream the one natural retry into a fresh turn so
+                            // a retry tool call and its result remain a valid,
+                            // uncontaminated assistant/tool pair. No prompt,
+                            // tags, or decode controls are injected here.
+                            debugLog(
+                                "send: reasoning-only agent step ended without visible answer; "
+                                    + "retrying exact pre-attempt history "
+                                    + "stop=\(assistantTurn.terminalStopReason ?? "nil") "
+                                    + "unclosed=\(assistantTurn.unclosedReasoning) "
+                                    + "reasoningChars=\(assistantTurn.thinkingLength)"
+                            )
+                            assistantTurn.modelContextExcluded = true
+                            let retryTurn = ChatTurn(role: .assistant, content: "")
+                            self.turns.append(retryTurn)
+                            assistantTurn = retryTurn
+                            incompleteReasoningRetryOrdinal += 1
+                            self.rebuildVisibleBlocks()
+                        },
+                        prepareTrackedTaskContinuation: {
+                            // The driver observed a successful current-run Todo
+                            // with structured pending items at an ordinary final.
+                            // Keep the real response visible, but exclude that
+                            // abandoned terminal attempt from model history
+                            // before giving the bounded loop a fresh assistant
+                            // buffer. Otherwise the next persisted tool call is
+                            // adjacent to an assistant final after the transient
+                            // Todo notice disappears. No prose classifier,
+                            // reasoning marker, sampler, or decode setting is
+                            // involved.
+                            debugLog(
+                                "send: current-run todo still has unchecked work at model stop; "
+                                    + "excluding abandoned final and continuing within the "
+                                    + "configured tool-attempt budget"
+                            )
+                            Self.excludeAbandonedTrackedTaskResponse(assistantTurn)
+                            let nextAssistantTurn = ChatTurn(role: .assistant, content: "")
+                            self.turns.append(nextAssistantTurn)
+                            assistantTurn = nextAssistantTurn
+                            self.rebuildVisibleBlocks()
+                        },
+                        willProcessCall: { inv, callId in
+                            // Recorded history uses the secret-safe view;
+                            // execution still receives the original `inv`.
+                            let call = SecretArgumentScrubber.recordedToolCall(
+                                id: callId,
+                                invocation: inv
+                            )
+                            assistantTurn.pendingToolName = nil
+                            assistantTurn.clearPendingToolArgs()
+                            if assistantTurn.toolCalls == nil { assistantTurn.toolCalls = [] }
+                            assistantTurn.toolCalls!.append(call)
+                            // Start the duration timer now; the call renders running
+                            // until `recordToolTurn` lands the result after execution.
+                            assistantTurn.markToolCallStarted(callId)
 
-                                                // Materialise the tool-call row BEFORE we await
-                                                // execute(...). Without this the chat skips
-                                                // straight from `pendingToolCall` (args still
-                                                // streaming) to `toolCallGroup` with the result
-                                                // already attached — `NativeToolCallRowView`
-                                                // never gets a chance to render with
-                                                // `item.result == nil`, so its inline live-
-                                                // streaming pane (TerminalDisplayView) never mounts
-                                                // for sandbox_exec / shell_run. Rebuilding here
-                                                // emits the row with a nil result; the row
-                                                // subscribes to LiveExecRegistry and starts
-                                                // streaming the moment the tool body registers
-                                                // its sink.
-                                                self.rebuildVisibleBlocks()
-                                            },
-                                            onDedupedResult: { _, _, _ in
-                                                // Consecutive-identical dedupe: the driver replayed
-                                                // the EXACT envelope the model already received —
-                                                // never a collapsed/summarized form — so the
-                                                // short-circuit is neutral and never hands back
-                                                // less than it had. The replayed outcome rides the
-                                                // driver's slotted outcomes, so `onBatchComplete`
-                                                // persists its turn in slot (model) order — an
-                                                // inline append here would land deferred replays
-                                                // AFTER their executed siblings.
-                                            },
+                            // Materialise the tool-call row BEFORE we await
+                            // execute(...). Without this the chat skips
+                            // straight from `pendingToolCall` (args still
+                            // streaming) to `toolCallGroup` with the result
+                            // already attached — `NativeToolCallRowView`
+                            // never gets a chance to render with
+                            // `item.result == nil`, so its inline live-
+                            // streaming pane (TerminalDisplayView) never mounts
+                            // for sandbox_exec / shell_run. Rebuilding here
+                            // emits the row with a nil result; the row
+                            // subscribes to LiveExecRegistry and starts
+                            // streaming the moment the tool body registers
+                            // its sink.
+                            self.rebuildVisibleBlocks()
+                        },
+                        onDedupedResult: { _, _, _ in
+                            // Consecutive-identical dedupe: the driver replayed
+                            // the EXACT envelope the model already received —
+                            // never a collapsed/summarized form — so the
+                            // short-circuit is neutral and never hands back
+                            // less than it had. The replayed outcome rides the
+                            // driver's slotted outcomes, so `onBatchComplete`
+                            // persists its turn in slot (model) order — an
+                            // inline append here would land deferred replays
+                            // AFTER their executed siblings.
+                        },
 
-                                            executeTool: { inv, callId in
-                                                // Serial single-call path (used when no batch
-                                                // executor is installed; kept for parity).
-                                                await executeSingleToolCall(inv, callId: callId)
-                                            },
-                                            executeBatch: { calls in
-                                                // Approval-aware parallel batches: approvals
-                                                // serial in model order, execution concurrent,
-                                                // post-processing back in model order.
-                                                await executeToolBatch(calls)
-                                            },
-                                            onBatchComplete: { outcomes in
-                                                guard !outcomes.isEmpty else { return }
-                                                // Slot-order turn persistence (mirrors HTTP): the
-                                                // driver hands outcomes in the model's call order
-                                                // — executed results, denials, and dedupe replays
-                                                // alike — so the transcript and session save
-                                                // always match the order the model asked for.
-                                                // Intercept slots are excluded by the driver
-                                                // (they wrote their own history); the intercept
-                                                // serial fallback appends inline, so skip call
-                                                // ids that already have a tool turn.
-                                                var appendedAny = false
-                                                for outcome in outcomes {
-                                                    let exists = self.turns.contains {
-                                                        $0.role == .tool && $0.toolCallId == outcome.callId
-                                                    }
-                                                    guard !exists else { continue }
-                                                    self.turns.append(
-                                                        recordToolTurn(outcome.result, callId: outcome.callId)
-                                                    )
-                                                    appendedAny = true
-                                                }
-                                                if appendedAny {
-                                                    // One fresh assistant turn for subsequent
-                                                    // content so tool calls and following prose
-                                                    // render sequentially (previously created
-                                                    // per-call by the post-processor).
-                                                    let newAssistantTurn = ChatTurn(role: .assistant, content: "")
-                                                    self.turns.append(newAssistantTurn)
-                                                    assistantTurn = newAssistantTurn
-                                                }
-                                                self.rebuildVisibleBlocks()
-                                            },
-                                            pendingTodoCount: {
-                                                // Feeds the driver's staleness nudge — todo is
-                                                // session-scoped, so only chat provides this.
+                        executeTool: { inv, callId in
+                            // Serial single-call path (used when no batch
+                            // executor is installed; kept for parity).
+                            await executeSingleToolCall(inv, callId: callId)
+                        },
+                        executeBatch: { calls in
+                            // Approval-aware parallel batches: approvals
+                            // serial in model order, execution concurrent,
+                            // post-processing back in model order.
+                            await executeToolBatch(calls)
+                        },
+                        onBatchComplete: { outcomes in
+                            guard !outcomes.isEmpty else { return }
+                            // Slot-order turn persistence (mirrors HTTP): the
+                            // driver hands outcomes in the model's call order
+                            // — executed results, denials, and dedupe replays
+                            // alike — so the transcript and session save
+                            // always match the order the model asked for.
+                            // Intercept slots are excluded by the driver
+                            // (they wrote their own history); the intercept
+                            // serial fallback appends inline, so skip call
+                            // ids that already have a tool turn.
+                            var appendedAny = false
+                            for outcome in outcomes {
+                                let exists = self.turns.contains {
+                                    $0.role == .tool && $0.toolCallId == outcome.callId
+                                }
+                                guard !exists else { continue }
+                                self.turns.append(
+                                    recordToolTurn(outcome.result, callId: outcome.callId)
+                                )
+                                appendedAny = true
+                            }
+                            if appendedAny {
+                                // One fresh assistant turn for subsequent
+                                // content so tool calls and following prose
+                                // render sequentially (previously created
+                                // per-call by the post-processor).
+                                let newAssistantTurn = ChatTurn(role: .assistant, content: "")
+                                self.turns.append(newAssistantTurn)
+                                assistantTurn = newAssistantTurn
+                            }
+                            self.rebuildVisibleBlocks()
+                        },
+                        pendingTodoCount: {
+                            // Feeds the driver's staleness nudge — todo is
+                            // session-scoped, so only chat provides this.
                                                 guard
                                                     let todo = await AgentTodoStore.shared.todo(
-                                                        for: todoSessionIdForRun
-                                                    )
-                                                else { return 0 }
-                                                return todo.totalCount - todo.doneCount
-                                            },
-                                            todoProgressSnapshot: {
+                                for: todoSessionIdForRun
+                            )
+                            else { return 0 }
+                            return todo.totalCount - todo.doneCount
+                        },
+                        todoProgressSnapshot: {
                                                 guard
                                                     let todo = await AgentTodoStore.shared.todo(
-                                                        for: todoSessionIdForRun
+                                for: todoSessionIdForRun
                                                     )
                                                 else { return nil }
-                                                return AgentTodoProgressSnapshot(
-                                                    done: todo.doneCount,
-                                                    total: todo.totalCount
-                                                )
-                                            },
-                                            emitFallbackText: { text in
-                                                // Empty-turn recovery exhausted: render a visible
-                                                // message into the assistant turn so the user never
-                                                // sees a silent "No visible text was produced".
-                                                // The same hook finalises the narrowly recovered
-                                                // post-success desktop-tool repeat. Clear any
-                                                // committed pending preview first so a suppressed
-                                                // malformed call cannot leave a tool card spinning.
-                                                assistantTurn.pendingToolName = nil
-                                                assistantTurn.clearPendingToolArgs()
-                                                if text == AgentToolLoop.lengthExhaustedFallback {
-                                                    assistantTurn.content =
-                                                        AgentLoopModelStep.contentWithLengthFallback(
-                                                            assistantTurn.content,
-                                                            fallback: text
-                                                        )
-                                                } else {
-                                                    assistantTurn.appendContentAndNotify(text)
-                                                }
-                                                self.rebuildVisibleBlocks()
-                                            }
-                                        )
+                            return AgentTodoProgressSnapshot(
+                                done: todo.doneCount,
+                                total: todo.totalCount
+                            )
+                        },
+                        emitFallbackText: { text in
+                            // Empty-turn recovery exhausted: render a visible
+                            // message into the assistant turn so the user never
+                            // sees a silent "No visible text was produced".
+                            // The same hook finalises the narrowly recovered
+                            // post-success desktop-tool repeat. Clear any
+                            // committed pending preview first so a suppressed
+                            // malformed call cannot leave a tool card spinning.
+                            assistantTurn.pendingToolName = nil
+                            assistantTurn.clearPendingToolArgs()
+                            if text == AgentToolLoop.lengthExhaustedFallback {
+                                assistantTurn.content =
+                                    AgentLoopModelStep.contentWithLengthFallback(
+                                        assistantTurn.content,
+                                        fallback: text
+                                    )
+                            } else {
+                                assistantTurn.appendContentAndNotify(text)
+                            }
+                            self.rebuildVisibleBlocks()
+                        }
+                    )
 
-                                        let runResult = try await AgentToolLoop.run(
-                                            policy: AgentLoopPolicy(
-                                                maxIterations: maxAttempts,
-                                                budgetWarningThreshold: 0,
-                                                stopOnToolRejection: true,
-                                                dedupeNoticeEnabled: false,
-                                                todoStalenessThreshold: .max,
-                                                maxDataMovementSteps: min(16, maxAttempts),
-                                                todoRequiredBeforeToolCallCount: 0
-                                            ),
-                                            state: taskState,
-                                            hooks: loopHooks
-                                        )
+                    let runResult = try await AgentToolLoop.run(
+                        policy: AgentLoopPolicy(
+                            maxIterations: maxAttempts,
+                            budgetWarningThreshold: 0,
+                            stopOnToolRejection: true,
+                            dedupeNoticeEnabled: false,
+                            todoStalenessThreshold: .max,
+                            maxDataMovementSteps: min(16, maxAttempts),
+                            todoRequiredBeforeToolCallCount: 0
+                        ),
+                        state: taskState,
+                        hooks: loopHooks
+                    )
 
-                                        if runResult.exit == .toolRejected {
-                                            // A rejected/failed tool row is already recorded in
-                                            // history for the user and for the model-visible
-                                            // transcript. Classify the run as errored for
-                                            // lifecycle cleanup so `completeRunCleanup` does not
-                                            // schedule a hidden completed-transcript warm-up over
-                                            // the failed intermediate state. That warm-up can own
-                                            // the solo lease and rebuild a different cache
-                                            // fingerprint immediately after a tool failure,
-                                            // making the next send look like a cold prefill.
-                                            lastStreamError = "Tool call failed."
-                                        }
+                    if runResult.exit == .toolRejected {
+                        // A rejected/failed tool row is already recorded in
+                        // history for the user and for the model-visible
+                        // transcript. Classify the run as errored for
+                        // lifecycle cleanup so `completeRunCleanup` does not
+                        // schedule a hidden completed-transcript warm-up over
+                        // the failed intermediate state. That warm-up can own
+                        // the solo lease and rebuild a different cache
+                        // fingerprint immediately after a tool failure,
+                        // making the next send look like a cold prefill.
+                        lastStreamError = "Tool call failed."
+                    }
 
-                                        if runResult.exit == .overBudget {
-                                            // Even fully-compacted history can't fit the model
-                                            // window — the driver ended the run before sending a
-                                            // doomed request. Surface the distinct failure on the
-                                            // assistant bubble instead of a generic stream error.
-                                            assistantTurn.content = AgentToolLoop.overBudgetMessage
-                                            lastStreamError = AgentToolLoop.overBudgetMessage
-                                            rebuildVisibleBlocks()
-                                        }
+                    if runResult.exit == .overBudget {
+                        // Even fully-compacted history can't fit the model
+                        // window — the driver ended the run before sending a
+                        // doomed request. Surface the distinct failure on the
+                        // assistant bubble instead of a generic stream error.
+                        assistantTurn.content = AgentToolLoop.overBudgetMessage
+                        lastStreamError = AgentToolLoop.overBudgetMessage
+                        rebuildVisibleBlocks()
+                    }
 
-                                        if runResult.exit == .lengthExhausted {
-                                            // The driver already appended a visible, truthful
-                                            // incomplete-state message. Mark lifecycle cleanup as
-                                            // failed so this capped reasoning-only turn cannot be
-                                            // announced or warmed as a completed agent task.
-                                            lastStreamError = AgentToolLoop.lengthExhaustedFallback
-                                        }
+                    if runResult.exit == .lengthExhausted {
+                        // The driver already appended a visible, truthful
+                        // incomplete-state message. Mark lifecycle cleanup as
+                        // failed so this capped reasoning-only turn cannot be
+                        // announced or warmed as a completed agent task.
+                        lastStreamError = AgentToolLoop.lengthExhaustedFallback
+                    }
 
-                                        if runResult.exit == .emptyResponseExhausted {
-                                            // The driver already emitted a visible, honest message
-                                            // after repeated empty post-tool completions. Do not
-                                            // warm or index that incomplete tool run as success.
-                                            lastStreamError = AgentToolLoop.emptyToolTaskFallback
-                                        }
+                    if runResult.exit == .emptyResponseExhausted {
+                        // The driver already emitted a visible, honest message
+                        // after repeated empty post-tool completions. Do not
+                        // warm or index that incomplete tool run as success.
+                        lastStreamError = AgentToolLoop.emptyToolTaskFallback
+                    }
 
-                                        if runResult.exit == .incompleteReasoningExhausted {
-                                            // The typed exit owns no cross-surface text. Append the
-                                            // honest chat-native fallback here after the one
-                                            // bounded retry failed (or visible partial content made
-                                            // replay unsafe), then keep cleanup from warming or
-                                            // announcing this as a completed task.
-                                            assistantTurn.content =
-                                                AgentLoopModelStep.contentWithLengthFallback(
-                                                    assistantTurn.content,
-                                                    fallback: AgentToolLoop.incompleteReasoningFallback
-                                                )
-                                            rebuildVisibleBlocks()
-                                            lastStreamError = AgentToolLoop.incompleteReasoningFallback
-                                        }
+                    if runResult.exit == .incompleteReasoningExhausted {
+                        // The typed exit owns no cross-surface text. Append the
+                        // honest chat-native fallback here after the one
+                        // bounded retry failed (or visible partial content made
+                        // replay unsafe), then keep cleanup from warming or
+                        // announcing this as a completed task.
+                        assistantTurn.content =
+                            AgentLoopModelStep.contentWithLengthFallback(
+                                assistantTurn.content,
+                                fallback: AgentToolLoop.incompleteReasoningFallback
+                            )
+                        rebuildVisibleBlocks()
+                        lastStreamError = AgentToolLoop.incompleteReasoningFallback
+                    }
 
-                                        if runResult.exit == .iterationCapReached && isRunActive(runId) {
-                                            if let pending = runResult.unfinishedTodoCount, pending > 0 {
-                                                // A current-run Todo hit the hard step cap. Do not
-                                                // launch the generic tool-free wrap-up stream: it
-                                                // can only guess at unfinished work, and treating
-                                                // it as clean would warm/index a partial task. The
-                                                // driver provides the typed pending count instead.
-                                                let message = AgentToolLoop.unfinishedTodoCapFallback(
-                                                    pending: pending
-                                                )
-                                                assistantTurn.content = message
-                                                lastStreamError = message
-                                                rebuildVisibleBlocks()
-                                            } else {
-                                                do {
-                                                    let trimmedFinalMessages =
-                                                        AgentLoopBudget.trimPreservingSystemPrefix(
-                                                            buildMessages(),
-                                                            with: loopBudgetManager,
-                                                            watermark: compactionWatermark
-                                                        )
-                                                    // The final request intentionally has no tool
-                                                    // schema. Make that boundary visible to the
-                                                    // model as transient tool-role feedback (when
-                                                    // the transcript ends in a tool result), so it
-                                                    // reports unfinished work instead of imitating
-                                                    // a tool/result envelope. Appending after trim
-                                                    // preserves the same stable-prefix contract as
-                                                    // ordinary loop notices.
-                                                    let finalMessages =
-                                                        AgentLoopBudget.appendingTransientNotices(
-                                                            [AgentToolLoop.iterationCapWrapUpNotice],
-                                                            to: trimmedFinalMessages
-                                                        )
-                                                    var finalReq = ChatCompletionRequest(
-                                                        model: selectedModel ?? "default",
-                                                        // Same watermark-trimmed view of history the
-                                                        // loop iterations used — the raw array can
-                                                        // exceed the window precisely when the cap
-                                                        // hits after heavy tool traffic.
-                                                        messages: finalMessages,
-                                                        temperature: effectiveTemp,
-                                                        max_tokens: effectiveMaxTokensForAgent,
-                                                        stream: true,
-                                                        top_p: chatCfg.topPOverride,
-                                                        frequency_penalty: nil,
-                                                        presence_penalty: nil,
-                                                        stop: nil,
-                                                        n: nil,
-                                                        tools: nil,
-                                                        tool_choice: nil,
-                                                        session_id: sessionId?.uuidString
-                                                    )
-                                                    finalReq.samplingParametersAreImplicit = true
-                                                    finalReq.runAsRemoteAgent = isRemoteAgentTarget
-                                                    finalReq.cacheStableSystemPrefix =
-                                                        isRemoteAgentTarget ? nil : context.staticPrefix
-                                                    // Carry the agent provider id on this path too so
-                                                    // the route-by-provider invariant holds for *every*
-                                                    // Mode 2 request — a `runAsRemoteAgent` send with no
-                                                    // provider id would fall back to model-string
-                                                    // routing (the exact mis-route this fix removes).
-                                                    finalReq.remoteAgentProviderId =
-                                                        isRemoteAgentTarget
-                                                        ? windowState?.selectedDiscoveredAgentProviderId : nil
-                                                    finalReq.remoteAgentLogModel =
-                                                        isRemoteAgentTarget
-                                                        ? windowState?.pinnedRemoteAgentEffectiveModel : nil
-                                                    finalReq.isAgentRequest = !toolSpecs.isEmpty || isRemoteAgentTarget
-                                                    finalReq.claudeCodeOptions = claudeCodeRunOptions(for: turnAgentId)
-                                                    turnGenerationControls.apply(to: &finalReq)
-                                                    finalReq.backgroundModelLoad = (loadIntent == .background)
-                                                    finalReq.turnId = assistantTurn.id
-                                                    // Distinct logical step (the post-cap summarizing
-                                                    // call) so it bills once and dedupes on its own
-                                                    // connect-phase retry without colliding with the
-                                                    // loop's per-iteration keys.
-                                                    finalReq.idempotencyKey = "\(runId.uuidString):final"
+                    if runResult.exit == .iterationCapReached && isRunActive(runId) {
+                        if let pending = runResult.unfinishedTodoCount, pending > 0 {
+                            // A current-run Todo hit the hard step cap. Do not
+                            // launch the generic tool-free wrap-up stream: it
+                            // can only guess at unfinished work, and treating
+                            // it as clean would warm/index a partial task. The
+                            // driver provides the typed pending count instead.
+                            let message = AgentToolLoop.unfinishedTodoCapFallback(
+                                pending: pending
+                            )
+                            assistantTurn.content = message
+                            lastStreamError = message
+                            rebuildVisibleBlocks()
+                        } else {
+                            do {
+                                let trimmedFinalMessages =
+                                    AgentLoopBudget.trimPreservingSystemPrefix(
+                                        buildMessages(),
+                                        with: loopBudgetManager,
+                                        watermark: compactionWatermark
+                                    )
+                                // The final request intentionally has no tool
+                                // schema. Make that boundary visible to the
+                                // model as transient tool-role feedback (when
+                                // the transcript ends in a tool result), so it
+                                // reports unfinished work instead of imitating
+                                // a tool/result envelope. Appending after trim
+                                // preserves the same stable-prefix contract as
+                                // ordinary loop notices.
+                                let finalMessages =
+                                    AgentLoopBudget.appendingTransientNotices(
+                                        [AgentToolLoop.iterationCapWrapUpNotice],
+                                        to: trimmedFinalMessages
+                                    )
+                                var finalReq = ChatCompletionRequest(
+                                    model: selectedModel ?? "default",
+                                    // Same watermark-trimmed view of history the
+                                    // loop iterations used — the raw array can
+                                    // exceed the window precisely when the cap
+                                    // hits after heavy tool traffic.
+                                    messages: finalMessages,
+                                    temperature: effectiveTemp,
+                                    max_tokens: effectiveMaxTokensForAgent,
+                                    stream: true,
+                                    top_p: chatCfg.topPOverride,
+                                    frequency_penalty: nil,
+                                    presence_penalty: nil,
+                                    stop: nil,
+                                    n: nil,
+                                    tools: nil,
+                                    tool_choice: nil,
+                                    session_id: sessionId?.uuidString
+                                )
+                                finalReq.samplingParametersAreImplicit = true
+                                finalReq.claudeCodeOptions = claudeCodeRunOptions(for: turnAgentId)
+                                finalReq.runAsRemoteAgent = isRemoteAgentTarget
+                                finalReq.cacheStableSystemPrefix =
+                                    isRemoteAgentTarget ? nil : context.staticPrefix
+                                // Carry the agent provider id on this path too so
+                                // the route-by-provider invariant holds for *every*
+                                // Mode 2 request — a `runAsRemoteAgent` send with no
+                                // provider id would fall back to model-string
+                                // routing (the exact mis-route this fix removes).
+                                finalReq.remoteAgentProviderId =
+                                    isRemoteAgentTarget
+                                    ? windowState?.selectedDiscoveredAgentProviderId : nil
+                                finalReq.remoteAgentLogModel =
+                                    isRemoteAgentTarget
+                                    ? windowState?.pinnedRemoteAgentEffectiveModel : nil
+                                finalReq.isAgentRequest = !toolSpecs.isEmpty || isRemoteAgentTarget
+                                turnGenerationControls.apply(to: &finalReq)
+                                finalReq.backgroundModelLoad = (loadIntent == .background)
+                                finalReq.turnId = assistantTurn.id
+                                // Distinct logical step (the post-cap summarizing
+                                // call) so it bills once and dedupes on its own
+                                // connect-phase retry without colliding with the
+                                // loop's per-iteration keys.
+                                finalReq.idempotencyKey = "\(runId.uuidString):final"
 
-                                                    // Route the capped-run wrap-up through the exact
-                                                    // same typed sentinel decoder as every ordinary
-                                                    // chat step. Feeding this stream directly into a
-                                                    // StreamingDeltaProcessor leaked U+FFFE prefill and
-                                                    // stats envelopes into ChatTurn.content (and then
-                                                    // transcript exports) whenever the agent reached
-                                                    // its iteration cap.
-                                                    let (_, finalTurn) = try await processStreamDeltas(
-                                                        stream: try await engine.streamChat(request: finalReq),
-                                                        assistantTurn: assistantTurn,
-                                                        runId: runId,
-                                                        streamStartTime: Date(),
-                                                        ttftTrace: ttftTrace,
-                                                        selectedModel: self.selectedModel
-                                                    )
-                                                    assistantTurn = finalTurn
-
-                                                } catch {
-                                                    let message =
-                                                        "The agent reached the configured step limit, and its final wrap-up failed: "
-                                                        + error.localizedDescription
+                                // Route the capped-run wrap-up through the exact
+                                // same typed sentinel decoder as every ordinary
+                                // chat step. Feeding this stream directly into a
+                                // StreamingDeltaProcessor leaked U+FFFE prefill and
+                                // stats envelopes into ChatTurn.content (and then
+                                // transcript exports) whenever the agent reached
+                                // its iteration cap.
+                                let (_, finalTurn) = try await processStreamDeltas(
+                                    stream: try await engine.streamChat(request: finalReq),
+                                    assistantTurn: assistantTurn,
+                                    runId: runId,
+                                    streamStartTime: Date(),
+                                    ttftTrace: ttftTrace,
+                                    selectedModel: self.selectedModel
+                                )
+                                assistantTurn = finalTurn
+                            } catch {
+                                let message =
+                                    "The agent reached the configured step limit, and its final wrap-up failed: "
+                                    + error.localizedDescription
                                                     debugLog(
                                                         "send: final wrap-up call failed: \(error.localizedDescription)"
                                                     )
-                                                    assistantTurn.content = message
-                                                    lastStreamError = message
-                                                    rebuildVisibleBlocks()
-                                                }
-                                            }
-                                        }
-                                    } catch is CancellationError {
-                                        // Two distinct cancel sources land here and they need
-                                        // OPPOSITE turn-history outcomes:
-                                        //
-                                        //  1. User dismissed the privacy review sheet
-                                        //     (RemoteProviderService maps `reviewCanceled` →
-                                        //     `CancellationError`). The send never left the
-                                        //     device — drop the just-appended user + empty
-                                        //     assistant turns and restore the original draft
-                                        //     so the user can edit and resend without
-                                        //     retyping. Detected by `!stopRequested`: only
-                                        //     `stop()` flips that flag, and the review-cancel
-                                        //     path doesn't go through `stop()`.
-                                        //
-                                        //  2. User clicked Stop AFTER the engine started but
-                                        //     before the first delta (e.g. mid-engine-setup,
-                                        //     mid-prepare, network in-flight). The user turn
-                                        //     was deliberately sent — it MUST stay in the
-                                        //     transcript. `completeRunCleanup()` (called via
-                                        //     `finalizeRun` from `stop()`) will trim the
-                                        //     empty assistant placeholder; we just clear the
-                                        //     error here.
-                                        //
-                                        // Pre-PR behavior for case 2 was to let the
-                                        // CancellationError fall into the generic `catch`
-                                        // and surface "Error: cancelled" on the assistant
-                                        // bubble, which was its own bug. This branch fixes
-                                        // both cases.
-                                        lastStreamError = nil
-                                        if stopRequested {
-                                            debugLog("send: stop() cancelled mid-prepare — keeping user turn")
-                                        } else {
-                                            debugLog("send: cancelled before any delta — restoring draft")
-                                            shouldPersistConversationArtifacts = false
-                                            suppressQueuedSendFlushForCurrentRun = true
-                                            handleCancelledBeforeFirstDelta()
-                                        }
-                                    } catch let pfError as PrivacyFilterPipelineError {
-                                        // Privacy filter blocked the send because it couldn't
-                                        // safely scrub (engine unavailable, substitution no-op,
-                                        // etc.). Distinct from `reviewCanceled` which is the
-                                        // user's deliberate Cancel and is mapped to
-                                        // `CancellationError` upstream. The user turn stays
-                                        // visible so they have the failed message in context;
-                                        // the assistant bubble surfaces the localized
-                                        // explanation (e.g. "Open Settings → Privacy to re-
-                                        // download…") instead of a generic "Error:" prefix.
-                                        debugLog("send: privacy filter blocked send — \(pfError.localizedDescription)")
-                                        assistantTurn.content = pfError.localizedDescription
-                                        lastStreamError = pfError.localizedDescription
-                                    } catch {
-                                        let errorMessage = ChatErrorMessages.assistantMessage(for: error)
-                                        // Preserve any text the model already streamed before the
-                                        // failure (common when a remote agent disconnects
-                                        // mid-stream): append the error as a trailing notice
-                                        // instead of replacing the partial answer. Only overwrite
-                                        // when nothing was streamed yet so an empty bubble still
-                                        // shows the actionable error on its own.
-                                        let streamedSoFar = assistantTurn.content.trimmingCharacters(
-                                            in: .whitespacesAndNewlines
-                                        )
-                                        if streamedSoFar.isEmpty {
-                                            assistantTurn.content = errorMessage
-                                        } else {
-                                            assistantTurn.content += "\n\n\(errorMessage)"
-                                        }
-                                        lastStreamError = error.localizedDescription
-                                        noteInsufficientFundsIfNeeded(error: error, blockedTurn: assistantTurn)
-                                    }
-                                }  // ChatExecutionContext.$currentEnableThinking.withValue
-                            }  // ChatExecutionContext.$currentModelName.withValue
-                        }  // ChatExecutionContext.$currentUserRequest.withValue
-                    }  // ChatExecutionContext.$currentAgentId.withValue
-                }  // ChatExecutionContext.$currentSessionSource.withValue
+                                assistantTurn.content = message
+                                lastStreamError = message
+                                rebuildVisibleBlocks()
+                            }
+                        }
+                    }
+                } catch is CancellationError {
+                    // Two distinct cancel sources land here and they need
+                    // OPPOSITE turn-history outcomes:
+                    //
+                    //  1. User dismissed the privacy review sheet
+                    //     (RemoteProviderService maps `reviewCanceled` →
+                    //     `CancellationError`). The send never left the
+                    //     device — drop the just-appended user + empty
+                    //     assistant turns and restore the original draft
+                    //     so the user can edit and resend without
+                    //     retyping. Detected by `!stopRequested`: only
+                    //     `stop()` flips that flag, and the review-cancel
+                    //     path doesn't go through `stop()`.
+                    //
+                    //  2. User clicked Stop AFTER the engine started but
+                    //     before the first delta (e.g. mid-engine-setup,
+                    //     mid-prepare, network in-flight). The user turn
+                    //     was deliberately sent — it MUST stay in the
+                    //     transcript. `completeRunCleanup()` (called via
+                    //     `finalizeRun` from `stop()`) will trim the
+                    //     empty assistant placeholder; we just clear the
+                    //     error here.
+                    //
+                    // Pre-PR behavior for case 2 was to let the
+                    // CancellationError fall into the generic `catch`
+                    // and surface "Error: cancelled" on the assistant
+                    // bubble, which was its own bug. This branch fixes
+                    // both cases.
+                    lastStreamError = nil
+                    if stopRequested {
+                        debugLog("send: stop() cancelled mid-prepare — keeping user turn")
+                    } else {
+                        debugLog("send: cancelled before any delta — restoring draft")
+                        shouldPersistConversationArtifacts = false
+                        suppressQueuedSendFlushForCurrentRun = true
+                        handleCancelledBeforeFirstDelta()
+                    }
+                } catch let pfError as PrivacyFilterPipelineError {
+                    // Privacy filter blocked the send because it couldn't
+                    // safely scrub (engine unavailable, substitution no-op,
+                    // etc.). Distinct from `reviewCanceled` which is the
+                    // user's deliberate Cancel and is mapped to
+                    // `CancellationError` upstream. The user turn stays
+                    // visible so they have the failed message in context;
+                    // the assistant bubble surfaces the localized
+                    // explanation (e.g. "Open Settings → Privacy to re-
+                    // download…") instead of a generic "Error:" prefix.
+                    debugLog("send: privacy filter blocked send — \(pfError.localizedDescription)")
+                    assistantTurn.content = pfError.localizedDescription
+                    lastStreamError = pfError.localizedDescription
+                } catch {
+                    let errorMessage = ChatErrorMessages.assistantMessage(for: error)
+                    // Preserve any text the model already streamed before the
+                    // failure (common when a remote agent disconnects
+                    // mid-stream): append the error as a trailing notice
+                    // instead of replacing the partial answer. Only overwrite
+                    // when nothing was streamed yet so an empty bubble still
+                    // shows the actionable error on its own.
+                    let streamedSoFar = assistantTurn.content.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    )
+                    if streamedSoFar.isEmpty {
+                        assistantTurn.content = errorMessage
+                    } else {
+                        assistantTurn.content += "\n\n\(errorMessage)"
+                    }
+                    lastStreamError = error.localizedDescription
+                    noteInsufficientFundsIfNeeded(error: error, blockedTurn: assistantTurn)
+                }
+            }  // ChatExecutionContext.$currentEnableThinking.withValue
+            }  // ChatExecutionContext.$currentModelName.withValue
+            }  // ChatExecutionContext.$currentUserRequest.withValue
+            }  // ChatExecutionContext.$currentAgentId.withValue
+            }  // ChatExecutionContext.$currentSessionSource.withValue
             }  // ChatExecutionContext.$currentFolderRoot.withValue
         }
     }
@@ -7039,6 +7595,22 @@ struct ChatView: View {
                 CreditsTopUpSheet()
                     .environment(\.theme, theme)
             }
+            // First-run / progress dialog for LLM context compaction. The
+            // sheet's dismissal (Esc, outside interaction) routes through the
+            // session so a declined first run resumes the stashed send.
+            .sheet(
+                isPresented: Binding(
+                    get: { observedSession.showCompactionDialog },
+                    set: { isShown in
+                        if !isShown, observedSession.showCompactionDialog {
+                            observedSession.cancelCompactionDialog()
+                        }
+                    }
+                )
+            ) {
+                CompactionDialogView(session: observedSession)
+                    .environment(\.theme, theme)
+            }
             .onChange(of: accountService.balance) { _, _ in
                 session.handleBalanceChangeForRetry()
             }
@@ -7297,6 +7869,7 @@ struct ChatView: View {
                                 isEmptyChat: !observedSession.hasVisibleThreadMessages,
                                 onClearChat: { observedSession.reset() },
                                 onCaptureScreenshot: { observedSession.captureScreenshotFromSlashCommand() },
+                                onGenerateTitle: { observedSession.generateTitleFromSlashCommand() },
                                 onSkillSelected: { skillId in
                                     observedSession.pendingOneOffSkillId = skillId
                                 },
@@ -7318,6 +7891,12 @@ struct ChatView: View {
                                 },
                                 inputHistoryKey: observedSession.sessionId,
                                 warmModelsOnLoadEnabled: ChatConfigurationStore.load().warmModelsOnLoad,
+                                compactionState: observedSession.compactionState,
+                                canCompactConversation: observedSession
+                                    .canManuallyCompactConversation,
+                                onCompactConversation: {
+                                    observedSession.requestManualCompaction()
+                                },
                                 warmupController: observedSession.warmupController,
                                 folderState: observedSession.folderState
                             )
@@ -7838,15 +8417,12 @@ struct ChatView: View {
         // `activeModelOptions`) can't re-render the greeting. `ChatView` observes
         // the whole session object, so its body re-evaluates on every published
         // change; `.equatable()` lets SwiftUI skip this subtree when the inputs
-        // below are unchanged. The `GenerativeGreetingTrigger` stays *outside*
-        // the equatable boundary so it keeps observing the session and still
-        // fires its onAppear / onChange greeting hooks.
+        // below are unchanged.
         EmptyStateContent(
             selectedModel: session.selectedModel,
             agents: windowState.agents,
             activeAgentId: windowState.agentId,
             quickActions: emptyStateQuickActions,
-            generativeGreetingState: session.generativeGreetingState,
             pendingLocalModelId: session.pendingLocalSetupModelId,
             temporaryCloudModelName: session.temporaryCloudModelDisplayName,
             activeDiscoveredAgent: windowState.selectedDiscoveredAgent,
@@ -7873,12 +8449,6 @@ struct ChatView: View {
         )
         .equatable()
         .transition(.opacity.combined(with: .scale(scale: 0.98)))
-        .modifier(
-            GenerativeGreetingTrigger(
-                session: session,
-                windowState: windowState
-            )
-        )
     }
 
     // MARK: - Background

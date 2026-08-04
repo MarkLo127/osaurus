@@ -66,6 +66,8 @@ struct FloatingInputCard: View {
     var onClearChat: (() -> Void)? = nil
     /// Callback to capture the current screen as a local chat artifact.
     var onCaptureScreenshot: (() -> Void)?
+    /// Callback to generate an AI title for the current chat (triggered by /title command).
+    var onGenerateTitle: (() -> Void)? = nil
     /// Callback when the user selects a skill slash command. Passes the skill UUID so the
     /// caller can inject that skill's instructions as one-off context for the next send.
     var onSkillSelected: ((UUID) -> Void)? = nil
@@ -116,6 +118,14 @@ struct FloatingInputCard: View {
     var inputHistoryKey: UUID?
     /// When true, the model chip dot reflects warm-up state (yellow/green).
     var warmModelsOnLoadEnabled: Bool = false
+    /// Session-scoped LLM context-compaction state, rendered as inline
+    /// progress / result rows inside the Context Budget popover.
+    var compactionState: ContextCompactionUIState = .idle
+    /// True when the manual "Compact conversation" action is applicable:
+    /// utilization crossed the threshold and there's an uncovered older span.
+    var canCompactConversation: Bool = false
+    /// Invoked by the popover's "Compact conversation" button.
+    var onCompactConversation: (() -> Void)? = nil
     /// Warm-up state for the selected local model in this session.
     @ObservedObject var warmupController: ChatWarmupController = ChatWarmupController()
     /// THIS chat session's working-folder state. The folder chip, picker,
@@ -150,6 +160,7 @@ struct FloatingInputCard: View {
         isEmptyChat: Bool = false,
         onClearChat: (() -> Void)? = nil,
         onCaptureScreenshot: (() -> Void)? = nil,
+        onGenerateTitle: (() -> Void)? = nil,
         onSkillSelected: ((UUID) -> Void)? = nil,
         pendingSkillId: Binding<UUID?> = .constant(nil),
         autoSpeakAssistant: Binding<Bool> = .constant(false),
@@ -164,6 +175,9 @@ struct FloatingInputCard: View {
         inputHistoryProvider: (() -> [String])? = nil,
         inputHistoryKey: UUID? = nil,
         warmModelsOnLoadEnabled: Bool = false,
+        compactionState: ContextCompactionUIState = .idle,
+        canCompactConversation: Bool = false,
+        onCompactConversation: (() -> Void)? = nil,
         warmupController: ChatWarmupController = ChatWarmupController(),
         folderState: ChatFolderState? = nil
     ) {
@@ -193,6 +207,7 @@ struct FloatingInputCard: View {
         self.isEmptyChat = isEmptyChat
         self.onClearChat = onClearChat
         self.onCaptureScreenshot = onCaptureScreenshot
+        self.onGenerateTitle = onGenerateTitle
         self.onSkillSelected = onSkillSelected
         self._pendingSkillId = pendingSkillId
         self._autoSpeakAssistant = autoSpeakAssistant
@@ -207,6 +222,9 @@ struct FloatingInputCard: View {
         self.inputHistoryProvider = inputHistoryProvider
         self.inputHistoryKey = inputHistoryKey
         self.warmModelsOnLoadEnabled = warmModelsOnLoadEnabled
+        self.compactionState = compactionState
+        self.canCompactConversation = canCompactConversation
+        self.onCompactConversation = onCompactConversation
         self._warmupController = ObservedObject(wrappedValue: warmupController)
         self._folderState = ObservedObject(wrappedValue: folderState ?? ChatFolderState())
     }
@@ -1114,12 +1132,18 @@ private struct RAMBannerShape: Shape {
         path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.minY))
         path.addArc(
             center: CGPoint(x: rect.maxX - r, y: rect.minY + r),
-            radius: r, startAngle: .degrees(-90), endAngle: .degrees(0), clockwise: false
+            radius: r,
+            startAngle: .degrees(-90),
+            endAngle: .degrees(0),
+            clockwise: false
         )
         path.addLine(to: CGPoint(x: rect.maxX, y: bodyBottom - r))
         path.addArc(
             center: CGPoint(x: rect.maxX - r, y: bodyBottom - r),
-            radius: r, startAngle: .degrees(0), endAngle: .degrees(90), clockwise: false
+            radius: r,
+            startAngle: .degrees(0),
+            endAngle: .degrees(90),
+            clockwise: false
         )
         path.addLine(to: CGPoint(x: pointerCenterX + halfPointer, y: bodyBottom))
         path.addLine(to: CGPoint(x: pointerCenterX, y: rect.maxY))
@@ -1127,12 +1151,18 @@ private struct RAMBannerShape: Shape {
         path.addLine(to: CGPoint(x: rect.minX + r, y: bodyBottom))
         path.addArc(
             center: CGPoint(x: rect.minX + r, y: bodyBottom - r),
-            radius: r, startAngle: .degrees(90), endAngle: .degrees(180), clockwise: false
+            radius: r,
+            startAngle: .degrees(90),
+            endAngle: .degrees(180),
+            clockwise: false
         )
         path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + r))
         path.addArc(
             center: CGPoint(x: rect.minX + r, y: rect.minY + r),
-            radius: r, startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false
+            radius: r,
+            startAngle: .degrees(180),
+            endAngle: .degrees(270),
+            clockwise: false
         )
         path.closeSubpath()
         return path
@@ -1417,7 +1447,8 @@ extension FloatingInputCard {
             voiceConfig.pauseDuration > 0
         else { return }
 
-        let hasContent = TranscriptionTextNormalizer.hasVisibleText(speechService.currentTranscription)
+        let hasContent =
+            TranscriptionTextNormalizer.hasVisibleText(speechService.currentTranscription)
             || TranscriptionTextNormalizer.hasVisibleText(speechService.confirmedTranscription)
         let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
 
@@ -1992,6 +2023,15 @@ extension FloatingInputCard {
                     message: "Pass an onCaptureScreenshot handler to enable /screenshot"
                 )
             }
+        case "title":
+            if let generateTitle = onGenerateTitle {
+                generateTitle()
+            } else {
+                ToastManager.shared.infoLocalized(
+                    "Chat Title",
+                    message: "Pass an onGenerateTitle handler to enable /title"
+                )
+            }
         case "help":
             ToastManager.shared.infoLocalized(
                 "Slash Commands",
@@ -2295,7 +2335,7 @@ extension FloatingInputCard {
             // token-budget semantics — those chips would all be inert. Swap
             // the whole row for the image config controls instead so they sit
             // right beside the model that owns them.
-            if isImageComposerActive {
+            if isMediaComposerActive {
                 // Scroll the config chips horizontally so a narrow (minimum-size)
                 // window can't compress them below their ideal width — that
                 // compression is what made the labels wrap character-by-character.
@@ -2307,7 +2347,9 @@ extension FloatingInputCard {
                 }
                 // The negative prompt sits where the token meter normally would,
                 // as a compact button that opens a themed editor on tap.
-                if imageCapabilities?.negativePrompt == true {
+                if selectedMediaPickerItem?.mediaModel != nil
+                    || imageCapabilities?.negativePrompt == true
+                {
                     negativePromptButton
                 }
             } else {
@@ -2474,7 +2516,10 @@ extension FloatingInputCard {
                         isHardOverflow: isContextHardOverflow,
                         metaCompact: metaCompact,
                         formatTokenCount: formatTokenCount,
-                        breakdown: { displayContextBreakdown }
+                        breakdown: { displayContextBreakdown },
+                        compactionState: compactionState,
+                        canCompact: canCompactConversation && !isStreaming,
+                        onCompact: onCompactConversation
                     )
                 }
             }
@@ -2502,7 +2547,15 @@ extension FloatingInputCard {
     }
 
     private var selectedImagePickerItem: ModelPickerItem? {
-        guard selectedPickerItem?.source.isImageGeneration == true else { return nil }
+        guard
+            selectedPickerItem?.source.isImageGeneration == true
+                || selectedPickerItem?.mediaModel?.kind == .image
+        else { return nil }
+        return selectedPickerItem
+    }
+
+    private var selectedMediaPickerItem: ModelPickerItem? {
+        guard selectedPickerItem?.isMediaGeneration == true else { return nil }
         return selectedPickerItem
     }
 
@@ -2512,6 +2565,10 @@ extension FloatingInputCard {
 
     private var isImageComposerActive: Bool {
         selectedImagePickerItem != nil
+    }
+
+    private var isMediaComposerActive: Bool {
+        selectedMediaPickerItem != nil
     }
 
     private var isSelectedModelDeprecated: Bool {
@@ -2564,7 +2621,8 @@ extension FloatingInputCard {
                 isDeprecated
                     ? String(
                         localized: "This model is outdated. Click to switch to a newer version.",
-                        bundle: .module)
+                        bundle: .module
+                    )
                     : helpText
             )
         }
@@ -2578,22 +2636,27 @@ extension FloatingInputCard {
                     ? String(localized: "Model loaded — ready to respond", bundle: .module)
                     : String(
                         localized: "Model not loaded — your next message loads it first",
-                        bundle: .module)
+                        bundle: .module
+                    )
             }
             switch warmupController.state {
             case .warm:
                 return String(
-                    localized: "Chat prefix warm — ready for a fast next response", bundle: .module)
+                    localized: "Chat prefix warm — ready for a fast next response",
+                    bundle: .module
+                )
             case .cold:
                 return warmupController.selectedModelResident
                     ? String(
                         localized:
                             "Chat prefix not pre-warmed — the next response may restore cache or prefill",
-                        bundle: .module)
+                        bundle: .module
+                    )
                     : String(
                         localized:
                             "Model not loaded — the next response loads the model first",
-                        bundle: .module)
+                        bundle: .module
+                    )
             case .warming:
                 guard let model = selectedModel, let phase = warmupProgressHub.phases[model] else {
                     return String(localized: "Warming up…", bundle: .module)
@@ -2604,7 +2667,9 @@ extension FloatingInputCard {
                 case .prefilling(let state):
                     guard state.totalUnitCount > 0 else {
                         return String(
-                            localized: "Warming up — prefilling context…", bundle: .module)
+                            localized: "Warming up — prefilling context…",
+                            bundle: .module
+                        )
                     }
                     let percent = Int(state.percentCompleted.rounded())
                     return state.totalUnitCount == 1
@@ -4014,16 +4079,17 @@ extension FloatingInputCard {
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .strokeBorder(effectiveBorderStyle, lineWidth: isDragOver ? 2 : (isFocused ? 1.5 : 0.5))
+                .strokeBorder(
+                    effectiveBorderStyle,
+                    lineWidth: isDragOver ? 2 : (inputStyle == .shadow ? 0.75 : (isFocused ? 1.5 : 0.5))
+                )
         )
-        /*
         .shadow(
-            color: shadowColor,
-            radius: isFocused ? 12 : 6,
+            color: inputStyle == .shadow ? shadowColor : .clear,
+            radius: inputStyle == .shadow ? (isFocused ? 4.9 : 4) : 0,
             x: 0,
-            y: isFocused ? 4 : 2
+            y: inputStyle == .shadow ? (theme.isDark ? 0 : (isFocused ? 3 : 1)) : 0
         )
-        */
         .animation(.easeOut(duration: 0.15), value: isFocused)
         .animation(.easeOut(duration: 0.1), value: isDragOver)
     }
@@ -4364,6 +4430,18 @@ extension FloatingInputCard {
 
     /// Placeholder text for the input field.
     private var placeholderText: String {
+        if let media = selectedMediaPickerItem?.mediaModel {
+            switch media.kind {
+            case .image:
+                return L("Describe the image...")
+            case .textToVideo:
+                return L("Describe the video...")
+            case .imageToVideo:
+                return pendingAttachments.loadImages().isEmpty
+                    ? L("Attach one image, then describe the video...")
+                    : L("Describe how the image should move...")
+            }
+        }
         if selectedImagePickerItem != nil {
             return L("Describe the image...")
         }
@@ -4383,6 +4461,10 @@ extension FloatingInputCard {
     /// chip (the model owns these settings, and the row's normal chips are inert
     /// for image models).
     private var imageComposerChips: some View {
+        Group {
+            if let media = selectedMediaPickerItem?.mediaModel {
+                catalogMediaComposerChips(media)
+            } else {
         HStack(spacing: 6) {
             sizeSelector
             stepsChip
@@ -4392,6 +4474,171 @@ extension FloatingInputCard {
                 strengthChip
             }
         }
+    }
+        }
+    }
+
+    @ViewBuilder
+    private func catalogMediaComposerChips(_ media: MediaModelInfo) -> some View {
+        HStack(spacing: 6) {
+            if media.kind == .image,
+                media.constraints.aspectRatios.isEmpty,
+                media.constraints.resolutions.isEmpty
+            {
+                sizeSelector
+            }
+            if !media.constraints.aspectRatios.isEmpty {
+                mediaChoiceChip(
+                    title: L("Aspect"),
+                    icon: "aspectratio",
+                    options: media.constraints.aspectRatios,
+                    selection: Binding(
+                        get: { imageComposerSettings.aspectRatio },
+                        set: { imageComposerSettings.aspectRatio = $0 }
+                    )
+                )
+            }
+            if !media.constraints.resolutions.isEmpty {
+                mediaChoiceChip(
+                    title: L("Resolution"),
+                    icon: "rectangle.inset.filled",
+                    options: media.constraints.resolutions,
+                    selection: Binding(
+                        get: { imageComposerSettings.resolution },
+                        set: { imageComposerSettings.resolution = $0 }
+                    )
+                )
+            }
+            if !media.constraints.qualities.isEmpty {
+                mediaChoiceChip(
+                    title: L("Quality"),
+                    icon: "sparkles",
+                    options: media.constraints.qualities,
+                    selection: Binding(
+                        get: { imageComposerSettings.quality },
+                        set: { imageComposerSettings.quality = $0 }
+                    )
+                )
+            }
+            if media.kind.isVideo, !media.constraints.durations.isEmpty {
+                mediaChoiceChip(
+                    title: L("Duration"),
+                    icon: "clock",
+                    options: media.constraints.durations,
+                    selection: Binding(
+                        get: { imageComposerSettings.duration },
+                        set: { imageComposerSettings.duration = $0 }
+                    )
+                )
+            }
+            if media.kind.isVideo, media.constraints.audioConfigurable {
+                Button {
+                    imageComposerSettings.audio =
+                        !(imageComposerSettings.audio ?? media.constraints.supportsAudio)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(
+                            systemName: imageComposerSettings.audio == true
+                                ? "speaker.wave.2.fill" : "speaker.slash.fill"
+                        )
+                        Text(imageComposerSettings.audio == true ? L("Audio") : L("Muted"))
+                    }
+                    .font(theme.font(size: CGFloat(theme.captionSize), weight: .medium))
+                    .foregroundColor(theme.secondaryText)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(chipBackground)
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+            }
+            if media.kind == .image {
+                if media.constraints.defaultSteps != nil || media.constraints.maxSteps != nil {
+                    stepsChip
+                }
+                cfgChip
+                seedChip
+                mediaChoiceChip(
+                    title: L("Format"),
+                    icon: "doc",
+                    options: ImageOutputFormat.allCases.map(\.rawValue),
+                    selection: Binding(
+                        get: { Optional(imageComposerSettings.effectiveOutputFormat.rawValue) },
+                        set: {
+                            imageComposerSettings.outputFormat = $0.flatMap {
+                                ImageOutputFormat(rawValue: $0)
+                            }
+                        }
+                    )
+                )
+                mediaChoiceChip(
+                    title: L("Count"),
+                    icon: "square.stack.3d.up",
+                    options: (1 ... 4).map(String.init),
+                    selection: Binding(
+                        get: { Optional(String(imageComposerSettings.clampedImageCount)) },
+                        set: { imageComposerSettings.imageCount = $0.flatMap { Int($0) } }
+                    )
+                )
+            }
+            if let minimum = media.pricing?.minimumUSD {
+                Text(String(format: "From $%.4f", minimum))
+                    .font(theme.font(size: CGFloat(theme.captionSize), weight: .medium))
+                    .foregroundColor(theme.secondaryText)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(chipBackground)
+            }
+            if media.kind == .imageToVideo {
+                Label("1 source image", systemImage: "photo")
+                    .font(theme.font(size: CGFloat(theme.captionSize), weight: .medium))
+                    .foregroundColor(
+                        pendingAttachments.loadImages().count == 1
+                            ? theme.secondaryText : Color.orange
+                    )
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(chipBackground)
+            }
+        }
+    }
+
+    private func mediaChoiceChip(
+        title: String,
+        icon: String,
+        options: [String],
+        selection: Binding<String?>
+    ) -> some View {
+        Menu {
+            ForEach(options, id: \.self) { option in
+                Button {
+                    selection.wrappedValue = option
+                } label: {
+                    if selection.wrappedValue == option {
+                        Label(option, systemImage: "checkmark")
+                    } else {
+                        Text(option)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .foregroundColor(theme.tertiaryText)
+                Text(selection.wrappedValue ?? title)
+                    .foregroundColor(theme.secondaryText)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(theme.font(size: CGFloat(theme.captionSize) - 3, weight: .semibold))
+                    .foregroundColor(theme.tertiaryText)
+            }
+            .font(theme.font(size: CGFloat(theme.captionSize), weight: .medium))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(chipBackground)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(Text(verbatim: title))
     }
 
     /// Shared pill backing so every composer control reads as one family of
@@ -4406,30 +4653,53 @@ extension FloatingInputCard {
     /// speed / detail trade-off (bare pixel numbers don't tell the user what
     /// they're choosing).
     private struct ImageSizeOption: Identifiable {
-        let dimension: Int
+        let width: Int
+        let height: Int
         let title: String
         let detail: String
-        var id: Int { dimension }
+        var id: String { "\(width)x\(height)" }
     }
 
     private var imageSizeOptions: [ImageSizeOption] {
-        [
+        var options = [
             ImageSizeOption(
-                dimension: 512,
+                width: 512,
+                height: 512,
                 title: L("512 × 512"),
                 detail: L("Fast drafts. Lowest detail, quickest to render.")
             ),
             ImageSizeOption(
-                dimension: 768,
+                width: 768,
+                height: 768,
                 title: L("768 × 768"),
                 detail: L("Balanced. Good detail at a moderate speed.")
             ),
             ImageSizeOption(
-                dimension: 1024,
+                width: 1024,
+                height: 1024,
                 title: L("1024 × 1024"),
                 detail: L("Sharpest. The size most models are trained for, but slowest.")
             ),
         ]
+        if selectedMediaPickerItem?.mediaModel != nil {
+            options.append(
+                ImageSizeOption(
+                    width: 1280,
+                    height: 720,
+                    title: L("1280 × 720"),
+                    detail: L("Landscape 16:9 for cinematic and banner compositions.")
+                )
+            )
+            options.append(
+                ImageSizeOption(
+                    width: 720,
+                    height: 1280,
+                    title: L("720 × 1280"),
+                    detail: L("Portrait 9:16 for mobile and vertical compositions.")
+                )
+            )
+        }
+        return options
     }
 
     private var selectedSizeLabel: String {
@@ -4474,11 +4744,11 @@ extension FloatingInputCard {
 
             ForEach(imageSizeOptions) { option in
                 let isSelected =
-                    imageComposerSettings.width == option.dimension
-                    && imageComposerSettings.height == option.dimension
+                    imageComposerSettings.width == option.width
+                    && imageComposerSettings.height == option.height
                 Button {
-                    imageComposerSettings.width = option.dimension
-                    imageComposerSettings.height = option.dimension
+                    imageComposerSettings.width = option.width
+                    imageComposerSettings.height = option.height
                     showImageSizePicker = false
                 } label: {
                     HStack(alignment: .top, spacing: 9) {
@@ -4902,12 +5172,18 @@ extension FloatingInputCard {
                 endPoint: .center
             )
             .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .opacity(inputStyle == .gradient ? 1 : 0)
         }
     }
+
+    private var inputStyle: ThemeInputStyle { theme.customThemeConfig?.inputStyle ?? .gradient }
 
     private var effectiveBorderStyle: AnyShapeStyle {
         if isDragOver {
             return AnyShapeStyle(theme.accentColor)
+        }
+        if inputStyle == .shadow {
+            return AnyShapeStyle(theme.primaryBorder.opacity(theme.isDark ? 0.8 : 0.7))
         }
         return borderGradient
     }
@@ -4940,7 +5216,8 @@ extension FloatingInputCard {
     }
 
     private var shadowColor: Color {
-        isFocused ? theme.accentColor.opacity(0.18) : theme.shadowColor.opacity(0.12)
+        let opacity = isFocused ? (theme.isDark ? 0.18 : 0.14) : 0.07
+        return (theme.isDark ? theme.accentColor : theme.shadowColor).opacity(opacity)
     }
 }
 
@@ -5501,6 +5778,13 @@ private struct ContextBreakdownPopover: View {
     let isNearLimit: Bool
     let isHardOverflow: Bool
     let formatTokenCount: (Int) -> String
+    /// Session compaction state — drives the inline progress / result row.
+    var compactionState: ContextCompactionUIState = .idle
+    /// True when the manual "Compact conversation" button should show
+    /// (utilization past threshold, an uncovered older span exists, and no
+    /// turn is streaming).
+    var canCompact: Bool = false
+    var onCompact: (() -> Void)? = nil
 
     @Environment(\.theme) private var theme
 
@@ -5679,7 +5963,110 @@ private struct ContextBreakdownPopover: View {
                 divider
                 messagesSection
             }
+
+            if showsCompactionSection {
+                divider
+                compactionSection
+            }
         }
+    }
+
+    // MARK: - Compaction
+
+    /// The compaction row shows whenever there's something to act on or
+    /// report: the manual trigger is available, a run is in flight, or a
+    /// run just completed/failed.
+    private var showsCompactionSection: Bool {
+        if canCompact { return true }
+        switch compactionState {
+        case .idle, .needsModelSelection: return false
+        case .running, .completed, .failed: return true
+        }
+    }
+
+    @ViewBuilder
+    private var compactionSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            switch compactionState {
+            case .running(let phase):
+                HStack(spacing: 7) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.6)
+                        .frame(width: 12, height: 12)
+                    Text(verbatim: phase.label)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundColor(theme.secondaryText)
+                    Spacer(minLength: 0)
+                }
+            case .completed(let savedTokens):
+                HStack(spacing: 7) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(theme.successColor)
+                    Text(
+                        "Compacted — ~\(formatTokenCount(savedTokens)) tokens reclaimed",
+                        bundle: .module
+                    )
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(theme.secondaryText)
+                    Spacer(minLength: 0)
+                }
+            case .failed(let message):
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(alignment: .top, spacing: 7) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(theme.warningColor)
+                        Text(verbatim: message)
+                            .font(.system(size: 10.5))
+                            .foregroundColor(theme.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if canCompact { compactButton(label: L("Retry compaction")) }
+                }
+            case .idle, .needsModelSelection:
+                if canCompact {
+                    VStack(alignment: .leading, spacing: 5) {
+                        compactButton(label: L("Compact conversation"))
+                        Text(
+                            "Summarizes older messages with your compaction model to free up context. The visible chat is unchanged.",
+                            bundle: .module
+                        )
+                        .font(.system(size: 9.5))
+                        .foregroundColor(theme.tertiaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private func compactButton(label: String) -> some View {
+        Button {
+            onCompact?()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(verbatim: label)
+                    .font(.system(size: 10.5, weight: .semibold))
+            }
+            .foregroundColor(theme.accentColor)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4.5)
+            .background(
+                Capsule()
+                    .fill(theme.accentColor.opacity(0.12))
+                    .overlay(
+                        Capsule().strokeBorder(theme.accentColor.opacity(0.3), lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
     }
 
     /// Wallet-style hero: the number users are checking first, followed by
@@ -6136,7 +6523,9 @@ private struct WalletPopover: View {
                                 .fill(theme.warningColor.opacity(0.14))
                                 .overlay(
                                     Capsule().strokeBorder(
-                                        theme.warningColor.opacity(0.35), lineWidth: 1)
+                                        theme.warningColor.opacity(0.35),
+                                        lineWidth: 1
+                                    )
                                 )
                         )
                 }
@@ -7243,6 +7632,10 @@ private struct FloatingContextChip: View {
     let metaCompact: Bool
     let formatTokenCount: (Int) -> String
     let breakdown: () -> ContextBreakdown
+    /// LLM compaction state + manual trigger, rendered inside the popover.
+    var compactionState: ContextCompactionUIState = .idle
+    var canCompact: Bool = false
+    var onCompact: (() -> Void)? = nil
 
     @Environment(\.theme) private var theme
 
@@ -7333,7 +7726,10 @@ private struct FloatingContextChip: View {
                 isStreaming: isStreaming,
                 isNearLimit: isNearLimit,
                 isHardOverflow: isHardOverflow,
-                formatTokenCount: formatTokenCount
+                formatTokenCount: formatTokenCount,
+                compactionState: compactionState,
+                canCompact: canCompact,
+                onCompact: onCompact
             )
             // Keep the popover alive while the cursor is over it, so the user
             // can travel from the trigger and click the disclosure headers.

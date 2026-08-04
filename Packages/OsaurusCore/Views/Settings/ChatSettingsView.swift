@@ -9,8 +9,8 @@
 //  Persistence is scoped to the fields this view owns. Saving does a
 //  load-modify-write on `ChatConfiguration` touching only the chat-owned
 //  fields (top-P, tool attempts, clipboard, greeting
-//  persona) so the General settings' hotkey + core-model values — which
-//  live in the same struct — are never clobbered. The default-agent
+//  persona, compaction model) so the General settings' hotkey + core-model
+//  values — which live in the same struct — are never clobbered. The default-agent
 //  persona / generation knobs persist to `DefaultAgentConfiguration`.
 //  Tools and memory are deliberately not surfaced here: the default
 //  agent's tools toggle lives in the Agents tab and the global memory
@@ -83,12 +83,14 @@ struct ChatSettingsView: View {
     /// debounced save baseline.
     @AppStorage(ContentBlock.ActivityRollupSetting.defaultsKey)
     private var activityRollupEnabled: Bool = false
-    /// Free-text "voice" instruction for AI-generated empty-state
-    /// greetings — the global default voice. The on/off is per-agent
-    /// (`AgentSettings.generativeGreetingsEnabled`). Empty = use the
-    /// built-in playful default. Per-agent overrides live on
-    /// `AgentSettings.greetingPersona`.
-    @State private var tempGreetingPersona: String = ""
+    /// Model that runs LLM context compaction (summarizing older messages
+    /// when a chat outgrows its context window). Same provider/name split
+    /// as the Core Model picker; empty = "ask on first use" (the first-run
+    /// dialog persists the user's choice back into these fields).
+    @State private var tempCompactionModelProvider: String = ""
+    @State private var tempCompactionModelName: String = ""
+    @State private var showCompactionModelPicker = false
+    @State private var compactionModelPickerItems: [ModelPickerItem] = []
 
     /// Placement of the task-progress notch overlay. With no saved preference,
     /// it defaults on for hardware-notch displays and off elsewhere. Off keeps
@@ -176,6 +178,11 @@ struct ChatSettingsView: View {
             withAnimation(.easeOut(duration: 0.25).delay(0.05)) {
                 hasAppeared = true
             }
+        }
+        // Shared model catalog for the compaction-model picker (same source
+        // the General tab's Core Model picker reads).
+        .onReceive(ModelPickerItemCache.shared.$items) { options in
+            compactionModelPickerItems = options
         }
         // Any edit to a save-relevant field reschedules the debounced save.
         .onChange(of: currentFormState) { _, _ in scheduleAutoSave() }
@@ -376,18 +383,20 @@ struct ChatSettingsView: View {
 
                 SettingsDivider()
 
-                SettingsSubsection(label: "Generative Greetings") {
-                    VStack(alignment: .leading, spacing: 12) {
+                SettingsSubsection(
+                    label: "Compaction Model", anchorId: "settings.chat.compactionModel"
+                ) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        compactionModelPicker
                         Text(
-                            "Default voice for AI-generated greetings + quick actions. Turn greetings on per agent under the agent's Appearance tab, where each agent can also override this voice.",
+                            "Model used to summarize older messages when a chat outgrows its context window (context compaction). Remote models pass through your Privacy Filter. If unset, you'll be asked to pick a model the first time compaction runs.",
                             bundle: .module
                         )
                         .font(.system(size: 11))
                         .foregroundColor(theme.tertiaryText)
-
-                        personalityEditorBlock
                     }
                 }
+
             }
         }
     }
@@ -505,56 +514,114 @@ struct ChatSettingsView: View {
         ManagementStateManager.shared.selectedTab = .settings
     }
 
-    private var personalityEditorBlock: some View {
-        let defaultText = GenerativeGreetingService.defaultPersonaInstruction
-        let isAtDefault =
-            tempGreetingPersona.trimmingCharacters(in: .whitespacesAndNewlines)
-            == defaultText.trimmingCharacters(in: .whitespacesAndNewlines)
+    // MARK: - Compaction Model Picker
 
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Text("Personality (default for all agents)", bundle: .module)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(theme.secondaryText)
-                Spacer()
-                if !isAtDefault {
-                    Button {
-                        tempGreetingPersona = defaultText
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.uturn.backward")
-                                .font(.system(size: 10, weight: .semibold))
-                            Text("Reset to Default", bundle: .module)
-                                .font(.system(size: 11, weight: .medium))
-                        }
-                        .foregroundColor(theme.accentColor)
-                    }
-                    .buttonStyle(.plain)
+    private var compactionModelIdentifierBinding: Binding<String> {
+        Binding(
+            get: {
+                if tempCompactionModelName.isEmpty { return "" }
+                return tempCompactionModelProvider.isEmpty
+                    ? tempCompactionModelName
+                    : "\(tempCompactionModelProvider)/\(tempCompactionModelName)"
+            },
+            set: { newValue in
+                if newValue.isEmpty {
+                    tempCompactionModelProvider = ""
+                    tempCompactionModelName = ""
+                    return
+                }
+                let parts = newValue.split(separator: "/", maxSplits: 1)
+                if parts.count == 2 {
+                    tempCompactionModelProvider = String(parts[0])
+                    tempCompactionModelName = String(parts[1])
+                } else {
+                    tempCompactionModelProvider = ""
+                    tempCompactionModelName = newValue
                 }
             }
+        )
+    }
 
-            TextEditor(text: $tempGreetingPersona)
-                .font(.system(size: 13, design: .monospaced))
-                .foregroundColor(theme.primaryText)
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 100, maxHeight: 200)
-                .padding(10)
+    private var compactionModelSelectionBinding: Binding<String?> {
+        Binding(
+            get: {
+                let id = compactionModelIdentifierBinding.wrappedValue
+                return id.isEmpty ? nil : id
+            },
+            set: { compactionModelIdentifierBinding.wrappedValue = $0 ?? "" }
+        )
+    }
+
+    /// Same trigger + rich `ModelPickerView` popover as the General tab's
+    /// Core Model picker, with "unset" meaning "ask on first compaction run"
+    /// rather than a chat-model fallback.
+    private var compactionModelPicker: some View {
+        let currentId = compactionModelIdentifierBinding.wrappedValue
+        let currentItem = compactionModelPickerItems.first { $0.id == currentId }
+        return HStack(spacing: 8) {
+            Button {
+                showCompactionModelPicker.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(currentId.isEmpty ? theme.tertiaryText : theme.accentColor)
+                    if currentId.isEmpty {
+                        Text("Ask on first use (default)", bundle: .module)
+                            .font(.system(size: 13))
+                            .foregroundColor(theme.placeholderText)
+                    } else if let currentItem {
+                        Text(currentItem.displayName)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(theme.primaryText)
+                            .lineLimit(1)
+                    } else {
+                        // Persisted-but-uninstalled values (e.g. a disconnected
+                        // remote model) keep an "(unavailable)" hint so the row
+                        // isn't an orphan.
+                        Text("\(currentId) (unavailable)", bundle: .module)
+                            .font(.system(size: 13))
+                            .foregroundColor(theme.secondaryText)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(theme.tertiaryText)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
                         .fill(theme.inputBackground)
                         .overlay(
-                            RoundedRectangle(cornerRadius: 10)
-                                .stroke(theme.inputBorder, lineWidth: 1)
+                            RoundedRectangle(cornerRadius: 10).stroke(theme.inputBorder, lineWidth: 1)
                         )
                 )
+            }
+            .buttonStyle(PlainButtonStyle())
+            .popover(isPresented: $showCompactionModelPicker, arrowEdge: .bottom) {
+                ModelPickerView(
+                    options: compactionModelPickerItems,
+                    selectedModel: compactionModelSelectionBinding,
+                    agentId: nil,
+                    onDismiss: { showCompactionModelPicker = false }
+                )
+            }
 
-            Text(
-                "Shapes the voice of AI-generated empty-state greetings and quick actions. Each agent can override this in its Customization tab.",
-                bundle: .module
-            )
-            .font(.system(size: 11))
-            .foregroundColor(theme.tertiaryText)
+            if !currentId.isEmpty {
+                Button {
+                    compactionModelIdentifierBinding.wrappedValue = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 13))
+                        .foregroundColor(theme.tertiaryText)
+                }
+                .buttonStyle(.plain)
+                .localizedHelp("Ask on first use (default)")
+            }
         }
+        .frame(maxWidth: 320)
     }
 
     // MARK: - Success Toast
@@ -695,7 +762,7 @@ struct ChatSettingsView: View {
         // The Default agent's persona and generation knobs live on
         // `DefaultAgentConfiguration` (split off from `ChatConfiguration`);
         // the numeric generation knobs (top-P and tool
-        // attempts) and clipboard / greeting voice live on `ChatConfiguration`.
+        // attempts) and clipboard settings live on `ChatConfiguration`.
         // Tools and memory are intentionally NOT surfaced here: the default
         // agent's tools toggle lives in the Agents tab and the global memory
         // switch lives in the Memory tab.
@@ -710,15 +777,8 @@ struct ChatSettingsView: View {
         tempEnableClipboardMonitoring = chat.enableClipboardMonitoring
         tempWarmModelsOnLoad = chat.warmModelsOnLoad
         tempAutoGenerateChatTitles = chat.autoGenerateChatTitles
-        // Storage convention: empty string = "use the built-in default."
-        // The editor never displays an empty state — we hydrate it with the
-        // built-in default so the text is editable in place. `saveConfiguration`
-        // collapses an unedited default back to "" so future updates to the
-        // built-in copy still propagate to users who never changed it.
-        tempGreetingPersona =
-            chat.greetingPersona.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? GenerativeGreetingService.defaultPersonaInstruction
-            : chat.greetingPersona
+        tempCompactionModelProvider = chat.compactionModelProvider ?? ""
+        tempCompactionModelName = chat.compactionModelName ?? ""
 
         // Capture the pristine baseline so the auto-save stays idle until the
         // user actually edits something.
@@ -738,7 +798,8 @@ struct ChatSettingsView: View {
         tempEnableClipboardMonitoring = chatDefaults.enableClipboardMonitoring
         tempWarmModelsOnLoad = chatDefaults.warmModelsOnLoad
         tempAutoGenerateChatTitles = chatDefaults.autoGenerateChatTitles
-        tempGreetingPersona = GenerativeGreetingService.defaultPersonaInstruction
+        tempCompactionModelProvider = chatDefaults.compactionModelProvider ?? ""
+        tempCompactionModelName = chatDefaults.compactionModelName ?? ""
 
         showSuccess("Chat settings restored to defaults")
     }
@@ -755,7 +816,8 @@ struct ChatSettingsView: View {
         var enableClipboardMonitoring: Bool
         var warmModelsOnLoad: Bool
         var autoGenerateChatTitles: Bool
-        var greetingPersona: String
+        var compactionModelProvider: String
+        var compactionModelName: String
     }
 
     private var currentFormState: SaveableFormState {
@@ -768,7 +830,8 @@ struct ChatSettingsView: View {
             enableClipboardMonitoring: tempEnableClipboardMonitoring,
             warmModelsOnLoad: tempWarmModelsOnLoad,
             autoGenerateChatTitles: tempAutoGenerateChatTitles,
-            greetingPersona: tempGreetingPersona
+            compactionModelProvider: tempCompactionModelProvider,
+            compactionModelName: tempCompactionModelName
         )
     }
 
@@ -839,14 +902,10 @@ struct ChatSettingsView: View {
         chatCfg.enableClipboardMonitoring = tempEnableClipboardMonitoring
         chatCfg.warmModelsOnLoad = tempWarmModelsOnLoad
         chatCfg.autoGenerateChatTitles = tempAutoGenerateChatTitles
-        chatCfg.greetingPersona = {
-            // Collapse an unedited built-in default back to "" so storage stays
-            // in "inherit the default" mode.
-            let trimmed = tempGreetingPersona.trimmingCharacters(in: .whitespacesAndNewlines)
-            let defaultTrimmed = GenerativeGreetingService.defaultPersonaInstruction
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed == defaultTrimmed ? "" : tempGreetingPersona
-        }()
+        chatCfg.compactionModelProvider =
+            tempCompactionModelProvider.isEmpty ? nil : tempCompactionModelProvider
+        chatCfg.compactionModelName =
+            tempCompactionModelName.isEmpty ? nil : tempCompactionModelName
         ChatConfigurationStore.save(chatCfg)
 
         // Persist default-agent specific fields to their own store. Tools

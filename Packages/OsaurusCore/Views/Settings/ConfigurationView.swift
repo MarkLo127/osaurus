@@ -106,7 +106,8 @@ struct ConfigurationView: View {
     // section reliably surfaces the empty state instead of a blank pane.
     private static let generalKeywords = [
         "General", "System", "Hotkey", "Login", "Start at Login", "Beta", "Updates",
-        "Core Model", "CLI", "Command Line", "Install", "Symlink", "Maintenance",
+        "Core Model",
+        "CLI", "Command Line", "Install", "Symlink", "Maintenance",
         "Reset", "Factory Reset", "Wipe",
     ]
     private static let notificationsKeywords = [
@@ -837,9 +838,9 @@ struct ConfigurationView: View {
 
         // Load-modify-write: this view owns only the global hotkey and the
         // core model within `ChatConfiguration`. The chat-mode generation
-        // knobs (context length, top-P, tool attempts, clipboard, greeting
-        // persona) are owned by the Chat tab, so we preserve whatever is on
-        // disk for them rather than reconstructing the whole struct.
+        // knobs (context length, top-P, tool attempts, clipboard) are owned by
+        // the Chat tab, so we preserve whatever is on disk for them rather
+        // than reconstructing the whole struct.
         var chatCfg = previousChatCfg
         chatCfg.hotkey = tempChatHotkey
         chatCfg.coreModelProvider = tempCoreModelProvider.isEmpty ? nil : tempCoreModelProvider
@@ -984,6 +985,7 @@ struct ConfigurationView: View {
         }
         .frame(maxWidth: 320)
     }
+
 }
 
 // MARK: - CLI Install Helper

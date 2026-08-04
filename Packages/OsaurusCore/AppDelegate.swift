@@ -407,6 +407,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
                 // catalog so existing sign-ins carry over to Browser Use.
                 BrowserPluginMigration.migrateIfNeeded()
             }
+            await MediaGenerationCoordinator.shared.refreshCloudCatalog()
+            await MediaGenerationCoordinator.shared.resumePendingJobs()
             await ModelPickerItemCache.shared.prewarmModelCache()
         }
 
@@ -681,16 +683,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
                 }
             }
 
-            // Once the initial window has had a beat to settle, prewarm
-            // the AI-greeting pool for whichever (agent, model) the
-            // user last had open. This is purely additive: if the user
-            // opens a *different* agent first, the chat view's own
-            // `setActive` / `warmUp` calls will still drive the right
-            // pool — but for the common "reopen the same agent I just
-            // had" workflow this trims the cold inference wait off the
-            // first chat session of the launch.
             if !keychainDisabledTestMode {
-                prewarmGreetingPoolIfEnabled()
                 // Build the Settings/management window graph while idle so the
                 // first open is instant
                 // instead of stalling on a synchronous SwiftUI construct+layout.
@@ -738,21 +731,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
                 }
                 self?.updater.checkForUpdatesInBackground()
             }
-        }
-    }
-
-    /// Fire-and-forget launch prewarm. Skipped when the last-active
-    /// agent has generative greetings off, when no last-active context
-    /// was ever recorded (fresh install), or when that agent is no
-    /// longer in the store (it was deleted between launches).
-    @MainActor
-    private func prewarmGreetingPoolIfEnabled() {
-        guard let last = GenerativeGreetingPool.lastActiveContext(),
-            let agent = AgentManager.shared.agents.first(where: { $0.id == last.agentId }),
-            agent.shouldUseGenerativeGreetings
-        else { return }
-        Task.detached(priority: .utility) { [agent, model = last.model] in
-            await GenerativeGreetingPool.shared.warmUp(for: agent, model: model)
         }
     }
 
@@ -1141,6 +1119,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
                     keyEquivalent: ""
                 )
             )
+            menu.addItem(
+                NSMenuItem(
+                    title: "Reset & Test Import History Prompt",
+                    action: #selector(dockResetImportHistoryPrompt),
+                    keyEquivalent: ""
+                )
+            )
         #endif
         return menu
     }
@@ -1179,6 +1164,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         @objc private func dockResetProductHuntLaunch() {
             ProductHuntLaunchCampaign.shared.resetForDebugTesting()
             presentProductHuntLaunchDialogIfEligible()
+        }
+
+        /// Clear the import prompt's seen flag and run the normal
+        /// eligibility/presentation path — including the modal/alert
+        /// deferrals — without requiring a fresh install or a full
+        /// onboarding pass. Dismissing re-persists seen; pick this item
+        /// again to test another pass.
+        @objc private func dockResetImportHistoryPrompt() {
+            ImportHistoryPromptGate.shared.resetForDebugTesting()
+            presentImportHistoryPromptIfEligible()
         }
     #endif
 
@@ -1411,13 +1406,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         BrowserSessionManager.shared.shutdownAll()
         SharedConfigurationService.shared.remove()
         SharedConfigurationService.shared.flushPendingWork()
-        // `applicationWillTerminate` is sync and the process exits as
-        // soon as it returns. Bridge to the actor synchronously so
-        // any debounced greeting-pool entries land on disk — without
-        // this, a quit within the 1s save debounce silently throws
-        // away the latest seeds and the next launch is cold again.
-        flushGreetingPoolSync()
-
         // Tool enable/policy changes persist via a background serial writer to
         // keep the UI snappy; drain it here so a toggle made right before quit
         // isn't lost when `_exit` skips the pending write.
@@ -1457,18 +1445,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelega
         // that: the kernel reclaims the address space and GPU resources
         // atomically, so no in-flight thread can lose its objects mid-call.
         Darwin._exit(0)
-    }
-
-    /// Synchronously bridge to the greeting-pool actor so its
-    /// debounced save lands before the process exits. Capped at
-    /// 1.5s so a stalled write can't block the user's quit.
-    private func flushGreetingPoolSync() {
-        let done = DispatchSemaphore(value: 0)
-        Task.detached(priority: .userInitiated) {
-            await GenerativeGreetingPool.shared.flushPendingSave()
-            done.signal()
-        }
-        _ = done.wait(timeout: .now() + 1.5)
     }
 
     // MARK: Status Item / Menu
@@ -2259,6 +2235,11 @@ extension AppDelegate {
             }
 
             let themeManager = ThemeManager.shared
+            // Read before building the view: `completeOnboarding()` flips
+            // `hasCompletedOnboarding` before `onComplete` runs, so freshness
+            // must be captured up front. Re-onboarding users (version bump)
+            // are not fresh and never see the import prompt.
+            let wasFreshInstall = OnboardingService.shared.isFreshInstall
             let contentView = OnboardingView(
                 onPreferredSizeChange: { [weak self] newSize in
                     self?.resizeOnboardingWindow(to: newSize)
@@ -2272,11 +2253,18 @@ extension AppDelegate {
                     ModelPickerItemCache.shared.invalidateCache()
                     // Open ChatView after onboarding completes
                     self?.showChatOverlay()
-                    // Fresh installs during the Product Hunt launch window
-                    // deferred the launch dialog behind onboarding; recheck
-                    // now that the chat window is up to host it.
                     Task { @MainActor [weak self] in
                         try? await Task.sleep(for: .seconds(1))
+                        // Brand-new users get the one-time import-history
+                        // suggestion first, once the chat window is up to
+                        // host it.
+                        if wasFreshInstall {
+                            self?.presentImportHistoryPromptIfEligible()
+                        }
+                        // Fresh installs during the Product Hunt launch window
+                        // deferred the launch dialog behind onboarding; recheck
+                        // now that the chat window is up to host it. Its guard
+                        // defers again while the import prompt is on screen.
                         self?.presentProductHuntLaunchDialogIfEligible()
                     }
                 }
@@ -2645,6 +2633,82 @@ extension AppDelegate {
                 width: 400,
                 onDismiss: {
                     campaign.didDismiss()
+                    ThemedAlertCenter.shared.dismiss(scope: scope, id: requestId)
+                }
+            ),
+            scope: scope
+        )
+    }
+}
+
+// MARK: - Import History Prompt
+extension AppDelegate {
+    /// Present the one-time post-onboarding "import your chat history"
+    /// suggestion for brand-new users. The caller has already verified
+    /// the completing user is a fresh install; this checks the persisted
+    /// once-per-user gate and defers behind any competing modal. A
+    /// blocked attempt does not consume eligibility, but in practice the
+    /// only trigger is onboarding completion, so a deferred prompt is
+    /// simply never shown — the sidebar's Import button remains the
+    /// discoverable entry point.
+    @MainActor
+    func presentImportHistoryPromptIfEligible() {
+        guard !keychainDisabledTestMode else { return }
+
+        let gate = ImportHistoryPromptGate.shared
+        guard gate.isEligible else { return }
+
+        guard NSApp.modalWindow == nil else { return }
+        guard !NSApp.windows.contains(where: { $0.attachedSheet != nil }) else { return }
+        guard !ThemedAlertCenter.shared.hasAnyActiveAlert else { return }
+
+        // Host in the user's landing window (same routing as the Product
+        // Hunt dialog): the chat window that just opened after onboarding,
+        // else the management window, else the screen-level toast overlay.
+        let scope: ThemedAlertScope
+        if let chatId = ChatWindowManager.shared.lastFocusedWindowId,
+            ChatWindowManager.shared.windowExists(id: chatId) {
+            scope = .chat(chatId)
+        } else if WindowManager.shared.isVisible(.management) {
+            scope = .management
+        } else {
+            scope = .toastOverlay
+        }
+
+        // Seen is persisted at presentation time, so even a force-quit
+        // while the dialog is up can't make it reappear.
+        gate.willPresent()
+        FeatureTelemetry.importHistoryPromptShown()
+
+        let requestId = UUID()
+        let sheet = ImportGuideSheet(showsSkipToggle: false) {
+            FeatureTelemetry.importHistoryPromptClicked(action: "import")
+            ThemedAlertCenter.shared.dismiss(scope: scope, id: requestId)
+            // nil agent = default agent. `onOpen` stays nil: post-onboarding
+            // there is no sidebar selection to route through; imported
+            // sessions still refresh every window via `.chatSessionsImported`.
+            ChatSessionImportCoordinator.run(
+                agentId: nil, scope: scope, source: .onboardingPrompt, onOpen: nil)
+        }
+        ThemedAlertCenter.shared.present(
+            ThemedAlertRequest(
+                id: requestId,
+                title: L("Import your chat history"),
+                message: nil,
+                // Skip carries the cancel role so the corner X, Escape, and
+                // an outside click all follow the same permanent-dismiss
+                // path — and all count as "skip". Choose File dismisses the
+                // alert directly, so the two actions can't double-fire.
+                buttons: [
+                    .cancel(L("Skip")) {
+                        FeatureTelemetry.importHistoryPromptClicked(action: "skip")
+                    }
+                ],
+                showsCloseButton: true,
+                customContent: AnyView(sheet),
+                width: 470,
+                onDismiss: {
+                    gate.didDismiss()
                     ThemedAlertCenter.shared.dismiss(scope: scope, id: requestId)
                 }
             ),

@@ -140,6 +140,9 @@ struct ModelPickerItem: Identifiable, Hashable {
     let imageDefaultSteps: Int?
     let imageDefaultGuidance: Float?
     let imageReady: Bool
+    /// Provider-neutral media metadata for remote image/video rows. Local
+    /// image rows retain their existing `image*` fields.
+    let mediaModel: MediaModelInfo?
 
     init(
         id: String,
@@ -161,7 +164,8 @@ struct ModelPickerItem: Identifiable, Hashable {
         imageCapabilities: ImageModelCapabilities? = nil,
         imageDefaultSteps: Int? = nil,
         imageDefaultGuidance: Float? = nil,
-        imageReady: Bool = false
+        imageReady: Bool = false,
+        mediaModel: MediaModelInfo? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -183,6 +187,7 @@ struct ModelPickerItem: Identifiable, Hashable {
         self.imageDefaultSteps = imageDefaultSteps
         self.imageDefaultGuidance = imageDefaultGuidance
         self.imageReady = imageReady
+        self.mediaModel = mediaModel
     }
 
     /// Check if model matches search query using fuzzy matching.
@@ -204,7 +209,7 @@ struct ModelPickerItem: Identifiable, Hashable {
 extension ModelPickerItem {
     /// Create a Foundation model picker item
     static func foundation() -> ModelPickerItem {
-        ModelPickerItem(
+        return ModelPickerItem(
             id: "foundation",
             displayName: "Foundation",
             source: .foundation,
@@ -225,7 +230,7 @@ extension ModelPickerItem {
 
     /// Create a local MLX model picker item from an MLXModel.
     static func fromMLXModel(_ model: MLXModel) -> ModelPickerItem {
-        ModelPickerItem(
+        return ModelPickerItem(
             id: model.id,
             displayName: model.name,
             source: .local,
@@ -265,6 +270,23 @@ extension ModelPickerItem {
             id: modelId,
             displayName: displayName(fromModelId: modelId),
             source: .remote(providerName: providerName, providerId: providerId)
+        )
+    }
+
+    static func fromMediaModel(_ model: MediaModelInfo, providerId: UUID) -> ModelPickerItem {
+        let details = [
+            model.privacy,
+            model.pricing?.minimumUSD.map { String(format: "From $%.4f", $0) },
+        ]
+        .compactMap { $0 }
+        .joined(separator: " · ")
+        return ModelPickerItem(
+            id: model.id,
+            displayName: model.displayName,
+            source: .remote(providerName: model.providerName, providerId: providerId),
+            description: details.isEmpty ? nil : details,
+            imageReady: model.isAvailable,
+            mediaModel: model
         )
     }
 
@@ -432,6 +454,7 @@ extension ModelPickerItem {
     /// heuristic, the array helper below falls back to the first item so the
     /// picker is never left empty when models exist.
     var isLikelyChatCapable: Bool {
+        if mediaModel != nil { return false }
         switch source {
         case .foundation:
             // Foundation is Apple's on-device chat model.
@@ -470,11 +493,20 @@ extension ModelPickerItem {
     }
 
     var isImageGenerationDelegateCandidate: Bool {
-        source.isImageGeneration && imageReady && (imageCapabilities?.textToImage == true)
+        (source.isImageGeneration && imageReady && (imageCapabilities?.textToImage == true))
+            || (mediaModel?.kind == .image && mediaModel?.isAvailable == true)
     }
 
     var isImageEditDelegateCandidate: Bool {
         source.isImageGeneration && imageReady && (imageCapabilities?.imageEdit == true)
+    }
+
+    var isVideoGenerationDelegateCandidate: Bool {
+        mediaModel?.kind.isVideo == true && mediaModel?.isAvailable == true
+    }
+
+    var isMediaGeneration: Bool {
+        source.isImageGeneration || mediaModel != nil
     }
 
     /// Ranking used only when Chat needs an automatic fallback selection.
@@ -485,6 +517,7 @@ extension ModelPickerItem {
     /// because it sorts earlier on disk.
     var defaultChatSelectionRank: Int {
         let lower = id.lowercased()
+        if mediaModel != nil { return 40 }
         switch source {
         case .imageGeneration:
             return 40
@@ -699,6 +732,10 @@ extension Array where Element == ModelPickerItem {
 
     var imageGenerationDelegateCandidates: [ModelPickerItem] {
         filter(\.isImageGenerationDelegateCandidate)
+    }
+
+    var videoGenerationDelegateCandidates: [ModelPickerItem] {
+        filter(\.isVideoGenerationDelegateCandidate)
     }
 
     var imageEditDelegateCandidates: [ModelPickerItem] {

@@ -3,6 +3,44 @@
   <channel>
     <title>Osaurus</title>
         <item>
+            <title>0.22.15</title>
+            <pubDate>Sun, 02 Aug 2026 19:11:57 +0000</pubDate>
+            <sparkle:channel>release</sparkle:channel>
+            <sparkle:version>0.22.15</sparkle:version>
+            <sparkle:shortVersionString>0.22.15</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/osaurus-ai/osaurus/releases/download/0.22.15/Osaurus-0.22.15.dmg" length="69831032" type="application/octet-stream" sparkle:edSignature="LiXmoXm5LdMFDNKoZO2tU9QkxW7P5DDuiyOVZE6PGu2EVQzkz0Ajud54Lh0hGEiwy5BtUYlK5Q4p1/Yd1OE4BQ=="/>
+            <description sparkle:format="markdown"><![CDATA[
+## What's Changed
+
+- Repin vMLX to the boundary-digest diagnostic (#2270) by @jjang-ai
+- Repin vMLX to the DSV4 encoder/cache hardening fixes (#2269) by @jjang-ai
+- Pin DSV4 disk-prefix fix and improve eval proof (#2264) by @jjang-ai
+- Pin vMLX DSV4 warmup replay fix (#2262) by @jjang-ai
+- Add DeepSeek V4 Flash 0731 app support (#2260) by @jjang-ai
+
+## 🚀 Features
+
+- Add LLM-powered context compaction (#2265) by @tpae
+- Add live task status indicators to the History sidebar (#2263) by @tpae
+- Add redeemable credit codes (#2259) by @tpae
+
+## 🐛 Bug Fixes
+
+- Wait for the localModelsChanged notification instead of assuming a sleep covered it (#2272) by @jjang-ai
+- Stop cancellationDuringWave racing a fixed sleep against job completion (#2271) by @jjang-ai
+- Redeem code follow-ups: settle first-action gate from Credits, 429 countdown, identity error copy (#2261) by @tpae
+
+## 🧰 Maintenance
+
+- Revamp the default Osaurus agent: bundled guide, settings/watcher tools, expanded read scopes (#2268) by @tpae
+- Harden capability readiness and authorization (#2258) by @tpae
+
+**Full Changelog**: https://github.com/osaurus-ai/osaurus/compare/0.22.14...0.22.15
+]]></description>
+        </item>
+        <item>
             <title>0.22.14</title>
             <pubDate>Sat, 01 Aug 2026 10:17:19 +0000</pubDate>
             <sparkle:channel>release</sparkle:channel>

@@ -250,6 +250,9 @@ public final class ToolRegistry: ObservableObject {
             // → edit). Tool body enforces the separate Agent Delegation permission
             // defaults and low-RAM unload policy.
             ImageTool(),
+            // Billable remote text/image-to-video generation. The subagent kind
+            // obtains a live quote before permission and persists queued jobs.
+            VideoTool(),
             // Agent DB feature (spec §6). The system prompt composer
             // gates these per-agent via `Agent.settings.dbEnabled`;
             // registering them as built-ins means agents that *do*
@@ -289,6 +292,7 @@ public final class ToolRegistry: ObservableObject {
             OsaurusStatusTool(),
             OsaurusListTool(),
             OsaurusDescribeTool(),
+            OsaurusHelpTool(),
             // Computer Use (macOS automation harness). Registered as a
             // built-in so the runtime can execute it and ChatView can
             // intercept its live activity feed, but the system prompt
@@ -1890,6 +1894,9 @@ public final class ToolRegistry: ObservableObject {
     static var agentDelegationImageToolNames: Set<String> {
         Set(SubagentCapabilityRegistry.image.toolNames)
     }
+    static var agentDelegationVideoToolNames: Set<String> {
+        Set(SubagentCapabilityRegistry.video.toolNames)
+    }
     /// AppleScript-family tool names, derived from the capability registry.
     static var agentDelegationAppleScriptToolNames: Set<String> {
         Set(SubagentCapabilityRegistry.appleScript.toolNames)
@@ -2307,24 +2314,25 @@ extension ToolRegistry {
         return union
     }
 
-    /// Every tool that exists for the *configure* surface — the three
+    /// Every tool that exists for the *configure* surface — the four
     /// generic reads (`osaurus_status`, `osaurus_list`,
-    /// `osaurus_describe`) plus every write across every domain. Used
-    /// by `SystemPromptComposer.resolveTools` to strip configure tools
-    /// from non-default agents' schemas.
+    /// `osaurus_describe`, `osaurus_help`) plus every write across
+    /// every domain. Used by `SystemPromptComposer.resolveTools` to
+    /// strip configure tools from non-default agents' schemas.
     static var configureToolNames: Set<String> {
         configureWriteToolNames.union([
             "osaurus_status",
             "osaurus_list",
             "osaurus_describe",
+            "osaurus_help",
         ])
     }
 
     /// Turn-1 schema for the Default (configuration) agent: the consolidated
-    /// configure surface — the three generic reads (`osaurus_status` /
-    /// `osaurus_list` / `osaurus_describe`) plus the per-domain `osaurus_*`
-    /// write tools — together with the agent-loop tools (`todo` / `complete` /
-    /// `clarify`). The Default agent loads its write tools **directly**; it
+    /// configure surface — the four generic reads (`osaurus_status` /
+    /// `osaurus_list` / `osaurus_describe` / `osaurus_help`) plus the
+    /// per-domain `osaurus_*` write tools — together with the agent-loop
+    /// tools (`todo` / `complete` / `clarify`). The Default agent loads its write tools **directly**; it
     /// does NOT use `capabilities_discover` / `capabilities_load` (those stay
     /// available to custom agents). Computed from the live domain registry so
     /// a newly registered domain expands the set automatically, and stable
